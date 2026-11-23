@@ -10,26 +10,21 @@ import re
 import shutil
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 from collections import Counter
-from contextlib import suppress
 from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import urlencode, urlsplit, urlunsplit
+from typing import Any
+from urllib.parse import urlencode
 
-from ..engine import BrowserUseAgent as Agent
-from ..models import runtime_settings
-from .agent import RunCancelled
-from .baseline_evaluation import attempt_status, build_context, evaluate_frozen, freeze_context, outcome_statistics
-from .baseline_tasks import VERSION, inspect, prepare, task_catalog
-from .model import action_space
-from .planner import LIMITS, public_config
-from .planner import execution_mode as validate_mode
-from .questions import MAX_DECISION_ROUNDS, MAX_STEPS
-from .runtime import DEBUG_PROFILE, FINAL_REPORT_PROFILE, redact_secrets
+from .archive import atomic_json
+from .engine import MAX_STEPS, VIEWPORT, BrowserUseRun, RunCancelled, RunEvent
+from .evaluation import attempt_status, build_context, evaluate_frozen, freeze_context, outcome_statistics
+from .models import DEBUG_PROFILE, FINAL_REPORT_PROFILE, PROVIDER, RunSettings, redact_secrets, runtime_settings
+from .observation import indexed_elements
+from .tasks import VERSION, CaseProbe, EnvironmentBlocked, task_catalog
 from .token_usage import TOKEN_FIELDS, aggregate_token_usage, token_usage
 
 TERMINAL = {'completed', 'cancelled', 'error', 'interrupted'}
@@ -40,75 +35,31 @@ class BaselineConflict(ValueError):
 	pass
 
 
-class EnvironmentBlocked(RuntimeError):
-	pass
-
-
 def now():
 	return datetime.now().astimezone().isoformat(timespec='milliseconds')
 
 
-def atomic_json(path, data):
-	"""提交完整快照；短暂文件占用只重试替换，不重放产生快照的任何工作。"""
-	payload = json.dumps(data, ensure_ascii=False, indent=2)
-	temporary = None
-	try:
-		# 每个写入者独占同目录的临时文件，并在替换前关闭句柄。
-		with tempfile.NamedTemporaryFile(
-			mode='w', encoding='utf-8', dir=path.parent, prefix=f'.{path.name}.', suffix='.tmp', delete=False
-		) as stream:
-			temporary = Path(stream.name)
-			stream.write(payload)
-		for attempt in range(8):
-			try:
-				temporary.replace(path)
-				return
-			except OSError as error:
-				# Windows 读句柄可能同时表现为访问拒绝、共享冲突或锁冲突。
-				if getattr(error, 'winerror', None) not in {5, 32, 33} or attempt == 7:
-					raise
-				time.sleep(0.01 * 2**attempt)
-	finally:
-		if temporary is not None:
-			# 清理失败不能覆盖原始写入异常；绝不删除仍然有效的目标文件。
-			with suppress(OSError):
-				temporary.unlink(missing_ok=True)
-
-
-def public_endpoint(url):
-	parsed = urlsplit(url)
-	host = parsed.hostname or ''
-	if ':' in host:
-		host = f'[{host}]'
-	if parsed.port:
-		host += f':{parsed.port}'
-	return urlunsplit((parsed.scheme, host, parsed.path, '', ''))
-
-
 class BaselineManager:
-	def __init__(self, root, origin, *, agent_factory=Agent, inspector=inspect, preparer=prepare, timeout=300):
+	def __init__(self, root: Path, origin: str, *, run_factory=BrowserUseRun, timeout: int = 300):
 		self.root = Path(root).resolve()
 		self.tasks = task_catalog(origin)
-		self.agent_factory, self.inspector, self.preparer = agent_factory, inspector, preparer
+		self._run_factory = run_factory
+		self._settings: RunSettings | None = None
 		self.timeout = timeout
 		self.lock = threading.RLock()
 		self.io_lock = threading.Lock()
 		self.stop_event = threading.Event()
 		self.active = False
-		self.batch = None
-		self.snapshots = {}
+		self.batch: dict[str, Any] | None = None
+		self.snapshots: dict[tuple[str, str], dict[str, Any]] = {}
 		self.token_cache = {}
 		self.thread = None
 		self.recover()
 
-	def clean(self, data):
-		settings = getattr(self, 'model_settings', {})
-		report_key = settings['text']['api_key'] if settings.get('model_profile') == FINAL_REPORT_PROFILE else None
-		keys = (
-			os.getenv(name)
-			for name in ('LAYA_API_KEY', 'TEXT_MODEL_API_KEY', 'SYSTEM1_DEEPSEEK_API_KEY', 'TYPESAFE_API_KEY', 'PLANNER_API_KEY')
-		)
-		return redact_secrets(data, *keys, report_key, settings.get('system1_key'))
+	def clean(self, data: Any) -> Any:
+		settings = self._settings
+		keys = (settings.execution.api_key, settings.evaluation.api_key) if settings else ()
+		return redact_secrets(data, *keys)
 
 	def folder(self, run_id):
 		if not isinstance(run_id, str) or not re.fullmatch(r'\d{8}_\d{6}_\d{3}(?:_\d+)?', run_id):
@@ -300,7 +251,7 @@ class BaselineManager:
 										call.setdefault('laya_call_id', laya_id)
 		for frame in frames:
 			if frame.get('page'):
-				frame.setdefault('elements', action_space(frame['page'].get('actions', []))[0])
+				frame.setdefault('elements', indexed_elements(frame['page'].get('actions', [])))
 		return self.clean(snapshot)
 
 	def frame(self, run_id, attempt_id, name):
@@ -325,17 +276,12 @@ class BaselineManager:
 		before_start=None,
 	):
 		"""验证配置后串行启动新批次，运行模式与凭据均冻结。"""
-		# 整个批次固定执行模式，缺少 Planner 配置时先拒绝再创建目录。
-		mode = validate_mode(execution_mode)
 		settings = runtime_settings(
-			system1_provider, mode, screenshot_mode, screenshot_policy=screenshot_policy, model_profile=model_profile
+			system1_provider, execution_mode, screenshot_mode, screenshot_policy=screenshot_policy, model_profile=model_profile
 		)
-		screenshot_mode = settings['screenshot_mode']
-		screenshot_policy = settings['screenshot_policy']
-		planner = public_config(settings['planner']) if mode == 'planned' else None
-		config = settings['system1']
-		profile, text = settings['model_profile'], settings['text']
-		text_endpoint = public_endpoint(text['base_url'])
+		config = {'provider': PROVIDER, **settings.execution.public()}
+		profile, text = settings.profile, settings.evaluation
+		text_endpoint = text.public()['base_url']
 		ids = [t['id'] for t in self.tasks] if task_ids is None else task_ids
 		allowed = {t['id'] for t in self.tasks}
 		if (
@@ -378,11 +324,11 @@ class BaselineManager:
 					decision_rounds=0,
 					system1_provider=config['provider'],
 					text_calls=0,
-					execution_mode=mode,
-					screenshot_mode=screenshot_mode,
-					screenshot_policy=screenshot_policy,
+					execution_mode='direct',
+					screenshot_mode=False,
+					screenshot_policy='off',
 					model_profile=profile,
-					text_model=text['model'],
+					text_model=text.model,
 					text_model_base_url=text_endpoint,
 					planner_calls=0,
 					replans=0,
@@ -400,7 +346,7 @@ class BaselineManager:
 				for t in tasks
 				for n in range(1, repeats + 1)
 			]
-			self.batch = dict(
+			batch: dict[str, Any] = dict(
 				id=run_id,
 				status='running',
 				path=str(self.folder(run_id)),
@@ -408,76 +354,69 @@ class BaselineManager:
 				suite_version=VERSION,
 				attempts=attempts,
 				system1=config,
-				execution_mode=mode,
-				screenshot_mode=screenshot_mode,
-				screenshot_policy=screenshot_policy,
-				planner=planner,
+				execution_mode='direct',
+				screenshot_mode=False,
+				screenshot_policy='off',
 				model_profile=profile,
-				text_model=text['model'],
+				text_model=text.model,
 				text_model_base_url=text_endpoint,
 			)
+			self.batch = batch
 			self.snapshots = {}
 			# 私有配置包含密钥，不进入 batch/manifest/trace。
-			self.model_settings = settings
+			self._settings = settings
 			self.stop_event.clear()
 			self.active = True
 		try:
 			sources = {
 				str(p.relative_to(Path(__file__).parent)): hashlib.sha256(p.read_bytes()).hexdigest()
 				for p in Path(__file__).parent.rglob('*')
-				if p.suffix in {'.py', '.js', '.html'} and '__pycache__' not in p.parts
+				if p.suffix in {'.py', '.js', '.html', '.css', '.json'} and '__pycache__' not in p.parts
 			}
 			manifest = {
 				'run_id': run_id,
-				'created_at': self.batch['created_at'],
+				'created_at': batch['created_at'],
 				'suite_version': VERSION,
 				'tasks': tasks,
 				'repeats': repeats,
 				'sources_sha256': sources,
 				'limits': {
 					'actions': MAX_STEPS,
-					'decision_rounds': MAX_DECISION_ROUNDS,
-					'decision_calls': MAX_DECISION_ROUNDS * (2 if config['provider'] == 'deepseek' else 1),
+					'decision_rounds': MAX_STEPS,
+					'decision_calls': MAX_STEPS,
 					'seconds': self.timeout,
-					**(LIMITS if mode == 'planned' else {}),
 				},
-				'execution_mode': mode,
-				'screenshot_mode': screenshot_mode,
-				'screenshot_policy': screenshot_policy,
-				'planner': planner,
+				'execution_mode': 'direct',
+				'screenshot_mode': False,
+				'screenshot_policy': 'off',
 				'model_profile': profile,
-				'system1': {**config, 'base_url': public_endpoint(config['base_url'])},
-				'viewport': {'width': 1366, 'height': 780},
-				'shared_browser_profile': bool(settings.get('user_data_dir')),
+				'system1': config,
+				'viewport': VIEWPORT,
+				'shared_browser_profile': bool(settings.user_data_dir),
 				'models': {
-					'LAYA_MODEL': os.getenv('LAYA_MODEL', 'laya-v10s'),
-					'LAYA_TIMEOUT_SECONDS': os.getenv('LAYA_TIMEOUT_SECONDS', '120'),
-					'TEXT_MODEL': text['model'],
+					'TEXT_MODEL': text.model,
 					'TEXT_MODEL_REASONING': (
 						'disabled' if profile == FINAL_REPORT_PROFILE else os.getenv('TEXT_MODEL_REASONING', 'disabled')
 					),
 				},
-				'endpoints': {
-					'laya': public_endpoint(os.getenv('LAYA_BASE_URL', 'http://127.0.0.1:8791')),
-					'text': text_endpoint,
-				},
+				'endpoints': {'text': text_endpoint},
 			}
 			atomic_json(self.folder(run_id) / 'manifest.json', self.clean(manifest))
 			self.persist()
 			if before_start is not None:
 				before_start()
-			self.thread = threading.Thread(target=self.work, args=(run_id, tasks), daemon=True, name='baseline-worker')
+			self.thread = threading.Thread(target=self.work, args=(batch, tasks), daemon=True, name='baseline-worker')
 			self.thread.start()
 		except Exception:
 			with self.lock:
 				self.active = False
-				self.batch['status'] = 'error'
+				batch['status'] = 'error'
 			raise
 		return self.state()
 
 	def stop(self):
 		with self.lock:
-			if self.active and self.batch['status'] not in TERMINAL:
+			if self.active and self.batch and self.batch['status'] not in TERMINAL:
 				self.stop_event.set()
 				self.batch['status'] = 'stopping'
 		self.persist()
@@ -720,13 +659,13 @@ class BaselineManager:
 					self.batch = self.read_run(remaining[0]['id'])
 		return self.state()
 
-	def work(self, run_id, tasks):
-		by_id = {t['id']: t for t in tasks}
+	def work(self, batch: dict[str, Any], tasks: list[dict[str, Any]]):
+		run_id = batch['id']
+		by_id = {task['id']: task for task in tasks}
 		fatal = ''
 		try:
-			for index in range(len(self.batch['attempts'])):
+			for row in batch['attempts']:
 				with self.lock:
-					row = self.batch['attempts'][index]
 					if self.stop_event.is_set() or fatal:
 						row.update(status='cancelled', execution_status='cancelled', reason=fatal or 'Stopped by user')
 						continue
@@ -737,14 +676,14 @@ class BaselineManager:
 			fatal = self.clean(str(error))
 		finally:
 			with self.lock:
-				for row in self.batch['attempts']:
+				for row in batch['attempts']:
 					if row['status'] in {'running', 'queued'}:
 						row.update(
 							status='error' if fatal else 'cancelled',
 							execution_status='error' if fatal else 'cancelled',
 							reason=fatal or 'Stopped',
 						)
-				self.batch.update(
+				batch.update(
 					status='error' if fatal else 'cancelled' if self.stop_event.is_set() else 'completed',
 					ended_at=now(),
 					reason=fatal,
@@ -756,6 +695,8 @@ class BaselineManager:
 					self.active = False
 
 	def run_attempt(self, run_id, row, task):
+		settings = self._settings
+		assert settings is not None
 		folder = self.attempt_folder(run_id, row['id'])
 		(folder / 'screenshots').mkdir(parents=True)
 		started = time.monotonic()
@@ -773,167 +714,90 @@ class BaselineManager:
 			with (folder / 'events.jsonl').open('a', encoding='utf-8') as stream:
 				stream.write(json.dumps(self.clean({'time': now(), 'event': event, **payload}), ensure_ascii=False) + '\n')
 
-		def publish(current):
-			"""每个事件持久化 trace，并更新网页轮询可读的累计指标。"""
-			snapshot = deepcopy(current.snapshot())
-			snapshot['token_usage'] = token_usage(snapshot.get('model_calls', []))
+		def publish(snapshot: dict[str, Any]):
+			"""Persist the same state that the page can read while the attempt is running."""
+			snapshot = deepcopy(snapshot)
 			snapshot['page'].pop('screenshot', None)
-			snapshot['observations'] = deepcopy(observations)
+			snapshot['observations'] = observations
 			if observations:
 				snapshot['page']['screenshot_url'] = observations[-1].get('screenshot_url')
 			snapshot = self.clean(snapshot)
 			atomic_json(folder / 'trace.json', snapshot)
-			if snapshot.get('research'):
-				atomic_json(folder / 'research.json', snapshot['research'])
-			atomic_json(folder / 'result.json', snapshot.get('result'))
-			# Clear an obsolete draft when new evidence invalidates it.
-			(folder / 'result.md').write_text((snapshot.get('result') or {}).get('markdown', ''), encoding='utf-8')
+			result = snapshot.get('result')
+			atomic_json(folder / 'result.json', result)
+			(folder / 'result.md').write_text((result or {}).get('markdown', ''), encoding='utf-8')
+			calls = snapshot.get('model_calls', [])
+			verify_calls = [call for call in calls if call['kind'] == 'verify']
+			verify_usage = Counter()
+			for call in verify_calls:
+				for key, value in (call.get('response') or {}).get('usage', {}).items():
+					if type(value) in (int, float):
+						verify_usage[key] += value
 			with self.lock:
 				self.snapshots[(run_id, row['id'])] = snapshot
-				calls = snapshot.get('model_calls', [])
-				row['token_usage'] = snapshot['token_usage']
-				# 只累加服务实际返回的 usage；失败请求无 usage 时不伪造零 token。
-				planner_calls = [c for c in calls if c['kind'] == 'planner']
-				planner_usage = Counter()
-				for call in planner_calls:
-					for key, value in (call.get('response') or {}).get('usage', {}).items():
-						if type(value) in (int, float):
-							planner_usage[key] += value
-				decision_kinds = {'laya', 'deepseek', 'jev', 'browser_use', 'fixture'}
 				row.update(
 					actions=len(snapshot['history']),
-					laya_calls=sum(c['kind'] == 'laya' for c in calls),
-					deepseek_calls=sum(c['kind'] == 'deepseek' for c in calls),
-					jev_calls=sum(c['kind'] == 'jev' for c in calls),
-					decision_calls=sum(c['kind'] in decision_kinds for c in calls),
-					decision_rounds=snapshot.get(
-						'decision_rounds',
-						sum(c['kind'] in decision_kinds and c.get('stage', 'operation') == 'operation' for c in calls),
-					),
-					text_calls=sum(c['kind'] == 'text' for c in calls),
-					planner_calls=len(planner_calls),
-					planner_usage=dict(planner_usage),
-					replans=snapshot.get('planning', {}).get('replans', 0),
+					decision_calls=sum(call['kind'] == PROVIDER for call in calls),
+					decision_rounds=snapshot['decision_rounds'],
+					verify_calls=len(verify_calls),
+					research_usage={'verify': dict(verify_usage)},
+					token_usage=snapshot['token_usage'],
 					elapsed_ms=round((time.monotonic() - started) * 1000),
 				)
-				usage = {}
-				for kind in ('collect', 'summarize', 'verify'):
-					group = [c for c in calls if c['kind'] == kind]
-					row[kind + '_calls'] = len(group)
-					totals = Counter()
-					for call in group:
-						for key, value in (call.get('response') or {}).get('usage', {}).items():
-							if type(value) in (int, float):
-								totals[key] += value
-					usage[kind] = dict(totals)
-				row['research_usage'] = usage
 
-		def event(name, current, payload):
-			"""独立评估只读取观察，绝不把验收答案传回规划或执行模型。"""
-			nonlocal agent
-			agent = current
-			if name == 'model_start':
-				call = payload['call']
-				call['observation_index'] = current.state.get('observation_index', len(observations) - 1)
-				if call['kind'] == 'text':
-					parent = next(
-						(
-							c
-							for c in reversed(current.state['model_calls'][:-1])
-							if c['kind'] in {'laya', 'deepseek', 'jev'}
-							and c.get('observation_index') == call['observation_index']
-						),
-						None,
-					)
-					call['decision_call_id'] = parent['id'] if parent else None
-					if parent and parent['kind'] == 'laya':
-						call['laya_call_id'] = parent['id']
+		def event(record: RunEvent):
+			name, payload, snapshot = record.name, record.payload, record.snapshot
 			append(name, payload)
-			if name in {'action_started', 'action_executed', 'action_result', 'action_rejected'}:
+			if name in {'action_started', 'action_executed', 'action_result'}:
 				execution_events.append({'event': name, 'time': now(), **deepcopy(payload)})
-			if name == 'observation':
-				page, history = current.state['page'], current.state['history']
-				try:
-					sampled = self.inspector(task, current.browser, page, history)
-					result = {
-						'sample_status': sampled.get('sample_status', 'completed'),
-						'evidence': deepcopy(sampled.get('evidence', {})),
-					}
-					if sampled.get('reason'):
-						result['reason'] = sampled['reason']
-				except Exception as error:
-					result = {'sample_status': 'error', 'evidence': {}, 'reason': str(error)}
-				step = len(history)
+			if record.preview is not None:
+				page, preview = snapshot['page'], record.preview
+				step = len(snapshot['history'])
+				phase = payload['phase']
 				evaluations.append(
-					{'step': step, 'time': now(), 'phase': payload.get('phase'), 'event_seq': payload.get('event_seq'), **result}
+					{'step': step, 'time': now(), 'phase': phase, 'event_seq': payload['event_seq'], **preview.sample}
 				)
 				frame = {
 					'step': step,
-					'phase': payload.get('phase'),
+					'phase': phase,
 					'url': page['url'],
-					**{k: payload[k] for k in ('plan_revision', 'subgoal_id') if k in payload},
-					**{k: payload[k] for k in ('event_seq', 'research_revision') if k in payload},
 					'title': page['title'],
 					'time': now(),
-					'elements': action_space(page.get('actions', []))[0],
-					'page': deepcopy({k: v for k, v in page.items() if k != 'screenshot'}),
+					'event_seq': payload['event_seq'],
+					'elements': snapshot['elements'],
+					'page': page,
 				}
 				try:
-					# Reuse the model's exact observation image when screenshot mode is enabled.
-					image = (
-						page.get('screenshot')
-						or current.browser.call(
-							'Page.captureScreenshot', format='jpeg', quality=72, captureBeyondViewport=False, _response_timeout=15
-						)['data']
-					)
-					filename = f'{len(observations):06}.jpg'
-					(folder / 'screenshots' / filename).write_bytes(base64.b64decode(image, validate=True))
-					frame['screenshot_url'] = '/api/baseline/frame?' + urlencode(
-						{'run_id': run_id, 'attempt_id': row['id'], 'name': filename}
-					)
+					if preview.image is None:
+						frame['screenshot_error'] = preview.error
+					else:
+						filename = f'{len(observations):06}.jpg'
+						(folder / 'screenshots' / filename).write_bytes(base64.b64decode(preview.image, validate=True))
+						frame['screenshot_url'] = '/api/baseline/frame?' + urlencode(
+							{'run_id': run_id, 'attempt_id': row['id'], 'name': filename}
+						)
 				except Exception as error:
 					frame['screenshot_error'] = str(error)
 				observations.append(frame)
-				append('observed', {'page': page, 'evaluation': result, 'frame': frame})
+				append('observed', {'page': page, 'evaluation': preview.sample, 'frame': frame})
 				atomic_json(
 					folder / 'evaluation.json',
 					self.clean(
 						{'observations': evaluations, 'metrics_status': 'not_computed', 'ever_met': None, 'first_met_step': None}
 					),
 				)
-				publish(current)
-			else:
-				publish(current)
+			publish(snapshot)
 
 		try:
 			append('attempt_start', {'task': task, 'repeat': row['repeat']})
-
-			def setup(browser):
-				try:
-					return self.preparer(task, browser)
-				except ValueError as error:
-					raise EnvironmentBlocked(str(error)) from error
-
-			agent = self.agent_factory(
-				task['url'],
-				task['goal'],
-				screenshots=False,
-				on_event=event,
-				should_cancel=cancelled,
-				prepare=setup,
-				system1_provider=row['system1_provider'],
-				execution_mode=row.get('execution_mode', 'direct'),
-				_settings=self.model_settings,
+			agent = self._run_factory(
+				task['url'], task['goal'], settings, on_event=event, should_cancel=cancelled, probe=CaseProbe(task)
 			)
-			while agent.state['status'] not in {'done', 'blocked'}:
-				reason = cancelled()
-				if reason:
-					raise RunCancelled(reason)
-				if agent.state.get('decision_rounds', len(agent.state['decisions'])) >= MAX_DECISION_ROUNDS:
-					raise RunCancelled('timeout')
-				agent.command('tick')
-				publish(agent)
-			row.update(execution_status=agent.state['status'], execution_reason='')
+			state = agent.snapshot()
+			while state['status'] not in {'done', 'blocked'}:
+				state = agent.command('tick')
+			row.update(execution_status=state['status'], execution_reason='')
+
 		except RunCancelled as error:
 			with self.lock:
 				row.update(
@@ -1001,8 +865,8 @@ class BaselineManager:
 				if agent and trusted and execution_status != 'cancelled':
 					final = evaluate_frozen(
 						frozen,
-						getattr(agent, 'helper_config', self.model_settings['text']),
-						agent.call_model,
+						settings.evaluation,
+						agent.model_call,
 						should_cancel=self.stop_event.is_set,
 					)
 				else:
@@ -1041,13 +905,14 @@ class BaselineManager:
 					)
 					row['reason'] = self.clean(execution_reason or final['reason'])
 				if agent:
-					agent.state.update(
+					snapshot = agent.snapshot()
+					snapshot.update(
 						evaluation=deepcopy(final),
 						execution_status=execution_status,
 						execution_reason=execution_reason,
 						evaluation_status=final['evaluation_status'],
 					)
-					publish(agent)
+					publish(snapshot)
 				atomic_json(folder / 'evaluation.json', self.clean({**evaluation, 'observations': evaluations}))
 				append('attempt_end', {'result': row})
 			finally:

@@ -1,15 +1,16 @@
-"""Explicit offline-evidence reevaluation: python -m jev_ultrafast.reevaluate ATTEMPT_FOLDER."""
+"""Explicit offline-evidence reevaluation: python -m browser_use.benchmark.reevaluate ATTEMPT_FOLDER."""
 
 import argparse
 import json
 import time
+from contextlib import contextmanager
 from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
 
-from .baseline import atomic_json
-from .baseline_evaluation import build_context, evaluate_frozen, freeze_context, validate_frozen
-from .model import text_config
+from .archive import atomic_json
+from .evaluation import build_context, evaluate_frozen, freeze_context, validate_frozen
+from .models import EvaluationModel, load_environment, redact_secrets, text_config
 
 
 def load_context(folder):
@@ -54,7 +55,7 @@ def load_context(folder):
 	return freeze_context(context, reconstructed=True)
 
 
-def reevaluate(folder, config, *, frozen=None):
+def reevaluate(folder, config: EvaluationModel, *, frozen=None):
 	"""Append a separate audit record. Original trace/result/evaluation/summary files are untouched."""
 	folder = Path(folder).resolve()
 	frozen = load_context(folder) if frozen is None else deepcopy(frozen)
@@ -70,24 +71,24 @@ def reevaluate(folder, config, *, frozen=None):
 	atomic_json(output / 'evaluation-context.json', frozen)
 	calls = []
 
-	def call_model(kind, function, *args, **metadata):
+	@contextmanager
+	def model_call(kind, **metadata):
 		record = {'id': len(calls) + 1, 'kind': kind, 'status': 'pending', **metadata}
 		calls.append(record)
 		started = time.perf_counter()
 		try:
-			reply = function(*args, trace=record)
+			yield record
 			record['status'] = 'success'
-			return reply
 		except Exception as error:
 			record.update(status='error', error=str(error))
 			raise
 		finally:
 			record['latency_ms'] = round((time.perf_counter() - started) * 1000)
-			atomic_json(output / 'model-calls.json', calls)
+			atomic_json(output / 'model-calls.json', redact_secrets(calls, config.api_key))
 
-	result = evaluate_frozen(frozen, config, call_model)
+	result = evaluate_frozen(frozen, config, model_call)
 	result.update(reevaluated_at=result['ended_at'], original_result_unchanged=True)
-	atomic_json(output / 'evaluation.json', result)
+	atomic_json(output / 'evaluation.json', redact_secrets(result, config.api_key))
 	return {
 		'path': str(output),
 		'context_id': frozen['context_id'],
@@ -110,8 +111,6 @@ def main():
 		atomic_json(args.output, frozen)
 		print(json.dumps({'path': str(args.output), 'context_id': frozen['context_id']}))
 	else:
-		from .demo import load_environment
-
 		load_environment()
 		print(json.dumps(reevaluate(args.attempt_folder, text_config()), ensure_ascii=False))
 

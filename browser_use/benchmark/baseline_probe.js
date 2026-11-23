@@ -9,7 +9,7 @@
   };
   const text = e => rendered(e) ? e.innerText.trim() : '';
   const read = selector => text(document.querySelector(selector));
-  const cache = window.__jevFast;
+  const cache = window.__benchmarkObserver;
   const node = e => cache?.ids.get(e) ?? null;
   const truncation = [];
   const bounded = (value, size, field) => {

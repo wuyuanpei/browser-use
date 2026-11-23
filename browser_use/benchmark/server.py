@@ -1,7 +1,8 @@
-"""Loopback-only inspector for the Jev browser agent."""
+"""Loopback-only HTTP interface for the Browser Use benchmark."""
 
 import argparse
 import atexit
+import hashlib
 import json
 import os
 import secrets
@@ -11,15 +12,18 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from dotenv import dotenv_values
-
-from ..engine import BrowserUseAgent as Agent
-from ..models import model_profiles, runtime_settings, system1_options
-from .agent import RunCancelled
 from .baseline import BaselineConflict, BaselineManager
-from .planner import execution_mode, planner_config, public_config
-from .questions import MAX_STEPS
-from .runtime import DEBUG_PROFILE, redact_secrets, runtime_info
+from .engine import MAX_STEPS, BrowserUseRun, RunCancelled
+from .models import (
+	DEBUG_PROFILE,
+	PROVIDER,
+	load_environment,
+	load_profile_environment,
+	model_profiles,
+	redact_secrets,
+	runtime_settings,
+)
+from .observation import READ_STATE
 
 ROOT = Path(__file__).parent
 PORT = 8824
@@ -27,8 +31,8 @@ ORIGIN = f'http://127.0.0.1:{PORT}'
 ARTIFACTS = Path.cwd() / 'artifacts' / 'baselines'
 TOKEN = secrets.token_urlsafe(32)
 LOCK = threading.Lock()
-AGENT = None
-BASELINE = None
+AGENT: BrowserUseRun | None = None
+BASELINE: BaselineManager | None = None
 FREE_PAUSE = threading.Event()
 
 
@@ -51,45 +55,35 @@ def baseline():
 	return BASELINE
 
 
-def load_environment():
-	path = Path.cwd() / '.env'
-	if path.exists():
-		for line in path.read_text(encoding='utf-8-sig').splitlines():
-			if '=' in line and not line.startswith('#'):
-				key, value = line.split('=', 1)
-				os.environ.setdefault(key, value)
-
-
-def load_profile_environment(path):
-	if not path.is_file():
-		raise ValueError('Jev model profile configuration file does not exist')
-	prefixes = ('PLANNER_', 'TEXT_MODEL_', 'REPORT_TEXT_MODEL_', 'SYSTEM1_DEEPSEEK_')
-	for key, value in dotenv_values(path, encoding='utf-8-sig', interpolate=False).items():
-		if value is not None and (key in {'TEXT_MODEL', 'REPORT_TEXT_MODEL'} or key.startswith(prefixes)):
-			os.environ[key] = value
-
-
 def response_state():
 	"""公开运行状态和脱敏配置，不返回后端保存的密钥。"""
 	state = AGENT.snapshot() if AGENT else {'page': None, 'status': 'idle', 'history': [], 'decision': None}
-	debug_planner = public_config(planner_config())
 	profiles = model_profiles()
+	debug = profiles[0]
 	return {
 		**state,
 		'model_profile': state.get('model_profile', DEBUG_PROFILE),
 		'model_profile_default': DEBUG_PROFILE,
 		'model_profiles': profiles,
-		'server_runtime': runtime_info(),
-		'text_model': state.get('text_model', os.environ.get('TEXT_MODEL', 'deepseek-chat')),
+		'server_runtime': {
+			'process_id': os.getpid(),
+			'observation_sha256': hashlib.sha256(READ_STATE.encode()).hexdigest(),
+		},
+		'text_model': state.get('text_model', debug['text']['model']),
 		'laya_base_url': os.environ.get('LAYA_BASE_URL', 'http://127.0.0.1:8791').rstrip('/'),
-		'text_model_base_url': state.get(
-			'text_model_base_url', os.environ.get('TEXT_MODEL_BASE_URL', 'https://api.deepseek.com/v1').rstrip('/')
-		),
+		'text_model_base_url': state.get('text_model_base_url', debug['text']['base_url']),
 		'max_steps': MAX_STEPS,
 		'baseline_active': bool(BASELINE and BASELINE.active),
-		'system1_options': system1_options(profiles),
-		'system1_default': 'browser_use',
-		'planner_default': debug_planner,
+		'system1_options': [
+			{
+				'provider': PROVIDER,
+				'label': 'Browser Use',
+				**debug['planner'],
+				'configured': any(profile['configured'] for profile in profiles),
+			}
+		],
+		'system1_default': PROVIDER,
+		'planner_default': debug['planner'],
 	}
 
 
@@ -101,11 +95,7 @@ def close_browser():
 
 
 def public_error(error):
-	keys = (
-		os.getenv(name)
-		for name in ('PLANNER_API_KEY', 'TEXT_MODEL_API_KEY', 'SYSTEM1_DEEPSEEK_API_KEY', 'REPORT_TEXT_MODEL_API_KEY')
-	)
-	return redact_secrets(str(error), *keys)
+	return redact_secrets(str(error))
 
 
 def command(name, body):
@@ -172,26 +162,23 @@ def command(name, body):
 			valid_url = False
 		if not valid_url:
 			raise ValueError('Enter a valid http:// or https:// website URL (up to 2,048 characters)')
-		mode = execution_mode(body.get('execution_mode'))
 		# 配置验证必须先于 close_browser，错误配置不抢占旧任务。
 		settings = runtime_settings(
 			body.get('system1_provider'),
-			mode,
+			body.get('execution_mode'),
 			body.get('screenshot_mode', False),
 			screenshot_policy=body.get('screenshot_policy'),
 			model_profile=body.get('model_profile'),
 		)
 		close_browser()
-		AGENT = Agent(
+		AGENT = BrowserUseRun(
 			url,
 			goal,
-			screenshots=True,
-			execution_mode=mode,
-			_settings=settings,
+			settings,
+			scenario=scenario,
 			should_cancel=lambda: 'paused' if FREE_PAUSE.is_set() else None,
 			record_dir=(Path.cwd() / 'artifacts' / 'frames' if body.get('record') else None),
 		)
-		AGENT.state['scenario'] = scenario
 	else:
 		if AGENT is None:
 			raise ValueError('Start a demo first')
@@ -247,7 +234,7 @@ class Handler(BaseHTTPRequestHandler):
 			with LOCK:
 				return self.send(200, json.dumps(response_state()))
 		if path == '/demo.mp4':
-			video = ROOT.parent / 'docs' / 'demo.mp4'
+			video = ROOT / 'docs' / 'demo.mp4'
 			if video.exists():
 				return self.send(200, video.read_bytes(), 'video/mp4')
 		files = {
@@ -306,7 +293,7 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
 	global PORT, ORIGIN, ARTIFACTS
-	parser = argparse.ArgumentParser(description='Run the Jev benchmark inspector with Browser Use')
+	parser = argparse.ArgumentParser(description='Run the Browser Use benchmark inspector')
 	parser.add_argument('--port', type=int, default=PORT, help='Loopback port. Use 0 for an available port.')
 	parser.add_argument('--artifacts', type=Path, default=ARTIFACTS, help='Directory for benchmark batches.')
 	parser.add_argument('--profile-env', type=Path, action='append', default=[], help='Reuse a Jev model configuration file.')

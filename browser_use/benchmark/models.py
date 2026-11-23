@@ -1,19 +1,128 @@
-"""Freeze the execution model and the independent evaluator for a run."""
+"""Load, validate and freeze the execution and evaluation profiles for a run."""
 
+import math
 import os
+from pathlib import Path
+from typing import Any, Literal
+from urllib.parse import urlsplit, urlunsplit
 
-from ._jev.model import text_config
-from ._jev.planner import planner_config, public_config
-from ._jev.runtime import DEBUG_PROFILE, FINAL_REPORT_PROFILE, REPORT_MODEL, report_text_config, validate_model_profile
+from dotenv import dotenv_values
+from pydantic import BaseModel, ConfigDict, Field
+
+PROVIDER = 'browser_use'
+DEBUG_PROFILE = 'debug'
+FINAL_REPORT_PROFILE = 'final_report'
+DEEPSEEK_URL = 'https://api.deepseek.com/v1'
+REPORT_MODEL = {'model': 'deepseek-flash', 'base_url': DEEPSEEK_URL}
+_SECRET_NAMES = (
+	'PLANNER_API_KEY',
+	'TEXT_MODEL_API_KEY',
+	'SYSTEM1_DEEPSEEK_API_KEY',
+	'REPORT_TEXT_MODEL_API_KEY',
+	'LAYA_API_KEY',
+	'TYPESAFE_API_KEY',
+)
 
 
-def model_profiles():
-	debug_execution = planner_config()
-	debug_text = text_config()
-	execution_public = public_config(debug_execution)
-	text_public = public_config(debug_text)
+class ModelEndpoint(BaseModel):
+	model_config = ConfigDict(frozen=True)
+
+	model: str
+	base_url: str
+	api_key: str = Field(repr=False, exclude=True)
+
+	def public(self) -> dict[str, str]:
+		address = urlsplit(self.base_url)
+		host = address.hostname or ''
+		if ':' in host:
+			host = f'[{host}]'
+		if address.port:
+			host += f':{address.port}'
+		return {'model': self.model, 'base_url': urlunsplit((address.scheme, host, address.path, '', ''))}
+
+
+class ExecutionModel(ModelEndpoint):
+	timeout: float
+	max_tokens: int
+
+
+class EvaluationModel(ModelEndpoint):
+	reasoning: dict[str, Any]
+
+
+class RunSettings(BaseModel):
+	model_config = ConfigDict(frozen=True)
+
+	profile: Literal['debug', 'final_report']
+	execution: ExecutionModel
+	evaluation: EvaluationModel
+	headless: bool
+	user_data_dir: str | None
+
+
+def load_environment():
+	"""Load optional local settings without overriding the process environment."""
+	for key, value in dotenv_values(Path.cwd() / '.env', encoding='utf-8-sig', interpolate=False).items():
+		if value is not None:
+			os.environ.setdefault(key, value)
+
+
+def load_profile_environment(path: Path):
+	"""Import the model fields accepted by the workbench from a profile file."""
+	if not path.is_file():
+		raise ValueError('Benchmark model profile configuration file does not exist')
+	prefixes = ('PLANNER_', 'TEXT_MODEL_', 'REPORT_TEXT_MODEL_', 'SYSTEM1_DEEPSEEK_')
+	for key, value in dotenv_values(path, encoding='utf-8-sig', interpolate=False).items():
+		if value is not None and (key in {'TEXT_MODEL', 'REPORT_TEXT_MODEL'} or key.startswith(prefixes)):
+			os.environ[key] = value
+
+
+def _debug_endpoint() -> ModelEndpoint:
+	# Keep the original profile variable names for existing local installations.
+	base = (os.getenv('PLANNER_BASE_URL') or os.getenv('SYSTEM1_DEEPSEEK_BASE_URL') or DEEPSEEK_URL).rstrip('/')
+	model = os.getenv('PLANNER_MODEL') or os.getenv('SYSTEM1_DEEPSEEK_MODEL') or 'deepseek-flash'
+	key = os.getenv('PLANNER_API_KEY', '').strip()
+	if not key and urlsplit(base).hostname == 'api.deepseek.com':
+		for prefix in ('SYSTEM1_DEEPSEEK', 'TEXT_MODEL'):
+			if urlsplit(os.getenv(f'{prefix}_BASE_URL') or DEEPSEEK_URL).hostname == 'api.deepseek.com':
+				key = os.getenv(f'{prefix}_API_KEY', '').strip()
+				if key:
+					break
+	return ModelEndpoint(model=model, base_url=base, api_key=key)
+
+
+def text_config() -> EvaluationModel:
+	base = os.getenv('TEXT_MODEL_BASE_URL', DEEPSEEK_URL).rstrip('/')
+	reasoning: dict[str, Any] = (
+		{'thinking': {'type': 'disabled'}} if 'api.deepseek.com/' in base else {'reasoning': {'effort': 'low'}}
+	)
+	if os.getenv('TEXT_MODEL_REASONING') == 'none':
+		reasoning = {'reasoning': {'enabled': False}}
+	return EvaluationModel(
+		model=os.getenv('TEXT_MODEL', 'deepseek-chat'),
+		base_url=base,
+		api_key=os.getenv('TEXT_MODEL_API_KEY', ''),
+		reasoning=reasoning,
+	)
+
+
+def _report_evaluation() -> EvaluationModel:
+	if (os.getenv('REPORT_TEXT_MODEL_BASE_URL') or DEEPSEEK_URL).rstrip('/') != DEEPSEEK_URL:
+		raise ValueError(f'REPORT_TEXT_MODEL_BASE_URL must be {DEEPSEEK_URL}')
+	if (os.getenv('REPORT_TEXT_MODEL') or REPORT_MODEL['model']) != REPORT_MODEL['model']:
+		raise ValueError(f'REPORT_TEXT_MODEL must be {REPORT_MODEL["model"]}')
+	if (os.getenv('REPORT_TEXT_MODEL_REASONING') or 'disabled') != 'disabled':
+		raise ValueError('REPORT_TEXT_MODEL_REASONING must be disabled')
+	key = os.getenv('REPORT_TEXT_MODEL_API_KEY', '').strip()
+	if not key:
+		raise ValueError('Final report needs REPORT_TEXT_MODEL_API_KEY')
+	return EvaluationModel(**REPORT_MODEL, api_key=key, reasoning={'thinking': {'type': 'disabled'}})
+
+
+def model_profiles() -> list[dict[str, Any]]:
+	debug_execution, debug_text = _debug_endpoint(), text_config()
 	try:
-		report_text_config()
+		_report_evaluation()
 		report_ready = True
 	except ValueError:
 		report_ready = False
@@ -21,9 +130,10 @@ def model_profiles():
 		{
 			'id': DEBUG_PROFILE,
 			'label': '调试',
-			'configured': bool(debug_execution['api_key'] and debug_text['api_key']),
-			'planner': {k: execution_public[k] for k in ('model', 'base_url')},
-			'text': {k: text_public[k] for k in ('model', 'base_url')},
+			'configured': bool(debug_execution.api_key and debug_text.api_key),
+			# The inspector already reads the execution endpoint from this field.
+			'planner': debug_execution.public(),
+			'text': debug_text.public(),
 		},
 		{
 			'id': FINAL_REPORT_PROFILE,
@@ -35,47 +145,64 @@ def model_profiles():
 	]
 
 
-def system1_options(profiles):
-	debug = profiles[0]['planner']
-	return [
-		{
-			'provider': 'browser_use',
-			'label': 'Browser Use',
-			'model': debug['model'],
-			'base_url': debug['base_url'],
-			'configured': any(profile['configured'] for profile in profiles),
-		},
-	]
-
-
-def runtime_settings(provider, mode, screenshot_mode=False, *, screenshot_policy=None, model_profile=None):
-	if mode != 'direct':
+def runtime_settings(
+	provider=None, mode=None, screenshot_mode=False, *, screenshot_policy=None, model_profile=None
+) -> RunSettings:
+	if mode not in (None, 'direct'):
 		raise ValueError('Browser Use 目前支持直接执行。旧记录中的 Planner 详情仍可查看。')
-	if provider not in (None, '', 'browser_use'):
+	if provider not in (None, '', PROVIDER):
 		raise ValueError('测试台使用 Browser Use 执行。')
 	policy = screenshot_policy if screenshot_policy is not None else 'always' if screenshot_mode else 'off'
 	if policy != 'off':
 		raise ValueError('当前两套 DeepSeek 配置使用文本输入，实时预览仍会生成。')
-	profile = validate_model_profile(model_profile)
+	profile = DEBUG_PROFILE if model_profile is None else model_profile
+	if profile not in (DEBUG_PROFILE, FINAL_REPORT_PROFILE):
+		raise ValueError('model_profile must be debug or final_report')
 	if profile == FINAL_REPORT_PROFILE:
-		verifier = report_text_config()
-		execution = planner_config(service=verifier)
+		evaluation = _report_evaluation()
+		endpoint = evaluation
 	else:
-		execution = planner_config(require_key=True)
-		verifier = text_config()
-		if not verifier['api_key']:
-			raise ValueError('调试终验需要原 Jev 的 TEXT_MODEL_API_KEY。')
+		endpoint, evaluation = _debug_endpoint(), text_config()
+		if not endpoint.api_key:
+			raise ValueError('调试执行需要 PLANNER_API_KEY 或同一官方 DeepSeek 服务的凭据。')
+		if not evaluation.api_key:
+			raise ValueError('调试终验需要 TEXT_MODEL_API_KEY。')
 
-	public = public_config(execution)
-	return {
-		'system1': {'provider': 'browser_use', 'model': public['model'], 'base_url': public['base_url']},
-		'system1_key': execution['api_key'],
-		'execution_config': execution,
-		'text': verifier,
-		'model_profile': profile,
-		'screenshot_mode': False,
-		'screenshot_policy': policy,
-		'headless': os.getenv('BROWSER_USE_BENCHMARK_HEADLESS', 'true').lower() not in {'0', 'false'},
-		'user_data_dir': os.getenv('BROWSER_USE_BENCHMARK_USER_DATA_DIR'),
-		'planner': None,
-	}
+	timeout = float(os.getenv('PLANNER_TIMEOUT_SECONDS') or '60')
+	if not math.isfinite(timeout) or timeout <= 0:
+		raise ValueError('PLANNER_TIMEOUT_SECONDS must be positive and finite')
+	try:
+		max_tokens = int(os.getenv('PLANNER_MAX_TOKENS') or '4096')
+		if max_tokens <= 0:
+			raise ValueError()
+	except ValueError:
+		raise ValueError('PLANNER_MAX_TOKENS must be a positive integer') from None
+
+	return RunSettings(
+		profile=profile,
+		execution=ExecutionModel(
+			model=endpoint.model, base_url=endpoint.base_url, api_key=endpoint.api_key, timeout=timeout, max_tokens=max_tokens
+		),
+		evaluation=evaluation,
+		headless=os.getenv('BROWSER_USE_BENCHMARK_HEADLESS', 'true').lower() not in {'0', 'false'},
+		user_data_dir=os.getenv('BROWSER_USE_BENCHMARK_USER_DATA_DIR'),
+	)
+
+
+def redact_secrets(data: Any, *keys: str | None) -> Any:
+	"""Remove current credentials from public responses, records and diagnostics."""
+	secrets = {key for key in (*keys, *(os.getenv(name) for name in _SECRET_NAMES)) if key}
+	if not secrets:
+		return data
+
+	def clean(value: Any) -> Any:
+		if isinstance(value, str):
+			for secret in secrets:
+				value = value.replace(secret, '[REDACTED]')
+		elif isinstance(value, dict):
+			return {clean(k): clean(v) for k, v in value.items()}
+		elif isinstance(value, list):
+			return [clean(item) for item in value]
+		return value
+
+	return clean(data)

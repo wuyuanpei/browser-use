@@ -147,8 +147,6 @@ skip-magic-trailing-comma = false
 [tool.pyright]
 typeCheckingMode = "basic"
 include = ["browser_use", "examples", "tests"]
-# The migrated Jev inspector uses dynamic archive and CDP records.
-ignore = ["browser_use/benchmark/_jev"]
 exclude = [
     ".venv/",
     ".venv*/",
@@ -188,9 +186,9 @@ include = [
     "browser_use/skills/**/*.md",
     "browser_use/py.typed",
     "browser_use/dom/**/*.js",
-    "browser_use/benchmark/_jev/*.json",
-    "browser_use/benchmark/_jev/*.js",
-    "browser_use/benchmark/_jev/static/*",
+    "browser_use/benchmark/*.json",
+    "browser_use/benchmark/*.js",
+    "browser_use/benchmark/static/*",
     "browser_use/benchmark/docs/demo.mp4",
     "browser_use/benchmark/LICENSE",
     "!tests/**/*.py",

@@ -1,5 +1,6 @@
-"""Start the original Jev inspector with the Browser Use adapter."""
+"""Start the Browser Use benchmark workbench."""
 
-from ._jev.demo import main
+from .server import main
 
-main()
+if __name__ == '__main__':
+	main()

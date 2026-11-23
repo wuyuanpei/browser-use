@@ -1,4 +1,4 @@
-"""Browser Use execution behind the original synchronous Jev inspector contract."""
+"""Run Browser Use in an owned browser and publish benchmark observations."""
 
 from __future__ import annotations
 
@@ -8,20 +8,48 @@ import os
 import tempfile
 import threading
 import time
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from ._jev.agent import Agent as InspectorAgent
-from ._jev.agent import RunCancelled
-from ._jev.browser import READ_STATE, fingerprint
-from ._jev.model import action_space
-from ._jev.questions import MAX_STEPS
+from .models import PROVIDER, RunSettings, redact_secrets
+from .observation import READ_STATE, document_key, fingerprint, indexed_elements
+from .token_usage import token_usage
 
 if TYPE_CHECKING:
 	from browser_use.agent.service import Agent
 	from browser_use.browser.session import BrowserSession, CDPSession
 	from browser_use.browser.views import BrowserStateSummary
+
+	from .tasks import CaseProbe
+
+MAX_STEPS = 100
+VIEWPORT = {'width': 1366, 'height': 780}
+
+
+class RunCancelled(RuntimeError):
+	"""Cooperative cancellation at a boundary before browser input."""
+
+	is_cancellation = True
+
+
+@dataclass(frozen=True)
+class Preview:
+	image: str | None
+	error: str | None
+	sample: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class RunEvent:
+	name: str
+	payload: dict[str, Any]
+	snapshot: dict[str, Any]
+	preview: Preview | None
+
 
 if os.name == 'nt':
 
@@ -95,23 +123,20 @@ class _BrowserLoop:
 
 
 class _BoundBrowser:
-	"""Adapt Jev's read-only probe and allowlisted fixture setup to an owned CDP target."""
+	"""Read observations and prepare fixtures on the currently owned CDP target."""
 
 	def __init__(self, bridge):
 		self.bridge = bridge
 		self.native: BrowserSession | None = None
 		self.bound: CDPSession | None = None
-		self.target = self.session = None
-		self._owned = {}
 
-	async def bind(self):
+	async def bind(self) -> str:
 		browser = self.native
 		if browser is None or not (target := browser.agent_focus_target_id):
 			raise RuntimeError('Browser Use has no active page')
 		bound = await browser.get_or_create_cdp_session(target, focus=False)
 		self.bound = bound
-		self.target, self.session = bound.target_id, bound.session_id
-		self._owned = {self.target: {'session': self.session}}
+		return bound.target_id
 
 	async def send(self, method, params):
 		browser = self.native
@@ -132,70 +157,56 @@ class _BoundBrowser:
 		timeout = params.pop('_response_timeout', 20)
 		return self.bridge.run(self.send(method, params), timeout=timeout)
 
-	def evaluate(self, expression, *, utf8=False):
+	def evaluate(self, expression: str) -> Any:
 		result = self.call('Runtime.evaluate', expression=expression, returnByValue=True, awaitPromise=True)
 		if result.get('exceptionDetails'):
 			raise RuntimeError(f'Browser evaluation failed: {result["exceptionDetails"].get("text", "")}')
 		return result['result'].get('value')
 
-	def observe(self, *, screenshot):
-		self.bridge.run(self.bind())
+	def observe(self) -> dict[str, Any]:
+		target = self.bridge.run(self.bind())
 		page = self.evaluate(READ_STATE)
 		if not isinstance(page, dict):
 			raise RuntimeError('Browser document is unavailable')
-		page.update(target_id=self.target, observed_at=datetime.now(timezone.utc).isoformat())
+		page.update(target_id=target, document_id=document_key(page)[1], observed_at=datetime.now(timezone.utc).isoformat())
 		page['dom_fingerprint'] = page['fingerprint'] = fingerprint(page)
-		if screenshot:
-			page['screenshot'] = self.call('Page.captureScreenshot', format='jpeg', quality=72, captureBeyondViewport=False)[
-				'data'
-			]
 		return page
 
+	def screenshot(self, timeout: int = 20) -> str:
+		return self.call(
+			'Page.captureScreenshot', format='jpeg', quality=72, captureBeyondViewport=False, _response_timeout=timeout
+		)['data']
 
-class BrowserUseAgent(InspectorAgent):
-	"""Expose native observation, prediction and execution as the inspector's original commands."""
+
+class BrowserUseRun:
+	"""Own one browser session, its decisions and the inspector's published evidence."""
 
 	def __init__(
 		self,
-		url,
-		goal,
-		screenshots=False,
-		on_event=None,
-		should_cancel=None,
-		prepare=None,
-		system1_provider=None,
-		execution_mode='direct',
-		_settings=None,
-		record_dir=None,
-		**_,
+		url: str,
+		goal: str,
+		settings: RunSettings,
+		*,
+		scenario: str | None = None,
+		on_event: Callable[[RunEvent], None] | None = None,
+		should_cancel: Callable[[], str | None] | None = None,
+		probe: CaseProbe | None = None,
+		record_dir: Path | None = None,
 	):
-		if not _settings:
-			from .models import runtime_settings
-
-			_settings = runtime_settings(system1_provider, execution_mode)
-		settings = _settings
-		config = settings['system1']
-		provider = config['provider']
-		if execution_mode not in (None, 'direct'):
-			raise ValueError('Browser Use currently supports direct execution')
-		if provider != 'browser_use':
-			raise ValueError(f'Unsupported Browser Use provider: {provider}')
-		self.helper_config = settings['text']
-		self._report_key = self.helper_config.get('api_key') if settings.get('model_profile') == 'final_report' else None
-		self.on_event, self.should_cancel = on_event, should_cancel
-		self.record_dir = Path(record_dir) if record_dir else None
-		self.screenshots = screenshots or bool(self.record_dir)
-		self.state: dict[str, Any] = dict(
+		self._secrets = (settings.execution.api_key, settings.evaluation.api_key)
+		self._on_event, self._should_cancel, self._probe = on_event, should_cancel, probe
+		self._record_dir = record_dir
+		self._state: dict[str, Any] = dict(
 			goal=goal,
-			system1_provider=provider,
-			system1_model=config['model'],
-			system1_base_url=config.get('base_url', ''),
+			system1_provider=PROVIDER,
+			system1_model=settings.execution.model,
+			system1_base_url=settings.execution.public()['base_url'],
 			execution_mode='direct',
-			screenshot_mode=settings.get('screenshot_mode', False),
-			screenshot_policy=settings.get('screenshot_policy', 'off'),
-			model_profile=settings.get('model_profile', 'debug'),
-			text_model=self.helper_config['model'],
-			text_model_base_url=self.helper_config['base_url'],
+			screenshot_mode=False,
+			screenshot_policy='off',
+			model_profile=settings.profile,
+			text_model=settings.evaluation.model,
+			text_model_base_url=settings.evaluation.public()['base_url'],
 			status='ready',
 			page={},
 			decision=None,
@@ -209,131 +220,179 @@ class BrowserUseAgent(InspectorAgent):
 			observation_index=-1,
 			plan=[goal],
 			plan_index=0,
-			record=bool(self.record_dir),
+			record=bool(record_dir),
 			free_step_supported=True,
 		)
+		if scenario is not None:
+			self._state['scenario'] = scenario
 		self._started = time.monotonic()
 		self._closed = False
 		self._browser_start_dispatched = False
-		self.check_cancelled()
+		self._check_cancelled()
 		self._temp = tempfile.TemporaryDirectory(prefix='browser-use-benchmark-', ignore_cleanup_errors=True)
 		self._bridge = _BrowserLoop()
-		self.browser = _BoundBrowser(self._bridge)
-		self.native: Agent | None = None
-		self.summary: BrowserStateSummary | None = None
+		self._browser = _BoundBrowser(self._bridge)
+		self._native: Agent | None = None
+		self._summary: BrowserStateSummary | None = None
 		try:
 			# BrowserStartEvent launches and attaches CDP on the native event bus.
 			# Let that operation settle before issuing kill() on the same session.
 			self._bridge.run(self._start(url, settings), timeout=110)
-			self.check_cancelled()
-			if prepare:
-				prepare(self.browser)
-			self.check_cancelled()
+			self._check_cancelled()
+			if probe:
+				probe.prepare(self._browser.evaluate)
+			self._check_cancelled()
 			self.observe('initial')
 		except BaseException:
 			self.close()
 			raise
 
-	async def _start(self, url, settings):
-		self.check_cancelled()
+	def _check_cancelled(self):
+		reason = self._should_cancel() if self._should_cancel else None
+		if reason:
+			raise RunCancelled(reason)
+
+	def _emit(self, name: str, *, preview: Preview | None = None, **payload: Any):
+		self._state['event_seq'] += 1
+		self._state['elapsed_ms'] = round((time.monotonic() - self._started) * 1000)
+		if self._on_event:
+			payload = redact_secrets({'event_seq': self._state['event_seq'], **payload}, *self._secrets)
+			self._on_event(RunEvent(name, payload, self.snapshot(), preview))
+
+	def snapshot(self) -> dict[str, Any]:
+		return redact_secrets(
+			{
+				**self._state,
+				'token_usage': token_usage(self._state['model_calls']),
+				'elements': indexed_elements(self._state['page'].get('actions', [])),
+			},
+			*self._secrets,
+		)
+
+	@contextmanager
+	def model_call(self, kind: str, **metadata: Any) -> Iterator[dict[str, Any]]:
+		"""Record one real execution or verification request with the same sequencing."""
+		calls = self._state['model_calls']
+		record = dict(
+			id=len(calls) + 1,
+			kind=kind,
+			status='pending',
+			observation_index=self._state['observation_index'],
+			event_seq=self._state['event_seq'] + 1,
+			**metadata,
+		)
+		calls.append(record)
+		self._emit('model_start', call=record)
+		started = time.perf_counter()
+		try:
+			yield record
+			record['status'] = 'success'
+		except BaseException as error:
+			record.update(status='error', error=str(error) or type(error).__name__)
+			raise
+		finally:
+			record['latency_ms'] = round((time.perf_counter() - started) * 1000)
+			self._emit('model_end', call=record)
+
+	async def _start(self, url: str, settings: RunSettings):
+		self._check_cancelled()
 		from browser_use import Agent, BrowserSession, ChatDeepSeek
 
-		self.check_cancelled()
-		config = settings['system1']
-		executable = settings.get('browser_executable') or os.getenv('BROWSER_USE_EXECUTABLE_PATH')
-		profile = settings.get('user_data_dir') or str(Path(self._temp.name) / 'profile')
+		self._check_cancelled()
+		executable = os.getenv('BROWSER_USE_EXECUTABLE_PATH')
+		profile = settings.user_data_dir or str(Path(self._temp.name) / 'profile')
 		options: dict[str, Any] = dict(
-			user_data_dir=profile, keep_alive=True, enable_default_extensions=False, viewport={'width': 1366, 'height': 780}
+			user_data_dir=profile, keep_alive=True, enable_default_extensions=False, viewport=VIEWPORT, headless=settings.headless
 		)
-		if 'headless' in settings:
-			options['headless'] = settings['headless']
 		if executable:
 			options['executable_path'] = executable
 		browser = BrowserSession(**options)
-		self.browser.native = browser
-		execution = settings['execution_config']
+		self._browser.native = browser
+		execution = settings.execution
 		llm = ChatDeepSeek(
-			model=execution['model'],
-			api_key=execution['api_key'],
-			base_url=execution['base_url'],
-			timeout=execution['timeout'],
-			max_tokens=execution['max_tokens'],
+			model=execution.model,
+			api_key=execution.api_key,
+			base_url=execution.base_url,
+			timeout=execution.timeout,
+			max_tokens=execution.max_tokens,
 			thinking=False,
 		)
 		original = llm.ainvoke
 
 		async def traced(messages, output_format=None, **kwargs):
-			record = dict(
-				id=len(self.state['model_calls']) + 1,
-				kind=config['provider'],
-				model=config['model'],
-				status='pending',
-				observation_index=self.state['observation_index'],
-				request={'model': config['model'], 'messages': [m.model_dump(mode='json') for m in messages]},
-			)
-			self.state['model_calls'].append(record)
-			self.emit('model_start', call=record)
-			started = time.monotonic()
-			try:
+			request = dict(model=execution.model, messages=[message.model_dump(mode='json') for message in messages])
+			with self.model_call(PROVIDER, model=execution.model, request=request) as record:
 				reply = await original(messages, output_format=output_format, **kwargs)
-				record.update(status='success', response=reply.model_dump(mode='json', exclude_none=True))
+				record['response'] = reply.model_dump(mode='json', exclude_none=True)
 				return reply
-			except BaseException as error:
-				record.update(status='error', error=str(error) or type(error).__name__)
-				raise
-			finally:
-				record['latency_ms'] = round((time.monotonic() - started) * 1000)
-				self.emit('model_end', call=record)
 
 		async def check_stop():
-			self.check_cancelled()
+			self._check_cancelled()
 			return False
 
 		object.__setattr__(llm, 'ainvoke', traced)
-		self.native = Agent(
-			task=self.state['goal'],
+		self._native = Agent(
+			task=self._state['goal'],
 			llm=llm,
 			browser_session=browser,
 			use_judge=False,
 			directly_open_url=False,
 			enable_signal_handler=False,
 			register_external_agent_status_raise_error_callback=check_stop,
-			use_vision=self.state['screenshot_mode'],
+			use_vision=False,
 			max_actions_per_step=1,
 			enable_planning=False,
 			file_system_path=str(Path(self._temp.name) / 'agent-files'),
 		)
-		self.check_cancelled()
+		self._check_cancelled()
 		self._browser_start_dispatched = True
 		await browser.start()
-		self.check_cancelled()
+		self._check_cancelled()
 		await browser.navigate_to(url)
-		self.check_cancelled()
-		await self.browser.bind()
+		self._check_cancelled()
+		await self._browser.bind()
 
-	def observe(self, phase='step'):
-		self.state['page'] = self.browser.observe(screenshot=self.screenshots)
-		self.emit('observation', phase=phase)
-		if self.screenshots and not self.on_event:
-			self.state['observations'][-1]['page']['screenshot'] = self.state['page']['screenshot']
-		if self.record_dir:
-			self.record_dir.mkdir(parents=True, exist_ok=True)
+	def observe(self, phase: str = 'step'):
+		page = self._browser.observe()
+		self._state['page'] = page
+		self._state['observation_index'] += 1
+		if self._on_event:
+			sample = self._probe.inspect(self._browser.evaluate, page) if self._probe else {}
+			try:
+				preview = Preview(self._browser.screenshot(timeout=15), None, sample)
+			except Exception as error:
+				preview = Preview(None, str(error), sample)
+			self._emit('observation', preview=preview, phase=phase)
+			return
+
+		image = self._browser.screenshot()
+		page['screenshot'] = image
+		self._state.setdefault('observations', []).append(
+			dict(
+				page=page,
+				phase=phase,
+				step=len(self._state['history']),
+				elements=indexed_elements(page['actions']),
+				event_seq=self._state['event_seq'] + 1,
+			)
+		)
+		self._emit('observation', phase=phase)
+		if self._record_dir:
+			self._record_dir.mkdir(parents=True, exist_ok=True)
 			if phase == 'initial':
 				self._record_started = time.monotonic()
 			elapsed = round((time.monotonic() - self._record_started) * 1000)
-			frame = self.record_dir / f'{elapsed:06d}.jpg'
-			frame.write_bytes(base64.b64decode(self.state['page']['screenshot'], validate=True))
-		return self.state['page']
+			(self._record_dir / f'{elapsed:06d}.jpg').write_bytes(base64.b64decode(image, validate=True))
 
 	async def _predict(self):
 		from browser_use.agent.views import AgentStepInfo
 
-		agent = self.native
+		agent = self._native
 		if agent is None:
 			raise RuntimeError('Browser Use agent is unavailable')
 		agent.step_start_time = time.time()
 		summary = await agent._prepare_context(AgentStepInfo(agent.state.n_steps - 1, MAX_STEPS))
-		self.summary = summary
+		self._summary = summary
 		agent.state.last_model_output = agent.state.last_result = None
 		await agent._get_next_action(summary)
 		model_output = agent.state.last_model_output
@@ -351,88 +410,88 @@ class BrowserUseAgent(InspectorAgent):
 		node = summary.dom_state.selector_map.get(index) if isinstance(index, int) else None
 		if node is not None:
 			try:
-				obj = await self.browser.send('DOM.resolveNode', {'backendNodeId': node.backend_node_id})
+				obj = await self._browser.send('DOM.resolveNode', {'backendNodeId': node.backend_node_id})
 				object_id = obj['object']['objectId']
 				try:
-					result = await self.browser.send(
+					result = await self._browser.send(
 						'Runtime.callFunctionOn',
 						{
 							'objectId': object_id,
 							'returnByValue': True,
-							'functionDeclaration': 'function(){return window.__jevFast?.ids?.get(this) ?? null}',
+							'functionDeclaration': 'function(){return window.__benchmarkObserver?.ids?.get(this) ?? null}',
 						},
 					)
 				finally:
-					await self.browser.send('Runtime.releaseObject', {'objectId': object_id})
+					await self._browser.send('Runtime.releaseObject', {'objectId': object_id})
 				identity = result.get('result', {}).get('value')
-				elements = action_space(self.state['page']['actions'], include_node_refs=True)[0]
+				elements = indexed_elements(self._state['page']['actions'], include_node_refs=True)
 				target = next((e['index'] for e in elements if e['node_ref'] == identity), '')
 			except (RuntimeError, KeyError):
 				pass  # Closed frame or remote child target cannot be annotated on this screenshot.
 		return raw, operation, target
 
 	async def _act(self):
-		agent = self.native
+		agent = self._native
 		if agent is None:
 			raise RuntimeError('Browser Use agent is unavailable')
 		await agent._execute_actions()
 		await agent._post_process()
-		await agent._finalize(self.summary)
+		await agent._finalize(self._summary)
 		return [r.model_dump(mode='json', exclude_none=True) for r in (agent.state.last_result or [])]
 
 	def command(self, name, body=None):
 		if name not in {'predict', 'act', 'tick'}:
 			raise ValueError(f'Unknown Browser Use command: {name}')
 		try:
-			self.check_cancelled()
-			if self.state['status'] in {'done', 'blocked'}:
+			self._check_cancelled()
+			if self._state['status'] in {'done', 'blocked'}:
 				return self.snapshot()
-			if name in {'predict', 'tick'} and self.state['decision'] is None:
+			if name in {'predict', 'tick'} and self._state['decision'] is None:
 				self._choose()
 			if name in {'act', 'tick'}:
 				self._execute((body or {}).get('fingerprint'))
 		except RunCancelled:
-			self.state.update(decision=None, status='ready')
+			self._state.update(decision=None, status='ready')
 			raise
 		finally:
-			self.state['elapsed_ms'] = round((time.monotonic() - self._started) * 1000)
+			self._state['elapsed_ms'] = round((time.monotonic() - self._started) * 1000)
 		return self.snapshot()
 
 	def _choose(self):
-		if self.state['decision_rounds'] >= MAX_STEPS:
+		if self._state['decision_rounds'] >= MAX_STEPS:
 			raise RunCancelled('timeout')
-		raw, operation, target = self._bridge.run(self._predict(), cancel=self.should_cancel, timeout=150)
+		raw, operation, target = self._bridge.run(self._predict(), cancel=self._should_cancel, timeout=150)
 		decision = dict(
 			operation=operation,
 			target=target,
 			choice=operation,
 			native_action=raw,
-			provider=self.state['system1_provider'],
-			fingerprint=self.state['page']['fingerprint'],
-			observation_index=self.state['observation_index'],
+			provider=self._state['system1_provider'],
+			fingerprint=self._state['page']['fingerprint'],
+			observation_index=self._state['observation_index'],
 			probabilities={},
 		)
-		self.state['decisions'].append(decision)
-		self.state['decision_rounds'] += 1
-		self.state.update(decision=decision, status='predicted')
-		if self.state['model_calls']:
-			self.state['model_calls'][-1].update(decision=decision, operation=operation, target=target)
-		self.emit('decision', decision=decision)
+		self._state['decisions'].append(decision)
+		self._state['decision_rounds'] += 1
+		self._state.update(decision=decision, status='predicted')
+		if self._state['model_calls']:
+			self._state['model_calls'][-1].update(decision=decision, operation=operation, target=target)
+		self._emit('decision', decision=decision)
 
 	def _execute(self, expected_fingerprint):
-		decision = self.state['decision']
+		decision = self._state['decision']
 		if decision is None:
 			raise ValueError('Predict a Browser Use action first')
-		self.check_cancelled()
-		page = self.state['page']
-		current = self.browser.observe(screenshot=False)
+		self._check_cancelled()
+		page = self._state['page']
+		current = self._browser.observe()
 		if (
 			current['target_id'] != page['target_id']
 			or current.get('document_id') != page.get('document_id')
 			or current['fingerprint'] != decision['fingerprint']
 			or (expected_fingerprint is not None and expected_fingerprint != decision['fingerprint'])
 		):
-			self.state.update(decision=None, status='ready')
+			self._state.update(decision=None, status='ready')
 			self.observe('stale_retry')
 			return
 		operation = decision['operation']
@@ -444,28 +503,28 @@ class BrowserUseAgent(InspectorAgent):
 			native_action=decision['native_action'],
 			source_url=page['url'],
 			source_document=page.get('document_id'),
-			step=len(self.state['history']) + 1,
+			step=len(self._state['history']) + 1,
 		)
-		self.emit('action_started', action=action)
-		self.state.update(decision=None, status='ready')
+		self._emit('action_started', action=action)
+		self._state.update(decision=None, status='ready')
 		try:
-			results = self._bridge.run(self._act(), cancel=self.should_cancel, timeout=150)
+			results = self._bridge.run(self._act(), cancel=self._should_cancel, timeout=150)
 		except BaseException as error:
-			self.emit('action_result', action=action, error=str(error) or type(error).__name__)
+			self._emit('action_result', action=action, error=str(error) or type(error).__name__)
 			raise
 		result = results[-1] if results else {}
 		action.update(result=results, elapsed_ms=round((time.monotonic() - self._started) * 1000))
 		if operation != 'done':
-			self.state['history'].append(action)
-		self.emit('action_executed', action=action)
+			self._state['history'].append(action)
+		self._emit('action_executed', action=action)
 		if result.get('is_done'):
 			answer = result.get('extracted_content') or result.get('long_term_memory') or ''
-			self.state.update(
+			self._state.update(
 				status='blocked' if result.get('success') is False else 'done', plan_index=1, result={'markdown': answer}
 			)
 		elif not results:
-			self.state.update(status='blocked', stop_reason='Browser Use returned no action result')
-		self.emit('action_result', action=action, result=results)
+			self._state.update(status='blocked', stop_reason='Browser Use returned no action result')
+		self._emit('action_result', action=action, result=results)
 		self.observe('step')
 
 	def close(self):
@@ -473,7 +532,7 @@ class BrowserUseAgent(InspectorAgent):
 			return
 		self._closed = True
 		try:
-			if self.browser.native is not None:
+			if self._browser.native is not None:
 				self._bridge.run(self._close_browser(), timeout=25)
 		finally:
 			self._bridge.close()
@@ -481,9 +540,9 @@ class BrowserUseAgent(InspectorAgent):
 
 	async def _close_browser(self):
 		try:
-			if self.native is not None:
-				await self.native.eventbus.stop(clear=True, timeout=1)
+			if self._native is not None:
+				await self._native.eventbus.stop(clear=True, timeout=1)
 		finally:
-			browser = self.browser.native
+			browser = self._browser.native
 			if self._browser_start_dispatched and browser is not None:
 				await browser.kill()

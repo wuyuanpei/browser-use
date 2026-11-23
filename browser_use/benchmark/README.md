@@ -12,8 +12,10 @@ uv pip install -r pyproject.toml --extra benchmark
 
 打开 http://127.0.0.1:8824/#baseline。自由任务和基线测试均由 Browser Use 执行。浏览器默认使用独立临时配置。批次保存在当前目录的 `artifacts/baselines`，可用 `--artifacts` 指定目录。
 
-默认使用调试配置，复用原 Jev 的 Planner 服务执行、Text 服务独立终验。最终报告沿用原来的模型、服务和专用凭据，仅显式选择时用于当次运行。可用 `--profile-env` 读取已有的本机 Jev 配置，也可以在仓库的 `.env` 配置相同变量。若真实用例需要登录，可用 `BROWSER_USE_BENCHMARK_USER_DATA_DIR` 指定专用 Chrome 配置目录。
+默认使用调试配置。Browser Use 从原来的 `PLANNER_*` 读取执行模型，独立终验从 `TEXT_MODEL_*` 读取模型。最终报告沿用原来的模型、服务和专用凭据，仅显式选择时用于当次运行。可用 `--profile-env` 读取已有的本机 Jev 配置，也可以在仓库的 `.env` 配置相同变量。若真实用例需要登录，可用 `BROWSER_USE_BENCHMARK_USER_DATA_DIR` 指定专用 Chrome 配置目录。
 
-新运行支持直接执行。旧归档中的 Planner、重规划、资料库和模型调用详情仍由原版界面呈现。
+`engine.py` 管理 Browser Use 会话和运行事件。`tasks.py` 准备用例并从浏览器采集验收证据，`baseline.py` 保存批次、截图和 trace，`evaluation.py` 根据冻结的证据独立终验。历史归档里的 Planner、重规划和资料库由原版界面从 trace 回放。
+
+可运行 `python -m browser_use.benchmark.reevaluate ATTEMPT_FOLDER` 复评历史归档。加上 `--prepare-only --output CONTEXT.json` 可以单独导出评估输入。
 
 公开用例 79、83 和 91 使用测试邮箱或测试收货信息。实际跑这三条用例时，可以将用例数据替换为专用测试账号的值。

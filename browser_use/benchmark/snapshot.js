@@ -1,6 +1,6 @@
 (function readState() {
   if (!document.body) return null;
-  const cache = window.__jevFast ||= { ids: new WeakMap(), nodes: new Map(), next: 1 };
+  const cache = window.__benchmarkObserver ||= { ids: new WeakMap(), nodes: new Map(), next: 1 };
   cache.readState = readState;
   cache.headingVersions ||= new WeakMap();
   cache.fields ||= new WeakSet();
@@ -90,7 +90,6 @@
     const r = clipped(e, rect);
     return r && e.contains(document.elementFromPoint((r.left + r.right) / 2, (r.top + r.bottom) / 2));
   };
-  cache.isExposed = e => visible(e) && exposed(e, e.getBoundingClientRect());
   const scrollable = e => e && e !== document.body && e !== document.documentElement && visible(e) &&
     /auto|scroll/.test(getComputedStyle(e).overflowY) && e.scrollHeight > e.clientHeight + 2;
   cache.scrollPoint = e => {
@@ -107,9 +106,6 @@
     return null;
   };
   const viewport = () => [performance.timeOrigin, location.href, scrollX, scrollY, innerWidth, innerHeight];
-  cache.scrollKey = e => [...viewport(),
-    identity(e), e === document.scrollingElement ? identity(document.body) : null,
-    e.scrollLeft, e.scrollTop, e.clientWidth, e.clientHeight];
   const regions = [...document.body.querySelectorAll('*')].filter(e => scrollable(e) && cache.scrollPoint(e)).slice(0, 12);
   // 图标字体的私用区字符没有通用文本含义，还会挤占候选的 token 前缀预算。
   // 只清理控件名称；输入值及用于独立验收的原始正文保持原样。
@@ -721,20 +717,7 @@
     .filter(e => safe(e) && (cache.fields.has(e) || role(e) && cache.clickPoint(e)))
     .map(e => [identity(e), e.value, e.checked, e.selectedIndex, e.disabled, e.readOnly]),
   regions.map(e => [identity(e), e.scrollTop, e.scrollHeight, e.clientHeight])];
-  cache.guard = (e, point = cache.clickPoint(e)) => {
-    if (!point) return null;
-    const scope = e.form instanceof HTMLFormElement ? e.form :
-      e.closest('form,dialog,[role="dialog"],article,li,tr,[role="row"]') || e.parentElement;
-    const rname = role(e), description = describe(e, point);
-    // 容器正文中的视频计时、评论等变化不使无关按钮失效；仍绑定容器身份。
-    return [identity(e), rname, description, e.value ?? null, e.checked ?? null, e.selectedIndex ?? null,
-    e.readOnly ?? null, e.matches(':disabled'), e.getAttribute('aria-disabled'),
-    e.getAttribute('aria-expanded'), e.getAttribute('aria-checked'), e.getAttribute('aria-selected'),
-    e.getAttribute('href'), scope ? identity(scope) : null,
-    e.type, e.name, e.getAttribute('aria-readonly'), e.isContentEditable ? e.innerText : null,
-    identity(point.surface)];
-  };
-  const actions = [], readonlyIcons = new Set(), points = new Map(), descriptionText = new Map();
+  const actions = [], readonlyIcons = new Set(), descriptionText = new Map();
   for (const e of document.body.querySelectorAll('*')) {
     if (!safe(e) || (!visible(e) && !nativeChoice(e)) || e.closest(':disabled,[aria-disabled="true"]')) continue;
     const rname = role(e);
@@ -750,7 +733,6 @@
     }
     if (rname === 'gridcell' && e.querySelector('button,[role="button"]')) continue;
     if (e.matches('input,textarea,select')) cache.fields.add(e);
-    points.set(e, point);
     if (naming.nodes.length) descriptionText.set(e, naming);
     const base = {
       node: identity(e), role: rname, ...description, label: label || rname,
@@ -832,11 +814,7 @@
     }
   }
   const text = textPrefix(words.join('\n'), 6000), height = document.documentElement.scrollHeight;
-  const page_key = cache.pageKey(), guards = {};
-  for (const a of actions) if (!a.kind.startsWith('scroll_region_') && !(a.node in guards)) {
-    const e = cache.nodes.get(a.node);
-    guards[a.node] = cache.guard(e, points.get(e));
-  }
+  const page_key = cache.pageKey();
   // Compare meaning and identity. Geometry is always resolved and hit-tested just before input.
   const semantics = actions.map(({ rect, ...action }) => action);
   const marker = [performance.timeOrigin, location.href, scrollX, scrollY, innerWidth, innerHeight,
@@ -938,15 +916,9 @@
   });
   if (scrollRoot && !regions.length && scrollY > 0)
     actions.push({ id: 'scroll_up', kind: 'scroll', label: 'Scroll up', delta: -560 });
-  for (const action of actions) {
-    if (action.kind === 'scroll' || action.kind.startsWith('scroll_region_')) {
-      const target = action.kind === 'scroll' ? scrollRoot : cache.nodes.get(action.node);
-      guards[`scroll:${action.id}`] = cache.scrollKey(target);
-    }
-  }
   actions.push({ id: 'wait', kind: 'wait', label: 'Wait for the page to update' });
   return {
     url: location.href, title: document.title, w: innerWidth, h: innerHeight, text, content, links,
-    scroll: { y: scrollY, height }, actions, marker, page_key, guards, omitted_actions
+    scroll: { y: scrollY, height }, actions, marker, page_key, omitted_actions
   };
 })()

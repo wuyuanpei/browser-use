@@ -14,7 +14,7 @@ TOKEN_FIELDS = (
 
 
 def token_usage(calls):
-	result = dict.fromkeys(TOKEN_FIELDS, 0)
+	result: dict[str, int] = dict.fromkeys(TOKEN_FIELDS, 0)
 	missing = 0
 	for call in calls:
 		kind = call.get('kind')

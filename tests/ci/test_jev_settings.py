@@ -77,7 +77,7 @@ def test_trace_redacts_credentials_and_keeps_unicode(tmp_path: Path):
 	trace.write('action_result', step=4, status='executed_ok')
 	raw = trace.path.read_text(encoding='utf-8')
 	assert secret not in raw and '已保存' in raw
-	first, second = [json.loads(line) for line in raw.splitlines()]
+	first, second = (json.loads(line) for line in raw.splitlines())
 	assert first['nested'] == [{'title': '已保存'}] and first['step'] is None and first['agent_id'] == 'agent-42'
 	assert datetime.fromisoformat(first['ts']).utcoffset() == timedelta(0)
 	assert second['step'] == 4 and second['event'] == 'action_result'

@@ -68,7 +68,11 @@ class BaselineManager:
 
 	def clean(self, data: Any) -> Any:
 		settings = self._settings
-		keys = (settings.execution.api_key, settings.evaluation.api_key) if settings else ()
+		keys = (
+			(settings.execution.api_key, settings.evaluation.api_key, settings.jev.api_key if settings.jev else None)
+			if settings
+			else ()
+		)
 		return redact_secrets(data, *keys)
 
 	def folder(self, run_id):
@@ -289,7 +293,7 @@ class BaselineManager:
 		settings = runtime_settings(
 			system1_provider, execution_mode, screenshot_mode, screenshot_policy=screenshot_policy, model_profile=model_profile
 		)
-		config = {'provider': PROVIDER, **settings.execution.public()}
+		config = settings.system1_config()
 		profile, text = settings.profile, settings.evaluation
 		text_endpoint = text.public()['base_url']
 		ids = [t['id'] for t in self.tasks] if task_ids is None else task_ids
@@ -334,7 +338,7 @@ class BaselineManager:
 					decision_rounds=0,
 					system1_provider=config['provider'],
 					text_calls=0,
-					execution_mode='direct',
+					execution_mode=settings.execution_mode,
 					screenshot_mode=False,
 					screenshot_policy='off',
 					model_profile=profile,
@@ -365,7 +369,8 @@ class BaselineManager:
 				suite_version=VERSION,
 				attempts=attempts,
 				system1=config,
-				execution_mode='direct',
+				execution_mode=settings.execution_mode,
+				planner=settings.execution.public() if settings.jev is not None else None,
 				screenshot_mode=False,
 				screenshot_policy='off',
 				model_profile=profile,
@@ -397,11 +402,12 @@ class BaselineManager:
 					'decision_calls': MAX_STEPS,
 					'seconds': self.timeout,
 				},
-				'execution_mode': 'direct',
+				'execution_mode': settings.execution_mode,
 				'screenshot_mode': False,
 				'screenshot_policy': 'off',
 				'model_profile': profile,
 				'system1': config,
+				'planner': settings.execution.public() if settings.jev is not None else None,
 				'viewport': VIEWPORT,
 				'browser_mode': self._browser_mode,
 				'shared_browser_profile': self._browser_mode == 'attached_chrome' or bool(settings.user_data_dir),
@@ -762,6 +768,18 @@ class BaselineManager:
 					token_usage=snapshot['token_usage'],
 					elapsed_ms=round((time.monotonic() - started) * 1000),
 				)
+				if roles := snapshot.get('jev_usage_by_role'):
+					row.update(
+						jev_usage_by_role=roles,
+						jev_trace_path=snapshot['jev_trace_path'],
+						jev_calls=roles['system1']['calls'],
+						decision_calls=roles['system1']['calls'],
+						planner_calls=roles['planner']['calls'],
+						text_calls=roles['text']['calls'],
+						collect_calls=roles['summary']['calls'],
+						summarize_calls=roles['answer']['calls'],
+						risk_calls=roles['risk']['calls'],
+					)
 
 		def event(record: RunEvent):
 			name, payload, snapshot = record.name, record.payload, record.snapshot
@@ -810,7 +828,13 @@ class BaselineManager:
 		try:
 			append('attempt_start', {'task': task, 'repeat': row['repeat']})
 			agent = self._run_factory(
-				task['url'], task['goal'], settings, on_event=event, should_cancel=cancelled, probe=CaseProbe(task)
+				task['url'],
+				task['goal'],
+				settings,
+				on_event=event,
+				should_cancel=cancelled,
+				probe=CaseProbe(task),
+				**({'jev_artifact_dir': folder} if settings.jev is not None else {}),
 			)
 			state = agent.snapshot()
 			while state['status'] not in {'done', 'blocked'}:
@@ -849,6 +873,8 @@ class BaselineManager:
 			try:
 				if agent:
 					try:
+						if settings.jev is not None:
+							agent.finish_execution()
 						# Final sampling is read-only, including on timeout/error/cancellation.
 						agent.observe('final')
 					except Exception as error:

@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
+from .decision_guard import decision_validity, read_document, same_document, stale_disposition, target_guard
 from .models import PROVIDER, RunSettings, redact_secrets
 from .observation import READ_STATE, document_key, fingerprint, indexed_elements
 from .tasks import EnvironmentBlocked
@@ -205,6 +206,7 @@ class BrowserUseRun:
 		self._on_event, self._should_cancel, self._probe = on_event, should_cancel, probe
 		self._record_dir = record_dir
 		self._chrome = chrome
+		self._stale_streak: list[str] = []
 		self._state: dict[str, Any] = dict(
 			goal=goal,
 			system1_provider=PROVIDER,
@@ -225,6 +227,9 @@ class BrowserUseRun:
 			model_calls=[],
 			text_calls=[],
 			decision_rounds=0,
+			stale_retries=0,
+			forced_after_stale=0,
+			stale_reasons={},
 			elapsed_ms=0,
 			event_seq=0,
 			observation_index=-1,
@@ -376,8 +381,9 @@ class BrowserUseRun:
 		self._check_cancelled()
 		await self._browser.bind()
 
-	def observe(self, phase: str = 'step'):
+	def observe(self, phase: str = 'step', reason: str | None = None):
 		page = self._browser.observe()
+		metadata: dict[str, Any] = {'stale_reason': reason} if reason else {}
 		self._state['page'] = page
 		self._state['observation_index'] += 1
 		if self._on_event:
@@ -386,7 +392,7 @@ class BrowserUseRun:
 				preview = Preview(self._browser.screenshot(timeout=15), None, sample)
 			except Exception as error:
 				preview = Preview(None, str(error), sample)
-			self._emit('observation', preview=preview, phase=phase)
+			self._emit('observation', preview=preview, phase=phase, **metadata)
 			return
 
 		image = self._browser.screenshot()
@@ -395,12 +401,13 @@ class BrowserUseRun:
 			dict(
 				page=page,
 				phase=phase,
+				**metadata,
 				step=len(self._state['history']),
 				elements=indexed_elements(page['actions']),
 				event_seq=self._state['event_seq'] + 1,
 			)
 		)
-		self._emit('observation', phase=phase)
+		self._emit('observation', phase=phase, **metadata)
 		if self._record_dir:
 			self._record_dir.mkdir(parents=True, exist_ok=True)
 			if phase == 'initial':
@@ -415,7 +422,15 @@ class BrowserUseRun:
 		if agent is None:
 			raise RuntimeError('Browser Use agent is unavailable')
 		agent.step_start_time = time.time()
+		browser = self._browser.native
+		assert browser is not None
+		before = await read_document(browser)
 		summary = await agent._prepare_context(AgentStepInfo(agent.state.n_steps - 1, MAX_STEPS))
+		document = await read_document(browser)
+		# BrowserStateSummary has a URL but no document identity. A navigation
+		# during native capture makes that observation ambiguous even at the same URL.
+		stable = same_document(before, document) and same_document(document, {**document, 'url': summary.url})
+		document['url'] = summary.url
 		self._summary = summary
 		agent.state.last_model_output = agent.state.last_result = None
 		await agent._get_next_action(summary)
@@ -452,7 +467,7 @@ class BrowserUseRun:
 				target = next((e['index'] for e in elements if e['node_ref'] == identity), '')
 			except (RuntimeError, KeyError):
 				pass  # Closed frame or remote child target cannot be annotated on this screenshot.
-		return raw, operation, target
+		return raw, operation, target, target_guard(node) if node is not None else None, document, stable
 
 	async def _act(self):
 		agent = self._native
@@ -484,12 +499,17 @@ class BrowserUseRun:
 	def _choose(self):
 		if self._state['decision_rounds'] >= MAX_STEPS:
 			raise RunCancelled('timeout')
-		raw, operation, target = self._bridge.run(self._predict(), cancel=self._should_cancel, timeout=150)
+		raw, operation, target, guard, document, stable = self._bridge.run(
+			self._predict(), cancel=self._should_cancel, timeout=150
+		)
 		decision = dict(
 			operation=operation,
 			target=target,
 			choice=operation,
 			native_action=raw,
+			target_guard=guard,
+			document_guard=document,
+			document_stable_during_capture=stable,
 			provider=self._state['system1_provider'],
 			fingerprint=self._state['page']['fingerprint'],
 			observation_index=self._state['observation_index'],
@@ -507,17 +527,34 @@ class BrowserUseRun:
 		if decision is None:
 			raise ValueError('Predict a Browser Use action first')
 		self._check_cancelled()
-		page = self._state['page']
-		current = self._browser.observe()
-		if (
-			current['target_id'] != page['target_id']
-			or current.get('document_id') != page.get('document_id')
-			or current['fingerprint'] != decision['fingerprint']
-			or (expected_fingerprint is not None and expected_fingerprint != decision['fingerprint'])
-		):
+		page = decision['document_guard']
+		if expected_fingerprint is not None and expected_fingerprint != decision['fingerprint']:
+			reason = 'ui_out_of_sync'
+		elif not decision['document_stable_during_capture']:
+			reason = 'document_changed'
+		else:
+
+			async def check():
+				browser = self._browser.native
+				assert browser is not None
+				return await decision_validity(browser, decision['target_guard'], page, await read_document(browser))
+
+			reason = self._bridge.run(check(), cancel=self._should_cancel, timeout=20)
+		disposition = stale_disposition(len(self._stale_streak), reason)
+		if disposition != 'execute':
+			assert reason is not None
+			reasons = self._state['stale_reasons']
+			reasons[reason] = reasons.get(reason, 0) + 1
+			if disposition != 'ui_sync':
+				self._stale_streak.append(reason)
+		if disposition in {'retry', 'ui_sync'}:
+			if disposition == 'retry':
+				self._state['stale_retries'] += 1
+			decision['stale_reason'] = reason
 			self._state.update(decision=None, status='ready')
-			self.observe('stale_retry')
+			self.observe('stale_retry', reason=reason)
 			return
+		self._check_cancelled()
 		operation = decision['operation']
 		action = dict(
 			kind=operation,
@@ -529,6 +566,12 @@ class BrowserUseRun:
 			source_document=page.get('document_id'),
 			step=len(self._state['history']) + 1,
 		)
+		if disposition == 'force':
+			self._state['forced_after_stale'] += 1
+			action.update(forced_after_stale=True, stale_reasons=list(self._stale_streak))
+		elif reason == 'target_unverifiable':
+			action['target_unverifiable'] = True
+		self._stale_streak.clear()
 		self._emit('action_started', action=action)
 		self._state.update(decision=None, status='ready')
 		try:

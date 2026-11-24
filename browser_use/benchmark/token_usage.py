@@ -6,6 +6,7 @@ TOKEN_FIELDS = (
 	'planner_output_tokens',
 	'planner_total_tokens',
 	'other_input_tokens',
+	'other_cached_input_tokens',
 	'other_output_tokens',
 	'other_total_tokens',
 	'jev_total_tokens',
@@ -33,6 +34,12 @@ def token_usage(calls):
 		usage = response.get('usage') if isinstance(response, dict) else None
 		if not isinstance(usage, dict):
 			usage = {}
+		if group == 'other':
+			for key in ('prompt_cached_tokens', 'prompt_cache_hit_tokens'):
+				cached = usage.get(key)
+				if type(cached) is int and cached >= 0:
+					result['other_cached_input_tokens'] += cached
+					break
 		incomplete = False
 		for direction, aliases in (
 			('input', ('input_tokens', 'prompt_tokens')),
@@ -61,5 +68,5 @@ def aggregate_token_usage(attempts):
 			result['unavailable_attempts'] += 1
 			continue
 		for field in (*TOKEN_FIELDS, 'missing_usage_calls'):
-			result[field] += usage[field]
+			result[field] += usage.get(field, 0) if field == 'other_cached_input_tokens' else usage[field]
 	return {**result, 'complete': not (result['missing_usage_calls'] or result['unavailable_attempts'])}

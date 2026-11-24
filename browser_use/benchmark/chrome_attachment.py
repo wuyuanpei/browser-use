@@ -261,6 +261,12 @@ class _OwnedSessionManager(SessionManager):
 			if target_id not in self.client.pages and not owned_frame:
 				return
 			self.client.sessions[event['sessionId']] = target_id
+			if target['type'] == 'page' and target_id in self.client.pages:
+				create_task_with_error_handling(
+					self.client._request('Emulation.setFocusEmulationEnabled', {'enabled': True}, event['sessionId']),
+					name='benchmark_owned_focus_emulation',
+					logger_instance=self.logger,
+				)
 			create_task_with_error_handling(
 				self._handle_target_attached(event), name='benchmark_owned_attach', logger_instance=self.logger
 			)

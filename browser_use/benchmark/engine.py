@@ -9,14 +9,15 @@ import tempfile
 import threading
 import time
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from .models import PROVIDER, RunSettings, redact_secrets
 from .observation import READ_STATE, document_key, fingerprint, indexed_elements
+from .tasks import EnvironmentBlocked
 from .token_usage import token_usage
 
 if TYPE_CHECKING:
@@ -24,16 +25,22 @@ if TYPE_CHECKING:
 	from browser_use.browser.session import BrowserSession, CDPSession
 	from browser_use.browser.views import BrowserStateSummary
 
+	from .chrome_attachment import ChromeAttachment
 	from .tasks import CaseProbe
 
 MAX_STEPS = 100
 VIEWPORT = {'width': 1366, 'height': 780}
+BrowserMode = Literal['isolated', 'attached_chrome']
 
 
 class RunCancelled(RuntimeError):
 	"""Cooperative cancellation at a boundary before browser input."""
 
 	is_cancellation = True
+
+
+class BrowserUnavailable(EnvironmentBlocked):
+	"""The shared browser cannot start another case until it recovers."""
 
 
 @dataclass(frozen=True)
@@ -192,10 +199,12 @@ class BrowserUseRun:
 		should_cancel: Callable[[], str | None] | None = None,
 		probe: CaseProbe | None = None,
 		record_dir: Path | None = None,
+		chrome: ChromeAttachment | None = None,
 	):
 		self._secrets = (settings.execution.api_key, settings.evaluation.api_key)
 		self._on_event, self._should_cancel, self._probe = on_event, should_cancel, probe
 		self._record_dir = record_dir
+		self._chrome = chrome
 		self._state: dict[str, Any] = dict(
 			goal=goal,
 			system1_provider=PROVIDER,
@@ -205,6 +214,7 @@ class BrowserUseRun:
 			screenshot_mode=False,
 			screenshot_policy='off',
 			model_profile=settings.profile,
+			browser_mode='attached_chrome' if chrome is not None else 'isolated',
 			text_model=settings.evaluation.model,
 			text_model_base_url=settings.evaluation.public()['base_url'],
 			status='ready',
@@ -230,7 +240,7 @@ class BrowserUseRun:
 		self._browser_start_dispatched = False
 		self._check_cancelled()
 		self._temp = tempfile.TemporaryDirectory(prefix='browser-use-benchmark-', ignore_cleanup_errors=True)
-		self._bridge = _BrowserLoop()
+		self._bridge = chrome.bridge if chrome is not None else _BrowserLoop()
 		self._browser = _BoundBrowser(self._bridge)
 		self._native: Agent | None = None
 		self._summary: BrowserStateSummary | None = None
@@ -244,13 +254,16 @@ class BrowserUseRun:
 			self._check_cancelled()
 			self.observe('initial')
 		except BaseException:
-			self.close()
+			with suppress(BrowserUnavailable):
+				self.close()
 			raise
 
 	def _check_cancelled(self):
 		reason = self._should_cancel() if self._should_cancel else None
 		if reason:
 			raise RunCancelled(reason)
+		if self._chrome is not None:
+			self._chrome.check_connection()
 
 	def _emit(self, name: str, *, preview: Preview | None = None, **payload: Any):
 		self._state['event_seq'] += 1
@@ -296,17 +309,26 @@ class BrowserUseRun:
 
 	async def _start(self, url: str, settings: RunSettings):
 		self._check_cancelled()
-		from browser_use import Agent, BrowserSession, ChatDeepSeek
+		from browser_use import Agent, BrowserSession, ChatDeepSeek, Tools
 
 		self._check_cancelled()
-		executable = os.getenv('BROWSER_USE_EXECUTABLE_PATH')
-		profile = settings.user_data_dir or str(Path(self._temp.name) / 'profile')
-		options: dict[str, Any] = dict(
-			user_data_dir=profile, keep_alive=True, enable_default_extensions=False, viewport=VIEWPORT, headless=settings.headless
-		)
-		if executable:
-			options['executable_path'] = executable
-		browser = BrowserSession(**options)
+		if self._chrome is not None:
+			browser = await self._chrome.begin_case()
+			tools = Tools(exclude_actions=self._chrome.excluded_tools)
+		else:
+			executable = os.getenv('BROWSER_USE_EXECUTABLE_PATH')
+			profile = settings.user_data_dir or str(Path(self._temp.name) / 'profile')
+			options: dict[str, Any] = dict(
+				user_data_dir=profile,
+				keep_alive=True,
+				enable_default_extensions=False,
+				viewport=VIEWPORT,
+				headless=settings.headless,
+			)
+			if executable:
+				options['executable_path'] = executable
+			browser = BrowserSession(**options)
+			tools = None
 		self._browser.native = browser
 		execution = settings.execution
 		llm = ChatDeepSeek(
@@ -335,6 +357,7 @@ class BrowserUseRun:
 			task=self._state['goal'],
 			llm=llm,
 			browser_session=browser,
+			tools=tools,
 			use_judge=False,
 			directly_open_url=False,
 			enable_signal_handler=False,
@@ -346,7 +369,8 @@ class BrowserUseRun:
 		)
 		self._check_cancelled()
 		self._browser_start_dispatched = True
-		await browser.start()
+		if self._chrome is None:
+			await browser.start()
 		self._check_cancelled()
 		await browser.navigate_to(url)
 		self._check_cancelled()
@@ -535,7 +559,8 @@ class BrowserUseRun:
 			if self._browser.native is not None:
 				self._bridge.run(self._close_browser(), timeout=25)
 		finally:
-			self._bridge.close()
+			if self._chrome is None:
+				self._bridge.close()
 			self._temp.cleanup()
 
 	async def _close_browser(self):
@@ -544,5 +569,7 @@ class BrowserUseRun:
 				await self._native.eventbus.stop(clear=True, timeout=1)
 		finally:
 			browser = self._browser.native
-			if self._browser_start_dispatched and browser is not None:
+			if self._chrome is not None:
+				await self._chrome.finish_case()
+			elif self._browser_start_dispatched and browser is not None:
 				await browser.kill()

@@ -13,6 +13,7 @@ import sys
 import threading
 import time
 from collections import Counter
+from collections.abc import Callable
 from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
@@ -20,7 +21,7 @@ from typing import Any
 from urllib.parse import urlencode
 
 from .archive import atomic_json
-from .engine import MAX_STEPS, VIEWPORT, BrowserUseRun, RunCancelled, RunEvent
+from .engine import MAX_STEPS, VIEWPORT, BrowserMode, BrowserUnavailable, BrowserUseRun, RunCancelled, RunEvent
 from .evaluation import attempt_status, build_context, evaluate_frozen, freeze_context, outcome_statistics
 from .models import DEBUG_PROFILE, FINAL_REPORT_PROFILE, PROVIDER, RunSettings, redact_secrets, runtime_settings
 from .observation import indexed_elements
@@ -40,10 +41,19 @@ def now():
 
 
 class BaselineManager:
-	def __init__(self, root: Path, origin: str, *, run_factory=BrowserUseRun, timeout: int = 300):
+	def __init__(
+		self,
+		root: Path,
+		origin: str,
+		*,
+		run_factory: Callable[..., BrowserUseRun] = BrowserUseRun,
+		browser_mode: BrowserMode = 'isolated',
+		timeout: int = 300,
+	):
 		self.root = Path(root).resolve()
 		self.tasks = task_catalog(origin)
 		self._run_factory = run_factory
+		self._browser_mode = browser_mode
 		self._settings: RunSettings | None = None
 		self.timeout = timeout
 		self.lock = threading.RLock()
@@ -349,6 +359,7 @@ class BaselineManager:
 			batch: dict[str, Any] = dict(
 				id=run_id,
 				status='running',
+				browser_mode=self._browser_mode,
 				path=str(self.folder(run_id)),
 				created_at=now(),
 				suite_version=VERSION,
@@ -392,7 +403,8 @@ class BaselineManager:
 				'model_profile': profile,
 				'system1': config,
 				'viewport': VIEWPORT,
-				'shared_browser_profile': bool(settings.user_data_dir),
+				'browser_mode': self._browser_mode,
+				'shared_browser_profile': self._browser_mode == 'attached_chrome' or bool(settings.user_data_dir),
 				'models': {
 					'TEXT_MODEL': text.model,
 					'TEXT_MODEL_REASONING': (
@@ -806,6 +818,8 @@ class BaselineManager:
 					reason='Stopped by user' if str(error) == 'cancelled' else 'Run budget exceeded',
 				)
 		except EnvironmentBlocked as error:
+			if isinstance(error, BrowserUnavailable):
+				fatal = str(error)
 			with self.lock:
 				row.update(status='environment_blocked', execution_status='environment_blocked', reason=str(error))
 		except Exception as error:
@@ -919,6 +933,9 @@ class BaselineManager:
 				if agent:
 					try:
 						agent.close()
+					except BrowserUnavailable as error:
+						fatal = fatal or self.clean(str(error))
+						append('browser_cleanup_error', {'error': str(error)})
 					except Exception:
 						pass  # Never mask an artifact or execution error while releasing the owned tab.
 		return fatal

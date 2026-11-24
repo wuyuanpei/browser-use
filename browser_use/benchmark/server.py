@@ -8,12 +8,15 @@ import os
 import secrets
 import socket
 import threading
+from contextlib import suppress
+from functools import partial
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from .baseline import BaselineConflict, BaselineManager
-from .engine import MAX_STEPS, BrowserUseRun, RunCancelled
+from .chrome_attachment import ChromeAttachment
+from .engine import MAX_STEPS, BrowserUnavailable, BrowserUseRun, RunCancelled
 from .models import (
 	DEBUG_PROFILE,
 	PROVIDER,
@@ -33,6 +36,7 @@ TOKEN = secrets.token_urlsafe(32)
 LOCK = threading.Lock()
 AGENT: BrowserUseRun | None = None
 BASELINE: BaselineManager | None = None
+CHROME: ChromeAttachment | None = None
 FREE_PAUSE = threading.Event()
 
 
@@ -51,7 +55,12 @@ class InspectorServer(ThreadingHTTPServer):
 def baseline():
 	global BASELINE
 	if BASELINE is None:
-		BASELINE = BaselineManager(ARTIFACTS, ORIGIN)
+		BASELINE = BaselineManager(
+			ARTIFACTS,
+			ORIGIN,
+			run_factory=partial(BrowserUseRun, chrome=CHROME),
+			browser_mode='attached_chrome' if CHROME is not None else 'isolated',
+		)
 	return BASELINE
 
 
@@ -74,6 +83,11 @@ def response_state():
 		'text_model_base_url': state.get('text_model_base_url', debug['text']['base_url']),
 		'max_steps': MAX_STEPS,
 		'baseline_active': bool(BASELINE and BASELINE.active),
+		'chrome_attachment': {
+			'configured': CHROME is not None,
+			'connected': bool(CHROME and CHROME.connected),
+			'anchor_url': CHROME.anchor_url(ORIGIN) if CHROME and not CHROME.connected else None,
+		},
 		'system1_options': [
 			{
 				'provider': PROVIDER,
@@ -89,9 +103,9 @@ def response_state():
 
 def close_browser():
 	global AGENT
-	if AGENT:
-		AGENT.close()
-		AGENT = None
+	agent, AGENT = AGENT, None
+	if agent is not None:
+		agent.close()
 
 
 def public_error(error):
@@ -101,9 +115,26 @@ def public_error(error):
 def command(name, body):
 	"""路由自由任务和基线命令，浏览器所有权不跨模式抢占。"""
 	global AGENT
+	if name in ('chrome/connect', 'chrome/disconnect'):
+		if CHROME is None:
+			raise ValueError('本机 Chrome 附着模式未配置。')
+		if BASELINE and BASELINE.active:
+			raise BaselineConflict('批次运行中不能更换 Chrome 连接。')
+		connect = name == 'chrome/connect'
+		if not connect or not CHROME.connected:
+			# The attachment retains ownership of tabs for cleanup even after the free task ends.
+			with suppress(BrowserUnavailable):
+				close_browser()
+		if connect:
+			CHROME.connect(ORIGIN)
+		else:
+			CHROME.disconnect()
+		return response_state()
 	if name.startswith('baseline/'):
 		manager = baseline()
 		if name == 'baseline/start':
+			if CHROME is not None:
+				CHROME.check_connection()
 			# 在开始时将运行配置固定到新批次上。
 			return manager.start(
 				body.get('task_ids'),
@@ -170,6 +201,8 @@ def command(name, body):
 			screenshot_policy=body.get('screenshot_policy'),
 			model_profile=body.get('model_profile'),
 		)
+		if CHROME is not None:
+			CHROME.check_connection()
 		close_browser()
 		AGENT = BrowserUseRun(
 			url,
@@ -178,6 +211,7 @@ def command(name, body):
 			scenario=scenario,
 			should_cancel=lambda: 'paused' if FREE_PAUSE.is_set() else None,
 			record_dir=(Path.cwd() / 'artifacts' / 'frames' if body.get('record') else None),
+			chrome=CHROME,
 		)
 	else:
 		if AGENT is None:
@@ -292,11 +326,16 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-	global PORT, ORIGIN, ARTIFACTS
+	global PORT, ORIGIN, ARTIFACTS, CHROME
 	parser = argparse.ArgumentParser(description='Run the Browser Use benchmark inspector')
 	parser.add_argument('--port', type=int, default=PORT, help='Loopback port. Use 0 for an available port.')
 	parser.add_argument('--artifacts', type=Path, default=ARTIFACTS, help='Directory for benchmark batches.')
 	parser.add_argument('--profile-env', type=Path, action='append', default=[], help='Reuse a Jev model configuration file.')
+	parser.add_argument(
+		'--chrome-active-port-file',
+		type=Path,
+		help='Use DevToolsActivePort from an already running local Chrome instead of launching a browser.',
+	)
 	args = parser.parse_args()
 	load_environment()
 	default_profile = os.getenv('BROWSER_USE_BENCHMARK_PROFILE_ENV')
@@ -305,6 +344,9 @@ def main():
 		load_profile_environment(path)
 	os.environ.setdefault('ANONYMIZED_TELEMETRY', 'false')
 	ARTIFACTS = args.artifacts
+	if active_port := args.chrome_active_port_file or os.getenv('BROWSER_USE_BENCHMARK_CHROME_ACTIVE_PORT_FILE'):
+		CHROME = ChromeAttachment(Path(active_port))
+		atexit.register(CHROME.close)
 	atexit.register(close_browser)
 	with InspectorServer(('127.0.0.1', args.port), Handler) as server:
 		PORT = server.server_address[1]

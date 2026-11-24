@@ -7,11 +7,13 @@ import re
 import tempfile
 import time
 from collections.abc import Awaitable, Callable
+from copy import copy
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Generic, Literal, TypeVar, cast
 from urllib.parse import urlparse
 
 if TYPE_CHECKING:
+	from browser_use.agent.jev.service import JevExecutor
 	from browser_use.skills.views import Skill
 
 from dotenv import load_dotenv
@@ -36,6 +38,7 @@ from pydantic import BaseModel, ValidationError
 from uuid_extensions import uuid7str
 
 from browser_use import Browser, BrowserProfile, BrowserSession
+from browser_use.agent.jev.views import CheckName, JevSettings
 from browser_use.agent.judge import construct_judge_messages
 
 # Lazy import for gif to avoid heavy agent.views import at startup
@@ -133,6 +136,8 @@ AgentHookFunc = Callable[['Agent'], Awaitable[None]]
 
 
 class Agent(Generic[Context, AgentStructuredOutput]):
+	_jev: 'JevExecutor | None' = None
+
 	@time_execution_sync('--init')
 	def __init__(
 		self,
@@ -211,6 +216,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		max_clickable_elements_length: int = 40000,
 		_url_shortening_limit: int = 25,
 		enable_signal_handler: bool = True,
+		jev: JevSettings | None = None,
 		**kwargs,
 	):
 		# Validate llm_screenshot_size
@@ -320,6 +326,23 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			exclude_actions = ['screenshot'] if use_vision != 'auto' else []
 			self.tools = Tools(exclude_actions=exclude_actions, display_files_in_done_text=display_files_in_done_text)
 
+		if tools is not None or controller is not None:
+			# Delegation handlers bind an individual executor. Keep shared user tools independent across agents.
+			actions = self.tools.registry.registry.actions
+			owned = {
+				name
+				for name, action in actions.items()
+				if name in {'delegate_subgoal', 'finish', 'collect_page'}
+				and action.param_model.__module__ == 'browser_use.agent.jev.views'
+			}
+			if owned or (jev is not None and jev.mode != 'off'):
+				self.tools = copy(self.tools)
+				self.tools.registry = copy(self.tools.registry)
+				self.tools.registry.exclude_actions = self.tools.registry.exclude_actions.copy()
+				self.tools.registry.registry = self.tools.registry.registry.model_copy(
+					update={'actions': {name: action for name, action in actions.items() if name not in owned}}
+				)
+
 		# Enforce screenshot exclusion when use_vision != 'auto', even if user passed custom tools
 		if use_vision != 'auto':
 			self.tools.exclude_action('screenshot')
@@ -391,6 +414,22 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		if isinstance(message_compaction, bool):
 			message_compaction = MessageCompactionSettings(enabled=message_compaction)
 
+		self.jev_settings = jev
+		active_jev = jev if jev is not None and jev.mode != 'off' else None
+		if active_jev is not None:
+			if sensitive_data and active_jev.mode == 'collaborative':
+				self.logger.warning('Jev disabled for a collaborative task with sensitive_data.')
+				active_jev = None
+			elif active_jev.mode == 'isolated' and (sensitive_data or output_model_schema is not None):
+				raise ValueError(
+					'Jev isolated mode does not support sensitive_data or output_model_schema. Use collaborative or off mode.'
+				)
+		if active_jev is not None:
+			enable_planning = False
+			if active_jev.mode == 'isolated':
+				max_actions_per_step = 1
+			self._log_jev_settings(active_jev, max_actions_per_step)
+
 		self.settings = AgentSettings(
 			use_vision=use_vision,
 			vision_detail_level=vision_detail_level,
@@ -454,8 +493,14 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		self._set_screenshot_service()
 
 		# Action setup
-		self._setup_action_models()
 		self._set_browser_use_version_and_source(source)
+		self._jev = None
+		if active_jev is not None:
+			from browser_use.agent.jev.service import JevExecutor
+
+			self._jev = JevExecutor(self, active_jev)
+			self._jev.register_actions()
+		self._setup_action_models()
 
 		initial_url = None
 
@@ -515,6 +560,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 				is_anthropic=is_anthropic,
 				is_browser_use_model=is_browser_use_model,
 				model_name=self.llm.model,
+				jev_mode=active_jev.mode if active_jev is not None and active_jev.mode != 'off' else None,
 			).get_system_message(),
 			file_system=self.file_system,
 			state=self.state.message_manager_state,
@@ -778,26 +824,51 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		self.version = version
 		self.source = source
 
-	def _setup_action_models(self) -> None:
-		"""Setup dynamic action models from tools registry"""
-		# Initially only include actions with no filters
-		self.ActionModel = self.tools.registry.create_action_model()
-		# Create output model with the dynamic actions
+	def _output_model_for_actions(self, actions: type[ActionModel]) -> type[AgentOutput]:
 		if self.settings.flash_mode:
-			self.AgentOutput = AgentOutput.type_with_custom_actions_flash_mode(self.ActionModel)
-		elif self.settings.use_thinking:
-			self.AgentOutput = AgentOutput.type_with_custom_actions(self.ActionModel)
-		else:
-			self.AgentOutput = AgentOutput.type_with_custom_actions_no_thinking(self.ActionModel)
+			return AgentOutput.type_with_custom_actions_flash_mode(actions)
+		if self.settings.use_thinking:
+			return AgentOutput.type_with_custom_actions(actions)
+		return AgentOutput.type_with_custom_actions_no_thinking(actions)
 
-		# used to force the done action when max_steps is reached
-		self.DoneActionModel = self.tools.registry.create_action_model(include_actions=['done'])
-		if self.settings.flash_mode:
-			self.DoneAgentOutput = AgentOutput.type_with_custom_actions_flash_mode(self.DoneActionModel)
-		elif self.settings.use_thinking:
-			self.DoneAgentOutput = AgentOutput.type_with_custom_actions(self.DoneActionModel)
+	def _setup_action_models(self) -> None:
+		self._build_action_models(page_url=None)
+
+	def _build_action_models(self, page_url: str | None) -> None:
+		"""Build the executable action schema and the schema sent to the planner."""
+		create_model = self.tools.registry.create_action_model
+		self.ActionModel = create_model(page_url=page_url)
+		self.AgentOutput = self._output_model_for_actions(self.ActionModel)
+		self.DoneActionModel = create_model(include_actions=['done'], page_url=page_url)
+		self.DoneAgentOutput = self._output_model_for_actions(self.DoneActionModel)
+		if self._jev is None:
+			return
+
+		self._jev.finish_only = False
+		if self._jev.settings.mode == 'isolated':
+			planner_actions = ['delegate_subgoal', 'finish']
+			self.PlannerDoneAgentOutput = self._output_model_for_actions(
+				create_model(include_actions=['finish'], page_url=page_url)
+			)
 		else:
-			self.DoneAgentOutput = AgentOutput.type_with_custom_actions_no_thinking(self.DoneActionModel)
+			planner_actions = [name for name in self.tools.registry.registry.actions if name not in {'finish', 'collect_page'}]
+			self.PlannerDoneAgentOutput = self.DoneAgentOutput
+		self.PlannerAgentOutput = self._output_model_for_actions(create_model(include_actions=planner_actions, page_url=page_url))
+
+	def _planner_output_format(self) -> type[AgentOutput]:
+		if self._jev is None:
+			return self.AgentOutput
+		return self.PlannerDoneAgentOutput if self._jev.finish_only else self.PlannerAgentOutput
+
+	def _isolated_jev(self) -> bool:
+		return self._jev is not None and self._jev.settings.mode == 'isolated'
+
+	def _log_jev_settings(self, settings: JevSettings, max_actions: int) -> None:
+		self.logger.info('Jev %s mode: BU planning disabled, max_actions_per_step=%s', settings.mode, max_actions)
+		names: tuple[CheckName, ...] = ('risky_action', 'submit', 'completion', 'confidence', 'scope')
+		resolved = {name: settings.checks.mode(name) for name in names}
+		if any(mode != 'enforce' for mode in resolved.values()):
+			self.logger.warning('Jev check modes: %s', ', '.join(f'{name}={mode}' for name, mode in resolved.items()))
 
 	def _get_skill_slug(self, skill: 'Skill', all_skills: list['Skill']) -> str:
 		"""Generate a clean slug from skill title for action names
@@ -1010,6 +1081,8 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		if agent_id_suffix and agent_id_suffix[0].isdigit():
 			agent_id_suffix = 'a' + agent_id_suffix
 		self.eventbus = EventBus(name=f'Agent_{agent_id_suffix}')
+		if self._jev is not None:
+			self._jev.on_new_task()
 
 	async def _check_stop_or_pause(self) -> None:
 		"""Check if the agent should stop or pause, and handle accordingly."""
@@ -1114,7 +1187,9 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		await self._update_action_models_for_page(browser_state_summary.url)
 
 		# Get page-specific filtered actions
-		page_filtered_actions = self.tools.registry.get_prompt_description(browser_state_summary.url)
+		page_filtered_actions = (
+			'' if self._isolated_jev() else self.tools.registry.get_prompt_description(browser_state_summary.url)
+		)
 
 		# Page-specific actions will be included directly in the browser_state message
 		self.logger.debug(f'💬 Step {self.state.n_steps}: Creating state messages for context...')
@@ -1176,6 +1251,16 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 	@observe_debug(ignore_input=True, name='get_next_action')
 	async def _get_next_action(self, browser_state_summary: BrowserStateSummary) -> None:
 		"""Execute LLM interaction with retry logic and handle callbacks"""
+		if self._jev is not None:
+			routed = await self._jev.route(self, browser_state_summary)
+			if routed.model_output is not None:
+				self.state.last_model_output = routed.model_output
+				await self._check_stop_or_pause()
+				await self._handle_post_llm_processing(browser_state_summary, [])
+				await self._check_stop_or_pause()
+				return
+			for message in routed.context_messages:
+				self._message_manager._add_context_message(message)
 		input_messages = self._message_manager.get_messages()
 		self.logger.debug(
 			f'🤖 Step {self.state.n_steps}: Calling LLM with {len(input_messages)} messages (model: {self.llm.model})...'
@@ -1214,8 +1299,15 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		if self.state.last_model_output is None:
 			raise ValueError('No model output to execute actions from')
 
-		result = await self.multi_act(self.state.last_model_output.action)
+		try:
+			result = await self.multi_act(self.state.last_model_output.action)
+		except BaseException as error:
+			if self._jev is not None:
+				self._jev.on_dispatch_error(self, error)
+			raise
 		self.state.last_result = result
+		if self._jev is not None:
+			self._jev.on_executed(self, result)
 
 	async def _post_process(self) -> None:
 		"""Handle post-action processing like download tracking and result logging"""
@@ -1242,19 +1334,27 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			self.state.consecutive_failures = 0
 			self.logger.debug(f'🔄 Step {self.state.n_steps}: Consecutive failures reset to: {self.state.consecutive_failures}')
 
-		# Log completion results
-		if self.state.last_result and len(self.state.last_result) > 0 and self.state.last_result[-1].is_done:
-			success = self.state.last_result[-1].success
-			if success:
-				# Green color for success
-				self.logger.info(f'\n📄 \033[32m Final Result:\033[0m \n{self.state.last_result[-1].extracted_content}\n\n')
-			else:
-				# Red color for failure
-				self.logger.info(f'\n📄 \033[31m Final Result:\033[0m \n{self.state.last_result[-1].extracted_content}\n\n')
-			if self.state.last_result[-1].attachments:
-				total_attachments = len(self.state.last_result[-1].attachments)
-				for i, file_path in enumerate(self.state.last_result[-1].attachments):
-					self.logger.info(f'👉 Attachment {i + 1 if total_attachments > 1 else ""}: {file_path}')
+		if self._jev is None and self.state.last_result and self.state.last_result[-1].is_done:
+			self._log_completed_result(self.state.last_result[-1])
+
+	def _log_completed_result(self, result: ActionResult) -> None:
+		color = '\033[32m' if result.success else '\033[31m'
+		self.logger.info(f'\n📄 {color} Final Result:\033[0m \n{result.extracted_content}\n\n')
+		if result.attachments:
+			for i, file_path in enumerate(result.attachments, start=1):
+				self.logger.info(f'👉 Attachment {i if len(result.attachments) > 1 else ""}: {file_path}')
+
+	async def _finalize_jev_answer(self) -> None:
+		if self._jev is None or not self.state.last_result or not self.state.last_result[-1].is_done:
+			return
+		await self._jev.finalize_if_done(self)
+		result = self.state.last_result[-1]
+		self._log_completed_result(result)
+		await self._demo_mode_log(
+			result.extracted_content or result.long_term_memory or 'Task marked as done.',
+			'success' if result.success is not False else 'warning',
+			{'step': self.state.n_steps},
+		)
 
 	async def _handle_step_error(self, error: Exception) -> None:
 		"""Handle all types of errors that can occur during a step"""
@@ -1370,6 +1470,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 					previous_start_time = last_history_item.metadata.step_start_time
 					step_interval = max(0, previous_end_time - previous_start_time)
 			metadata = StepMetadata(
+				decision_source=self._jev.step_source() if self._jev is not None else 'llm',
 				step_number=self.state.n_steps,
 				step_start_time=self.step_start_time,
 				step_end_time=step_end_time,
@@ -1384,6 +1485,8 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 				metadata,
 				state_message=self._message_manager.last_state_message_text,
 			)
+			if self._jev is not None and not self._jev.defer_final_answer:
+				await self._finalize_jev_answer()
 
 		# Log step completion summary
 		summary_message = self._log_step_completion_summary(self.step_start_time, self.state.last_result)
@@ -1496,6 +1599,8 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 
 	def _inject_loop_detection_nudge(self) -> None:
 		"""Inject an escalating nudge when behavioral loops are detected."""
+		if self._jev is not None and not self._jev.last_step_planner_page_action():
+			return
 		if not self.settings.loop_detection_enabled:
 			return
 		nudge = self.state.loop_detector.get_nudge_message()
@@ -1508,6 +1613,8 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 
 	def _update_loop_detector_actions(self) -> None:
 		"""Record the actions from the latest step into the loop detector."""
+		if self._jev is not None and not self._jev.last_step_planner_page_action():
+			return
 		if not self.settings.loop_detection_enabled:
 			return
 		if self.state.last_model_output is None:
@@ -1518,6 +1625,8 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		for action in self.state.last_model_output.action:
 			action_data = action.model_dump(exclude_unset=True)
 			action_name = next(iter(action_data.keys()), 'unknown')
+			if self._jev is not None and action_name in {'delegate_subgoal', 'finish'}:
+				continue
 			if action_name in _LOOP_EXEMPT_ACTIONS:
 				continue
 			params = action_data.get(action_name, {})
@@ -1527,6 +1636,8 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 
 	def _update_loop_detector_page_state(self, browser_state_summary: BrowserStateSummary) -> None:
 		"""Record the current page state for stagnation detection."""
+		if self._jev is not None and not self._jev.last_step_planner_page_action():
+			return
 		if not self.settings.loop_detection_enabled:
 			return
 		url = browser_state_summary.url or ''
@@ -1563,6 +1674,13 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 				f'(2) call done with what you have. '
 				f'Partial results are far more valuable than exhausting all steps with nothing saved.'
 			)
+			if self._isolated_jev():
+				msg = (
+					f'BUDGET WARNING: You have used {steps_used}/{step_info.max_steps} steps '
+					f'({pct}%). {steps_remaining} steps remaining. System1 actions count as steps. '
+					'If the task cannot be completed in the remaining steps, delegate only what is essential, '
+					'then call finish with what has been verified. Saved pages will be used for the final answer.'
+				)
 			self.logger.info(f'Step budget warning: {steps_used}/{step_info.max_steps} ({pct}%)')
 			self._message_manager._add_context_message(UserMessage(content=msg))
 
@@ -1574,8 +1692,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			msg += '\nIf the task is not yet fully finished as requested by the user, set success in "done" to false! E.g. if not all steps are fully completed. Else success to true.'
 			msg += '\nInclude everything you found out for the ultimate task in the done text.'
 			self.logger.debug('Last step finishing up')
-			self._message_manager._add_context_message(UserMessage(content=msg))
-			self.AgentOutput = self.DoneAgentOutput
+			self._force_completion_model(msg, 'You reached max_steps - this is your last step.')
 
 	async def _force_done_after_failure(self) -> None:
 		"""Force done after failure"""
@@ -1587,8 +1704,20 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			msg += '\nInclude everything you found out for the ultimate task in the done text.'
 
 			self.logger.debug('Force done action, because we reached max_failures.')
-			self._message_manager._add_context_message(UserMessage(content=msg))
+			self._force_completion_model(msg, f'You failed {self.settings.max_failures} times. Therefore we terminate the agent.')
+
+	def _force_completion_model(self, message: str, reason: str) -> None:
+		if self._jev is None:
 			self.AgentOutput = self.DoneAgentOutput
+		else:
+			self._jev.finish_only = True
+			if self._isolated_jev():
+				message = (
+					f'{reason} Your only tool available is the "finish" tool. No other tool is available.\n'
+					'If the task is not yet fully finished as requested by the user, set success in "finish" to false. Else set it to true.\n'
+					'Put everything you verified into the reason of "finish".'
+				)
+		self._message_manager._add_context_message(UserMessage(content=message))
 
 	@observe(ignore_input=True, ignore_output=False)
 	async def _judge_trace(self) -> JudgementResult | None:
@@ -1688,6 +1817,13 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 
 			if not model_output.action or all(action.model_dump() == {} for action in model_output.action):
 				self.logger.warning('Model still returned empty after retry. Inserting safe noop action.')
+				if self._isolated_jev():
+					model_output.action = [
+						self.ActionModel.model_validate(
+							{'finish': {'success': False, 'reason': 'No next action returned by LLM!'}}
+						)
+					]
+					return model_output
 				action_instance = self.ActionModel()
 				setattr(
 					action_instance,
@@ -1722,6 +1858,9 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 				)
 
 		if self.settings.save_conversation_path and self.state.last_model_output:
+			if self._jev is not None and self._jev.step_source() == 'system1':
+				self._jev.save_system1_step(self, self.settings.save_conversation_path)
+				return
 			# Treat save_conversation_path as a directory (consistent with other recording paths)
 			conversation_dir = Path(self.settings.save_conversation_path)
 			conversation_filename = f'conversation_{self.id}_{self.state.n_steps}.txt'
@@ -1947,10 +2086,13 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 
 		# Build kwargs for ainvoke
 		# Note: ChatBrowserUse will automatically generate action descriptions from output_format schema
-		kwargs: dict = {'output_format': self.AgentOutput, 'session_id': self.session_id}
+		kwargs: dict = {'output_format': self._planner_output_format(), 'session_id': self.session_id}
 
 		try:
-			response = await self.llm.ainvoke(input_messages, **kwargs)
+			if self._jev is None:
+				response = await self.llm.ainvoke(input_messages, **kwargs)
+			else:
+				response = await self._jev.invoke_llm('planner', self.llm, input_messages, **kwargs)
 			parsed: AgentOutput = response.completion  # type: ignore[assignment]
 
 			# Replace any shortened URLs in the LLM response back to original URLs
@@ -2478,6 +2620,8 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 
 		self.logger.debug(f'🚶 Starting step {step + 1}/{max_steps}...')
 
+		if self._jev is not None:
+			self._jev.defer_final_answer = True
 		try:
 			await asyncio.wait_for(
 				self.step(step_info),
@@ -2495,6 +2639,12 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			# been skipped or returned early due to the cancellation.
 			if self.state.n_steps == step + 1:
 				self.state.n_steps += 1
+		finally:
+			if self._jev is not None:
+				self._jev.defer_final_answer = False
+
+		if self._jev is not None:
+			await self._finalize_jev_answer()
 
 		if on_step_end is not None:
 			await on_step_end(self)
@@ -2804,6 +2954,8 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 				pre_action_url = await self.browser_session.get_current_page_url()
 				pre_action_focus = self.browser_session.agent_focus_target_id
 
+				if self._jev is not None and self._jev.step_source() == 'system1':
+					self._jev.on_dispatch(self)
 				result = await self.tools.act(
 					action=action,
 					browser_session=self.browser_session,
@@ -2820,7 +2972,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 						'error',
 						{'action': action_name, 'step': self.state.n_steps},
 					)
-				elif result.is_done:
+				elif result.is_done and self._jev is None:
 					completion_text = result.long_term_memory or result.extracted_content or 'Task marked as done.'
 					level = 'success' if result.success is not False else 'warning'
 					await self._demo_mode_log(
@@ -4003,6 +4155,8 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 	async def close(self):
 		"""Close all resources"""
 		try:
+			if self._jev is not None:
+				await self._jev.aclose()
 			# Only close browser if keep_alive is False (or not set)
 			if self.browser_session is not None:
 				if not self.browser_session.browser_profile.keep_alive:
@@ -4047,25 +4201,8 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			self.logger.error(f'Error during cleanup: {e}')
 
 	async def _update_action_models_for_page(self, page_url: str) -> None:
-		"""Update action models with page-specific actions"""
-		# Create new action model with current page's filtered actions
-		self.ActionModel = self.tools.registry.create_action_model(page_url=page_url)
-		# Update output model with the new actions
-		if self.settings.flash_mode:
-			self.AgentOutput = AgentOutput.type_with_custom_actions_flash_mode(self.ActionModel)
-		elif self.settings.use_thinking:
-			self.AgentOutput = AgentOutput.type_with_custom_actions(self.ActionModel)
-		else:
-			self.AgentOutput = AgentOutput.type_with_custom_actions_no_thinking(self.ActionModel)
-
-		# Update done action model too
-		self.DoneActionModel = self.tools.registry.create_action_model(include_actions=['done'], page_url=page_url)
-		if self.settings.flash_mode:
-			self.DoneAgentOutput = AgentOutput.type_with_custom_actions_flash_mode(self.DoneActionModel)
-		elif self.settings.use_thinking:
-			self.DoneAgentOutput = AgentOutput.type_with_custom_actions(self.DoneActionModel)
-		else:
-			self.DoneAgentOutput = AgentOutput.type_with_custom_actions_no_thinking(self.DoneActionModel)
+		"""Refresh the schemas before applying the step budget and failure limits."""
+		self._build_action_models(page_url)
 
 	async def authenticate_cloud_sync(self, show_instructions: bool = True) -> bool:
 		"""

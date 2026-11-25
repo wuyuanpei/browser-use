@@ -1,0 +1,270 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <meta name="demo-token" content="__TOKEN__" />
+    <title>Jev Ultrafast · Browser Use</title>
+    <link rel="stylesheet" href="https://rsms.me/inter/inter.css" />
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body>
+    <header>
+      <a href="/" aria-label="Homepage" class="brand"
+        >browser<span>use</span> <i>×</i> System1</a
+      >
+      <div class="local"><span class="dot"></span> Jev Ultrafast</div>
+    </header>
+    <main>
+      <section class="intro">
+        <div>
+          <p class="eyebrow">A BROWSER THAT CHOOSES</p>
+          <h1>Every page is a set of possibilities.</h1>
+          <p>
+            System1 picks the next action. A small language model handles the words.
+            <a href="/demo.mp4" target="_blank" rel="noopener">Watch the original Jev Google Flights run ↗</a>
+          </p>
+        </div>
+        <dl class="model-endpoints" aria-label="Model service addresses">
+          <div><dt id="system1-name">执行 LLM</dt><dd id="laya-address">Loading...</dd></div>
+          <div><dt id="text-model-name">终验模型</dt><dd id="text-model-address">Loading...</dd></div>
+          <div id="planner-endpoint" hidden><dt id="planner-name">Planner</dt><dd id="planner-address"></dd></div>
+        </dl>
+      </section>
+      <div class="system1-control">
+        <label for="system1-provider">执行决策模型(暂不支持)</label>
+        <select id="system1-provider" disabled>
+          <option value="none">无</option>
+        </select>
+        <div class="screenshot-mode-control" role="group" aria-label="模型截图模式(暂不支持)" aria-describedby="screenshot-mode-hint">
+          <span>模型截图模式(暂不支持)</span>
+          <div class="screenshot-mode-options">
+            <button id="screenshot-off" type="button" aria-pressed="true">始终关闭</button>
+            <button id="screenshot-always" type="button" aria-pressed="false" disabled>始终开启</button>
+            <button id="screenshot-smart" type="button" aria-pressed="false" disabled>智能开关</button>
+          </div>
+        </div>
+        <label for="execution-mode">执行模式(暂不支持)</label>
+        <select id="execution-mode">
+          <option value="direct" selected>直接执行</option>
+          <option value="planned" disabled>Planner 子任务</option>
+        </select>
+        <label for="model-profile">下次运行配置</label>
+        <select id="model-profile" aria-describedby="model-profile-hint">
+          <option value="debug" selected>调试</option>
+          <option id="model-profile-final" value="final_report" disabled>最终报告</option>
+        </select>
+        <span id="model-profile-current" class="muted"></span>
+        <span id="model-profile-hint" class="muted">默认使用调试配置；最终报告配置仅用于本次显式选择的运行。</span>
+        <span id="screenshot-mode-hint" class="muted">Browser Use 当前使用文本直接执行，实时预览独立保存。</span>
+      </div>
+      <nav class="view-tabs" role="tablist" aria-label="任务模式">
+        <button type="button" id="free-tab" role="tab" aria-controls="free-panel" aria-selected="true">自由任务</button>
+        <button type="button" id="baseline-tab" role="tab" aria-controls="baseline-panel" aria-selected="false" tabindex="-1">基线测试</button>
+      </nav>
+      <section id="free-panel" role="tabpanel" aria-labelledby="free-tab">
+      <form id="task-form">
+        <div class="task-label">
+          <label for="goal">Give it a task</label>
+          <div class="website-controls">
+            <select id="scenario" name="scenario" aria-label="Website preset">
+              <option value="flights">Google Flights · real web</option>
+              <option value="travel">Travel planner · fixture</option>
+              <option value="research">Reading room · fixture</option>
+              <option value="custom">Custom website</option>
+            </select>
+            <input id="website-url" name="url" type="url" aria-label="Target website URL"
+              placeholder="https://example.com" value="https://www.google.com/travel/flights?hl=en"
+              maxlength="2048" required spellcheck="false" autocapitalize="none" />
+          </div>
+        </div>
+        <div class="task-row">
+          <textarea id="goal" name="goal" rows="5">
+Find one-way flights from Zurich to London on September 20, 2026, for one adult in economy. Stop when matching flight options are visible. Do not select or book a flight.</textarea
+          ><button type="submit" id="start" class="primary">
+            Start task <span>↗</span>
+          </button>
+        </div>
+      </form>
+      </section>
+      <section id="baseline-panel" role="tabpanel" aria-labelledby="baseline-tab" hidden>
+        <div class="baseline-heading">
+          <h2 id="baseline-task-heading">网页基线</h2>
+          <div class="baseline-controls">
+            <label for="baseline-repeats">重复次数 <input id="baseline-repeats" type="number" min="1" max="10" step="1" value="1" /></label>
+            <button type="button" id="baseline-run-all" class="primary">▶ 复测已成功组</button>
+            <button type="button" id="baseline-stop" disabled><span aria-hidden="true">■</span> 停止</button>
+            <button type="button" id="baseline-open-folder" disabled>打开结果文件夹</button>
+          </div>
+        </div>
+        <div class="baseline-batch-bar">
+          <div class="baseline-run-picker">
+            <label for="baseline-runs">历史批次 <select id="baseline-runs"><option value="">尚无批次</option></select></label>
+            <button type="button" id="baseline-rename" disabled title="重命名所选批次">重命名</button>
+            <button type="button" id="baseline-delete" disabled title="永久删除所选批次及全部文件" aria-label="删除所选批次">删除</button>
+          </div>
+          <span id="baseline-status" role="status" aria-live="polite">正在读取任务</span>
+        </div>
+        <p id="baseline-path" class="baseline-path"></p>
+        <div id="baseline-error" role="alert" hidden></div>
+        <nav class="baseline-group-tabs" aria-label="用例分组">
+          <button type="button" id="baseline-group-all" aria-pressed="false">全部用例 <span></span></button>
+          <button type="button" id="baseline-group-success" aria-pressed="true">已成功 <span></span></button>
+          <button type="button" id="baseline-group-partial" aria-pressed="false">部分成功 <span></span></button>
+          <button type="button" id="baseline-group-other" aria-pressed="false">其他用例 <span></span></button>
+        </nav>
+        <div class="baseline-group-heading">
+          <div><h3 id="baseline-group-title">已成功</h3><p id="baseline-group-help">最近一次确认达成目标的用例。</p></div>
+          <input id="baseline-case-search" type="search" placeholder="搜索名称或编号…" aria-label="搜索用例名称或编号" autocomplete="off" />
+        </div>
+        <div id="baseline-tasks" class="baseline-task-grid" aria-labelledby="baseline-group-title"></div>
+        <p id="baseline-group-count" class="baseline-group-count" role="status" aria-live="polite"></p>
+        <div class="baseline-attempt-heading"><h3 id="baseline-attempt-title">运行记录</h3><span id="baseline-summary"></span></div>
+        <div id="baseline-token-summary"></div>
+        <div id="baseline-attempts" class="baseline-task-grid baseline-attempt-grid" aria-labelledby="baseline-attempt-title"></div>
+        <p id="baseline-selected" class="baseline-selected">未选择运行记录</p>
+        <details id="baseline-evaluation-panel" hidden>
+          <summary>状态评估</summary>
+          <p id="baseline-evaluation-status" role="status"></p>
+          <p id="baseline-evaluation-reason"></p>
+          <div id="baseline-verification-calls"></div>
+          <details><summary>完整评估记录</summary><pre id="baseline-evaluation"></pre></details>
+        </details>
+      </section>
+      <div class="toolbar">
+        <div class="status">
+          <span class="dot" id="status-dot"></span
+          ><span id="status" role="status">Ready to explore</span>
+        </div>
+        <div class="controls" id="free-controls"><label class="overlay-control"><input name="pace" id="pace" type="checkbox"> Slow motion</label>
+          <label class="overlay-control"
+            ><input name="overlays" id="overlays" type="checkbox" checked />
+            Targets</label
+          ><button type="button" id="choose" disabled>Choose next</button
+          ><button type="button" id="execute" disabled>Execute choice</button
+          ><button type="button" id="auto" disabled>Run automatically</button
+          ><button type="button" id="stop" hidden>Pause</button>
+        </div>
+      </div>
+      <div id="error" role="alert" hidden></div>
+      <section id="original-prompt-panel" class="original-prompt-panel" aria-labelledby="original-prompt-heading" hidden>
+        <h2 id="original-prompt-heading">原始任务 Prompt</h2>
+        <p id="original-prompt"></p>
+      </section>
+      <section id="planning-panel" class="planning-panel" hidden>
+        <div class="planning-heading"><h2>子任务计划</h2><span id="planning-counts"></span></div>
+        <p id="planning-status" role="status"></p>
+        <ol id="planning-goals"></ol>
+      </section>
+      <div id="observation-toolbar" class="observation-toolbar" hidden>
+        <label for="observation-step">观察步骤 <select id="observation-step"></select></label>
+        <span id="observation-status" role="status"></span>
+      </div>
+      <section id="research-panel" class="research-panel">
+        <div class="research-heading"><h2>资料库</h2><span id="research-status">未记录</span>
+          <button type="button" id="research-latest">返回最新</button></div>
+        <p id="research-notice" role="status"></p>
+        <div id="research-entries"></div>
+        <details id="research-source-panel" hidden><summary>查看保存的网页原文</summary><div id="research-sources"></div></details>
+      </section>
+      <section id="research-report" class="research-panel" hidden aria-label="任务输出">
+          <h2>任务输出</h2><button type="button" id="report-copy">复制输出</button>
+          <button type="button" id="report-download">下载 Markdown</button>
+          <pre id="report-content"></pre>
+      </section>
+      <section class="workspace">
+        <div class="browser-panel">
+          <div class="browser-bar">
+            <div class="traffic"><b></b><b></b><b></b></div>
+            <span id="url">Local demo browser</span
+            ><span class="live" id="browser-mode">LIVE</span>
+          </div>
+          <div class="viewport" id="viewport">
+            <div class="empty" id="empty">
+              <p class="empty-symbol">[ ↗ ]</p>
+              <h2 id="empty-title">Watch the decision happen.</h2>
+              <p id="empty-description">
+                Start a task to see a real browser, its available<br />actions,
+                and the model's choice.
+              </p>
+            </div>
+            <img
+              id="screenshot"
+              alt="Live screenshot of the controlled browser"
+              hidden
+            />
+            <div id="targets"></div>
+          </div>
+          <div class="browser-footer">
+            <span id="page-title">Isolated demo tab</span
+            ><span>AX tree → typed actions → CDP</span>
+          </div>
+        </div>
+        <aside>
+          <div class="aside-header">
+            <div>
+              <p class="eyebrow">NEXT ACTION</p>
+              <h2 id="choice-title">Waiting for a page</h2>
+            </div>
+            <span id="action-count">0 options</span>
+          </div>
+          <div id="plan" class="plan"></div>
+          <div class="metrics">
+            <div><span>Decision time</span><strong id="latency">—</strong></div>
+            <div>
+              <span>Target confidence</span><strong id="confidence">—</strong>
+            </div>
+            <div>
+              <span>Operation</span
+              ><strong id="completion">—</strong>
+            </div>
+          </div>
+          <div id="operation-choices" class="operation-choices"></div>
+          <p class="distribution-label">
+            Indexed elements
+            <span id="ranking-note">Choose next to rank</span>
+          </p>
+          <div id="choices" class="choices">
+            <p class="muted">Available actions will appear here.</p>
+          </div>
+          <p class="aside-note">
+            Operation and target are separate choices in one request.<br />COLLECT saves evidence; TYPE_TEXT writes field values.
+          </p>
+        </aside>
+      </section>
+      <section class="trace">
+        <div class="trace-heading">
+          <h2>Decision trail <span id="step-count">0 actions</span></h2>
+          <button type="button" id="download" disabled>Export trace ↓</button>
+        </div>
+        <div id="history">
+          <p class="muted">No model calls yet.</p>
+        </div>
+      </section>
+      <p id="selected-call" class="muted">No call selected</p>
+      <section class="model-io">
+        <div class="model-inputs">
+          <details id="model-input-panel" open>
+            <summary>What the model sees</summary>
+            <div id="question-contexts"></div>
+          </details>
+          <details id="raw-request-panel" open>
+            <summary>HTTP request body</summary>
+            <div id="stage-requests" hidden></div>
+            <pre id="model-state">No request recorded.</pre>
+          </details>
+        </div>
+        <details id="model-output-panel" open>
+          <summary>What the model outputs</summary>
+          <div id="stage-outputs" hidden></div>
+          <pre id="model-output">No response recorded.</pre>
+        </details>
+      </section>
+      <footer>
+        <span>Browser Use × System1</span
+        ><span id="helper">Text helper loading</span>
+      </footer>
+    </main>
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>

@@ -1,0 +1,901 @@
+[
+  {
+    "id": "15_xiaoyi_weibo_ai",
+    "name": "微博关注流 AI 内容（3）",
+    "url": "https://weibo.com/",
+    "goal": "从头操控：收集我在微博关注的博主最近一周关于AI的3条发帖内容。如果没有，则返回数据不足。如果少于3条，则返回全部内容就好。",
+    "capability": "时间窗口、数量上限、数据不足分支",
+    "category": "关注流采集",
+    "source_dataset": "xiaoyi_100samples_v1.json",
+    "source_case_id": "3"
+  },
+  {
+    "id": "16_xiaoyi_zhihu_hot",
+    "name": "知乎热门话题（22_2）",
+    "url": "https://www.zhihu.com/",
+    "goal": "从头操控：去知乎收集最近24小时最热门的3个话题，附带每个话题的链接，以及一句话总结话题内容。",
+    "capability": "热榜、链接提取、内容总结",
+    "category": "热门内容采集",
+    "source_dataset": "xiaoyi_100samples_v1.json",
+    "source_case_id": "22_2"
+  },
+  {
+    "id": "17_xiaoyi_jd_reviews",
+    "name": "京东商品好评（15_2）",
+    "url": "https://www.jd.com/",
+    "goal": "从头操控：帮我从京东获取小米保温杯的用户评价，筛选和返回5条好评。",
+    "capability": "定位商品、好评筛选、批量提取",
+    "category": "商品评价查询",
+    "source_dataset": "xiaoyi_100samples_v1.json",
+    "source_case_id": "15_2"
+  },
+  {
+    "id": "18_xiaoyi_xhs_metrics",
+    "name": "小红书笔记数据（4_2）",
+    "url": "https://www.xiaohongshu.com/",
+    "goal": "从头操控：请帮我收集我小红书账号近30日的3条笔记数据，包含曝光数、观看数、点赞数、评论数、主页访客数。如果没有相关数据，则返回数据不足。如果小于3条笔记数据，则收集所有笔记数据就好。",
+    "capability": "个人后台、时间范围、多指标结构化输出",
+    "category": "后台数据查询",
+    "source_dataset": "xiaoyi_100samples_v1.json",
+    "source_case_id": "4_2"
+  },
+  {
+    "id": "19_xiaoyi_qq_mail_search",
+    "name": "QQ 邮箱会议邮件检索（57_1_4）",
+    "url": "https://mail.qq.com/",
+    "goal": "从头操控：帮我打开QQ邮箱，找到近7天邮件内容带“会议”二字的邮件，提取邮件的内容。如果大于3封邮件，则返回前3封邮件的内容。",
+    "capability": "时间与正文关键词组合、结果数量限制",
+    "category": "邮件检索",
+    "source_dataset": "xiaoyi_100samples_v1.json",
+    "source_case_id": "57_1_4"
+  },
+  {
+    "id": "20_xiaoyi_ctrip_hotels",
+    "name": "携程酒店多条件查询（65_2_2）",
+    "url": "https://hotels.ctrip.com/",
+    "goal": "从头操控：帮我在携程上搜索酒店。地点为上海。时间为2天后入住，3天后退房。星级可选4钻、5钻。评分4.5分以上。点评数100条以上。位置在上海虹桥站附近。返回3家推荐的酒店和对应的价格（起步最低价）。如搜索结果不足3家，则返回所有结果。",
+    "capability": "相对日期、多选筛选、数值门槛、位置约束、价格提取",
+    "category": "多条件查询",
+    "source_dataset": "xiaoyi_100samples_v1.json",
+    "source_case_id": "65_2_2"
+  },
+  {
+    "id": "21_xiaoyi_weibo_profile",
+    "name": "微博个人资料表单（65_1_1）",
+    "url": "https://weibo.com/",
+    "goal": "从头操控：请帮我打开微博的账号设置，完成以下的信息填写。昵称：Lucky。简介：A lucky man。性别：男。生日：1980年2月3号。其余字段不要填。不要保存或提交。",
+    "capability": "文本、性别、生日、未指定字段保持不变、不保存",
+    "category": "个人资料表单",
+    "source_dataset": "xiaoyi_100samples_v1.json",
+    "source_case_id": "65_1_1"
+  },
+  {
+    "id": "22_xiaoyi_questionnaire_1_8",
+    "name": "就业问卷第 1–8 题（65_3_1）",
+    "url": "https://wj.qq.com/s2/26481244/c860/",
+    "goal": "从头操控：帮我填写调查问卷https://wj.qq.com/s2/26481244/c860/ 的1到8题。学历为本科，专业大类为工学，毕业时间为2026年。薪资福利、工作稳定性、职业发展空间、工作地点、企业文化匹配度分别为3、4、5、2、4分。就业单位类型考虑国有企业、外资企业和继续深造。期待就业城市为新一线城市。期望月薪为5千-1万。留校工作推荐度为8分。只填写指定项，其余项不填写，即可已经有信息的也要重新填，不提交。",
+    "capability": "单选、多选、评分、数值、覆盖已有值、指定题目范围",
+    "category": "混合题型问卷",
+    "source_dataset": "xiaoyi_100samples_v1.json",
+    "source_case_id": "65_3_1"
+  },
+  {
+    "id": "23_xiaoyi_questionnaire_9_16",
+    "name": "就业问卷第 9–16 题（65_3_2）",
+    "url": "https://wj.qq.com/s2/26481244/c860/",
+    "goal": "从头操控：帮我填写调查问卷https://wj.qq.com/s2/26481244/c860/ 的9到16题。求职能力自评中，专业实践能力、外语能力、沟通表达能力为较强，团队协作能力和创新解决问题能力为非常强。没有实习经历。求职渠道为校园招聘会和社交媒体。当前就业形势比较严峻。求职障碍为竞争激烈和地域限制。希望学校提供更多的实习机会。就业信心指数为8。其他就业建议为希望多引进企业招聘会。只填写指定项，其余项不填写，即可已经有信息的也要重新填，不提交。",
+    "capability": "多维量表、多选、自由文本、覆盖已有值",
+    "category": "多维自评与文本问卷",
+    "source_dataset": "xiaoyi_100samples_v1.json",
+    "source_case_id": "65_3_2"
+  },
+  {
+    "id": "25_xiaoyi_pkulaw_conditions",
+    "name": "北大法宝组合检索条件（65_7_1）",
+    "url": "https://www.pkulaw.com/",
+    "goal": "从头操控：帮我打开北大法宝网站的法律法规检索页进行高级搜索填写表单，标题写AI法律并且人工智能，全文写人工智能法律或者机器人安全法律，制定机关前面选或者，从列表选择最高人民法院。只填写就好，不要提交检索。",
+    "capability": "并且/或者切换、多字段条件、列表选择",
+    "category": "布尔逻辑检索表单",
+    "source_dataset": "xiaoyi_100samples_v1.json",
+    "source_case_id": "65_7_1"
+  },
+  {
+    "id": "26_xiaoyi_zhihu_format",
+    "name": "知乎文章格式编辑（5_20）",
+    "url": "https://www.zhihu.com/",
+    "goal": "从头操控：帮我写一篇知乎文章。标题为：如何写好故事。内容为：“写好故事的三个关键点”+[今天的日期]。“关键点”三个字加粗和设置为斜体。加一个无序列表，内容为“人物要立住”，“冲突要抓人”，“结尾要有力”。填写就好，不要发布。",
+    "capability": "加粗、斜体、无序列表、动态日期、不发布",
+    "category": "富文本格式编辑",
+    "source_dataset": "xiaoyi_100samples_v1.json",
+    "source_case_id": "5_20"
+  },
+  {
+    "id": "27_xiaoyi_zhihu_table",
+    "name": "知乎文章链接与表格（5_21）",
+    "url": "https://www.zhihu.com/",
+    "goal": "从头操控：帮我写一篇知乎文章。标题为：如何写好故事。内容为：“写好故事的三个关键点”+[今天的日期]。加入一个链接https://www.zhihu.com/，文本为知乎网站。插入一个1行3列的表格，填写“人物要立住”，“冲突要抓人”，“结尾要有力”，不要发布。",
+    "capability": "超链接、链接文字、表格单元格填写、不发布",
+    "category": "富文本结构编辑",
+    "source_dataset": "xiaoyi_100samples_v1.json",
+    "source_case_id": "5_21"
+  },
+  {
+    "id": "28_xiaoyi_163_calendar",
+    "name": "163 邮箱日程邮件（57_3_1_2）",
+    "url": "https://mail.163.com/",
+    "goal": "从头操控：帮我打开163邮箱发送邮件。主题写奥创邮件。邮件内新建一个日程，时间为第二天晚上8点，持续半小时，地点为H201。发给我自己当前的163邮箱。",
+    "capability": "相对日期、时间、持续时长、地点、邮件内嵌日程",
+    "category": "日程创建",
+    "source_dataset": "xiaoyi_100samples_v1.json",
+    "source_case_id": "57_3_1_2"
+  },
+  {
+    "id": "29_xiaoyi_sina_scheduled_mail",
+    "name": "新浪邮箱定时邮件（57_2_2）",
+    "url": "https://mail.sina.com.cn/",
+    "goal": "从头操控：帮我打开新浪邮箱发送邮件。正文是“奥创：这是一封预约会议邮件”加上今天的日期，使用邮件的序号功能加上列表[1. 张三\n2. 李四\n3. 王五]。定时为第二天晚上8点发送。发给我自己当前的新浪邮箱。",
+    "capability": "有序列表、相对日期、定时发送设置",
+    "category": "定时发送",
+    "source_dataset": "xiaoyi_100samples_v1.json",
+    "source_case_id": "57_2_2"
+  },
+  {
+    "id": "30_xiaoyi_qq_star",
+    "name": "QQ 邮箱星标状态（57_1_7）",
+    "url": "https://mail.qq.com/",
+    "goal": "从头操控：请帮我打开QQ邮箱，给内容包含会议的第一封邮件标记为星标邮件，然后再取消星标。如果星标本来就有，则取消就好。",
+    "capability": "读取初始状态、切换与撤销、幂等终态",
+    "category": "有条件状态操作",
+    "source_dataset": "xiaoyi_100samples_v1.json",
+    "source_case_id": "57_1_7"
+  },
+  {
+    "id": "31_xiaoyi_baidu_note",
+    "name": "百度网盘笔记保存（64_1）",
+    "url": "https://pan.baidu.com/",
+    "goal": "从头操控：帮我打开百度网盘，新建一篇笔记并保存，标题写“AI浏览器方案”，内容写“这是最新的AI浏览器的方案”。",
+    "capability": "创建笔记、标题正文、持久化保存",
+    "category": "内容新建与保存",
+    "source_dataset": "xiaoyi_100samples_v1.json",
+    "source_case_id": "64_1"
+  },
+  {
+    "id": "32_xiaoyi_baidu_folder",
+    "name": "百度网盘文件夹重建（5_26）",
+    "url": "https://pan.baidu.com/",
+    "goal": "从头操控：帮我打开百度网盘。新建文件夹，文件夹名称为“测试文件夹”+今天的日期。如果已经存在，先删除再重建。",
+    "capability": "判断存在、删除、重建、动态命名",
+    "category": "条件式文件管理",
+    "source_dataset": "xiaoyi_100samples_v1.json",
+    "source_case_id": "5_26"
+  },
+  {
+    "id": "33_xiaoyi_baidu_upload",
+    "name": "百度网盘文件上传（5_23）",
+    "url": "https://pan.baidu.com/",
+    "goal": "从头操控：帮我打开百度网盘。上传文件/storage/Users/currentUser/appdata/el2/base/com.haitai.htbrowser/haps/eval.txt，等待文件上传成功。",
+    "capability": "文件选择、上传进度、完成状态",
+    "category": "文件上传",
+    "source_dataset": "xiaoyi_100samples_v1.json",
+    "source_case_id": "5_23"
+  },
+  {
+    "id": "34_xiaoyi_jianguoyun_share",
+    "name": "坚果云文件分享（5_32）",
+    "url": "https://www.jianguoyun.com/",
+    "goal": "从头操控：帮我打开坚果云网盘。点击“同步文件夹”，选择文件夹“测试使用”，选中文件eval_share.txt，生成分享链接。",
+    "capability": "同步文件夹导航、定位指定文件、生成分享链接",
+    "category": "文件分享",
+    "source_dataset": "xiaoyi_100samples_v1.json",
+    "source_case_id": "5_32"
+  },
+  {
+    "id": "35_xiaoyi_douban_novels",
+    "name": "豆瓣小说推荐（24_2）",
+    "url": "https://www.douban.com/",
+    "goal": "从头操控：获取豆瓣的3本小说推荐和对应的作者、出版社。",
+    "capability": "小说推荐、作者出版社、结构化结果",
+    "category": "书籍信息搜集",
+    "source_dataset": "xiaoyi_100samples_v1.json",
+    "source_case_id": "24_2"
+  },
+  {
+    "id": "36_xiaoyi_zhihu_columns",
+    "name": "知乎推荐专栏统计（5_7）",
+    "url": "https://www.zhihu.com/",
+    "goal": "从头操控：帮我打开知乎。点击专栏，并返回前三个推荐专栏的内容数、订阅数、赞同数。",
+    "capability": "推荐顺序、内容数、订阅数、赞同数",
+    "category": "公开统计采集",
+    "source_dataset": "xiaoyi_100samples_v1.json",
+    "source_case_id": "5_7"
+  },
+  {
+    "id": "37_xiaoyi_bilibili_workplace",
+    "name": "B站职场技巧视频（14_2）",
+    "url": "https://www.bilibili.com/",
+    "goal": "从头操控：帮我从B站获取关于职场技巧的视频标题，并返回给我。至少收集3条标题。",
+    "capability": "关键词搜索、视频标题、至少三条",
+    "category": "视频信息搜集",
+    "source_dataset": "xiaoyi_100samples_v1.json",
+    "source_case_id": "14_2"
+  },
+  {
+    "id": "38_xiaoyi_xhs_activities",
+    "name": "小红书热门活动（4_4）",
+    "url": "https://creator.xiaohongshu.com/",
+    "goal": "从头操控：请帮我收集小红书创作服务平台的3个热门活动。如果没有相关活动，则返回数据不足。如果小于3个活动，则收集所有活动就好。",
+    "capability": "热门活动、三项收集、数据不足分支",
+    "category": "活动信息搜集",
+    "source_dataset": "xiaoyi_100samples_v1.json",
+    "source_case_id": "4_4"
+  },
+  {
+    "id": "39_xiaoyi_xhs_beauty_topics",
+    "name": "小红书美妆创作话题（4_3）",
+    "url": "https://creator.xiaohongshu.com/",
+    "goal": "从头操控：请帮我收集小红书美妆相关的3个近期热门创作话题。如果没有相关话题，则返回数据不足。如果小于3个话题，则收集所有话题就好。",
+    "capability": "美妆分类、近期热门话题、数量核对",
+    "category": "创作话题搜集",
+    "source_dataset": "xiaoyi_100samples_v1.json",
+    "source_case_id": "4_3"
+  },
+  {
+    "id": "40_xiaoyi_zhihu_answers",
+    "name": "知乎首页前三条回答（5_3）",
+    "url": "https://www.zhihu.com/",
+    "goal": "从头操控：帮我打开知乎。打开首页推荐列表的第一个问题，返回回答列表中的前3条回答的简要信息。",
+    "capability": "首页首个问题、回答顺序、三条摘要",
+    "category": "问答信息搜集",
+    "source_dataset": "xiaoyi_100samples_v1.json",
+    "source_case_id": "5_3"
+  },
+  {
+    "id": "41_xiaoyi_douyin_workplace",
+    "name": "抖音职场技巧视频（14_1）",
+    "url": "https://www.douyin.com/",
+    "goal": "从头操控：帮我从抖音获取关于职场技巧的视频标题，并返回给我。至少收集3条标题。",
+    "capability": "标题采集、数量核对",
+    "category": "新增复测",
+    "source_dataset": "xiaoyi_100samples_v1.json",
+    "source_case_id": "14_1"
+  },
+  {
+    "id": "42_xiaoyi_zhihu_reading",
+    "name": "知乎半年读书推荐（24_1）",
+    "url": "https://www.zhihu.com/",
+    "goal": "从头操控：获取知乎近半年的读书推荐，列出3本书及推荐理由。",
+    "capability": "发布日期、书名与推荐理由",
+    "category": "新增复测",
+    "source_dataset": "xiaoyi_100samples_v1.json",
+    "source_case_id": "24_1"
+  },
+  {
+    "id": "43_xiaoyi_xhs_draft_count",
+    "name": "小红书图文草稿数量（4_1）",
+    "url": "https://creator.xiaohongshu.com/",
+    "goal": "从头操控：打开小红书的创作服务平台，获取我草稿箱的图文笔记的数量。",
+    "capability": "草稿类型、数量核对",
+    "category": "新增复测",
+    "source_dataset": "xiaoyi_100samples_v1.json",
+    "source_case_id": "4_1"
+  },
+  {
+    "id": "44_xiaoyi_douyin_first_work",
+    "name": "抖音首条作品播放数（4_21）",
+    "url": "https://creator.douyin.com/",
+    "goal": "从头操控：帮我打开抖音创作者中心的作品管理页面，查看我第一条作品的播放数。如果没有相关作品，则返回数据不足。",
+    "capability": "作品顺序、播放数、数据不足分支",
+    "category": "新增复测",
+    "source_dataset": "xiaoyi_100samples_v1.json",
+    "source_case_id": "4_21"
+  },
+  {
+    "id": "45_xiaoyi_qq_sent_mail",
+    "name": "QQ 邮箱已发送前两封（57_1_6）",
+    "url": "https://mail.qq.com/",
+    "goal": "从头操控：请帮我打开QQ邮箱，返回已发送邮件的前2封邮件的收件人、时间、主题和邮件内容。",
+    "capability": "邮件顺序、收件人、时间与正文",
+    "category": "新增复测",
+    "source_dataset": "xiaoyi_100samples_v1.json",
+    "source_case_id": "57_1_6"
+  },
+  {
+    "id": "46_xiaoyi_zhihu_vote_toggle",
+    "name": "知乎赞同后取消（5_15）",
+    "url": "https://www.zhihu.com/",
+    "goal": "从头操控：帮我打开知乎。对首页第一条内容进行“赞同”操作，并取消“赞同”操作，返回最终的赞同数。",
+    "capability": "目标身份、取消状态、最终赞同数",
+    "category": "新增复测",
+    "source_dataset": "xiaoyi_100samples_v1.json",
+    "source_case_id": "5_15"
+  },
+  {
+    "id": "47_xiaoyi_zhihu_author_toggle",
+    "name": "知乎关注作者后取消（5_17）",
+    "url": "https://www.zhihu.com/",
+    "goal": "从头操控：帮我打开知乎。进入首页推荐下第一条内容，并关注该作者，再取消关注。",
+    "capability": "首条内容、作者身份、取消关注",
+    "category": "新增复测",
+    "source_dataset": "xiaoyi_100samples_v1.json",
+    "source_case_id": "5_17"
+  },
+  {
+    "id": "48_xiaoyi_zhihu_question_toggle",
+    "name": "知乎热榜问题关注后取消（5_6）",
+    "url": "https://www.zhihu.com/",
+    "goal": "从头操控：帮我打开知乎。点击热榜的第一条问题，先关注该问题，再取消关注。",
+    "capability": "热榜排序、问题身份、取消关注",
+    "category": "新增复测",
+    "source_dataset": "xiaoyi_100samples_v1.json",
+    "source_case_id": "5_6"
+  },
+  {
+    "id": "49_xiaoyi_zhihu_profile_draft",
+    "name": "知乎个人资料填写（65_4_1）",
+    "url": "https://www.zhihu.com/",
+    "goal": "从头操控：帮我打开知乎编辑个人资料。性别写男。一句话介绍：研究AI的工程师，方向是Agent。现居住地为上海。所在行业为互联网。职业经历，公司是匿名，职位是AI工程师。其余字段不要填。不要保存或提交。",
+    "capability": "字段对应、保留未指定字段、不保存",
+    "category": "新增复测",
+    "source_dataset": "xiaoyi_100samples_v1.json",
+    "source_case_id": "65_4_1"
+  },
+  {
+    "id": "50_xiaoyi_law_keyword_form",
+    "name": "法规数据库四项检索词（65_8_1）",
+    "url": "https://flk.npc.gov.cn/",
+    "goal": "从头操控：帮我打开国家法律法规数据库网站首页进行高级搜索，填写搜索表单。法律标题写人工智能。法律全文写大模型。相关资料标题写自动驾驶测试。相关资料全文写大模型伦理。只填写，不要确定/提交。没提到的字段不要填。",
+    "capability": "字段对应、保留未指定字段、不提交",
+    "category": "新增复测",
+    "source_dataset": "xiaoyi_100samples_v1.json",
+    "source_case_id": "65_8_1"
+  },
+  {
+    "id": "51_xiaoyi_5",
+    "name": "微博关注财经博主一周内股市建议",
+    "url": "https://weibo.com/",
+    "goal": "从头操控：帮我操控网页，查看我微博关注的财经博主，搜集他们近一周分享的2条股市建议。如果没有，则返回数据不足。如果只有1条，则返回1条的帖子内容。",
+    "capability": "读取个人关注流中的股市建议",
+    "source_dataset": "xiaoyi_100samples_v1.json",
+    "source_case_id": "5"
+  },
+  {
+    "id": "52_xiaoyi_11",
+    "name": "小红书半年内平价粉底液测评",
+    "url": "https://www.xiaohongshu.com/",
+    "goal": "从头操控：去到小红书网页，浏览收集半年内推荐的平价粉底液测评内容。至少收集3条帖子，需要列出测评内容。",
+    "capability": "搜索并读取至少三条公开测评",
+    "source_dataset": "xiaoyi_100samples_v1.json",
+    "source_case_id": "11"
+  },
+  {
+    "id": "53_xiaoyi_12",
+    "name": "网易云音乐喜欢歌单",
+    "url": "https://music.163.com/",
+    "goal": "从头操控：帮我在我的网易云音乐网站，获取我的音乐里的歌单“我喜欢的音乐”的所有歌曲名称和歌手信息。如果歌曲多于3首，则收集3首就好。",
+    "capability": "读取本账号喜欢歌单的歌名及歌手",
+    "source_dataset": "xiaoyi_100samples_v1.json",
+    "source_case_id": "12"
+  },
+  {
+    "id": "54_xiaoyi_13",
+    "name": "微博关注博主一周内新能源车动态",
+    "url": "https://weibo.com/",
+    "goal": "从头操控：帮我收集我在微博上关注的博主，关于新能源车近一周讲了什么新鲜事，返回3条内容。如果没有，则返回数据不足。如果少于3条，则返回全部内容就好。",
+    "capability": "读取个人关注流中的发帖",
+    "source_dataset": "xiaoyi_100samples_v1.json",
+    "source_case_id": "13"
+  },
+  {
+    "id": "55_xiaoyi_18",
+    "name": "小红书半年内天生会画帖子",
+    "url": "https://www.xiaohongshu.com/",
+    "goal": "从头操控：搜集小红书上最近半年关于天生会画的帖子内容和点赞数。至少收集3条帖子，需要列出帖子内容。",
+    "capability": "搜索并读取公开帖子和点赞数",
+    "source_dataset": "xiaoyi_100samples_v1.json",
+    "source_case_id": "18"
+  },
+  {
+    "id": "56_xiaoyi_22_1",
+    "name": "微博最近24小时热门话题",
+    "url": "https://weibo.com/",
+    "goal": "从头操控：去微博收集最近24小时最热门的3个话题，附带每个话题的链接，以及一句话总结话题内容。",
+    "capability": "读取微博榜单、链接和摘要并验证时间范围",
+    "source_dataset": "xiaoyi_100samples_v1.json",
+    "source_case_id": "22_1"
+  },
+  {
+    "id": "57_xiaoyi_22_3",
+    "name": "抖音最近24小时热门话题",
+    "url": "https://www.douyin.com/",
+    "goal": "从头操控：去抖音收集最近24小时最热门的3个话题，附带每个话题的链接，以及一句话总结话题内容。",
+    "capability": "读取抖音榜单、链接和摘要并验证时间范围",
+    "source_dataset": "xiaoyi_100samples_v1.json",
+    "source_case_id": "22_3"
+  },
+  {
+    "id": "58_xiaoyi_4",
+    "name": "B站关注财经博主近20天视频",
+    "url": "https://www.bilibili.com/",
+    "goal": "从头操控：帮我收集我B站关注的财经UP主，近20天发布的视频标题和链接。收集1个样例就好。",
+    "capability": "读取个人关注流及视频标题、链接",
+    "source_dataset": "xiaoyi_100samples_v1.json",
+    "source_case_id": "4"
+  },
+  {
+    "id": "59_xiaoyi_6",
+    "name": "微博关注旅行博主的旅行地推荐",
+    "url": "https://weibo.com/",
+    "goal": "从头操控：帮我收集微博关注的旅行博主发布的2条旅行地推荐。如果没有，则返回数据不足。如果只有1条，则返回1条内容。",
+    "capability": "读取个人关注流中的旅行推荐",
+    "source_dataset": "xiaoyi_100samples_v1.json",
+    "source_case_id": "6"
+  },
+  {
+    "id": "60_xiaoyi_7",
+    "name": "微博关注娱乐博主一周内明星动态",
+    "url": "https://weibo.com/",
+    "goal": "从头操控：帮我收集微博关注的娱乐博主，近一周发布的明星动态及相关说明。至少收集3条动态。",
+    "capability": "读取个人关注流中的明星动态",
+    "source_dataset": "xiaoyi_100samples_v1.json",
+    "source_case_id": "7"
+  },
+  {
+    "id": "61_xiaoyi_8",
+    "name": "小红书穿搭博主一周内内容",
+    "url": "https://www.xiaohongshu.com/",
+    "goal": "从头操控：帮我收集小红书的穿搭博主一周内发布的穿搭内容及对应链接，至少3条内容，详细一些。",
+    "capability": "读取一周内的三条穿搭内容及链接",
+    "source_dataset": "xiaoyi_100samples_v1.json",
+    "source_case_id": "8"
+  },
+  {
+    "id": "62_xiaoyi_9",
+    "name": "小红书家居博主半年内平价好物",
+    "url": "https://www.xiaohongshu.com/",
+    "goal": "从头操控：帮我收集小红书的家居博主半年内推荐的平价好物及对应链接，至少3条内容，详细一些。",
+    "capability": "读取半年内的家居好物内容和链接",
+    "source_dataset": "xiaoyi_100samples_v1.json",
+    "source_case_id": "9"
+  },
+  {
+    "id": "63_xiaoyi_10",
+    "name": "小红书半年内减脂餐教程",
+    "url": "https://www.xiaohongshu.com/",
+    "goal": "从头操控：帮我收集小红书的美食博主，半年内发布的减脂餐制作教程，至少2条内容。",
+    "capability": "读取半年内的减脂餐教程",
+    "source_dataset": "xiaoyi_100samples_v1.json",
+    "source_case_id": "10"
+  },
+  {
+    "id": "64_xiaoyi_15_1",
+    "name": "淘宝小米保温杯五条好评",
+    "url": "https://www.taobao.com/",
+    "goal": "从头操控：帮我从淘宝获取小米保温杯的用户评价，筛选和返回5条好评。",
+    "capability": "读取公开评价，不购买",
+    "source_dataset": "xiaoyi_100samples_v1.json",
+    "source_case_id": "15_1"
+  },
+  {
+    "id": "65_xiaoyi_16",
+    "name": "京东鸿蒙笔记本五条好评",
+    "url": "https://www.jd.com/",
+    "goal": "从头操控：从京东获取鸿蒙笔记本电脑的用户评价，筛选和返回5条好评。",
+    "capability": "读取公开商品评价，无本地文件",
+    "source_dataset": "xiaoyi_100samples_v1.json",
+    "source_case_id": "16"
+  },
+  {
+    "id": "66_xiaoyi_17",
+    "name": "淘宝两种数据线各三条评价",
+    "url": "https://www.taobao.com/",
+    "goal": "从头操控：帮我从淘宝获取2种数据线的用户评价。至少收集2种数据线各3条评价。",
+    "capability": "读取两种商品的公开评价，不购买",
+    "source_dataset": "xiaoyi_100samples_v1.json",
+    "source_case_id": "17"
+  },
+  {
+    "id": "67_xiaoyi_19_1",
+    "name": "知乎三条热门创业经验",
+    "url": "https://www.zhihu.com/",
+    "goal": "从头操控：获取知乎热门的创业经验分享并提炼核心要点。至少收集3条分享。",
+    "capability": "读取并概括公开创业经验",
+    "source_dataset": "xiaoyi_100samples_v1.json",
+    "source_case_id": "19_1"
+  },
+  {
+    "id": "68_xiaoyi_57_1_1_1",
+    "name": "QQ 邮箱格式化邮件",
+    "url": "https://mail.qq.com/",
+    "goal": "从头操控：帮我打开QQ邮箱发送邮件。正文是“奥创：这是一封会议邮件”加上今天的日期，字体设置小三号，“会议邮件”的字体设置为橙色，发给我自己当前的QQ邮箱。",
+    "capability": "发送带指定字体和颜色的邮件到当前 QQ 邮箱",
+    "source_dataset": "xiaoyi_100samples_v1.json",
+    "source_case_id": "57_1_1_1"
+  },
+  {
+    "id": "69_xiaoyi_57_1_1_2",
+    "name": "QQ 邮箱链接与日程邮件",
+    "url": "https://mail.qq.com/",
+    "goal": "从头操控：帮我打开QQ邮箱发送邮件。正文是“奥创：这是一封会议邮件”加上今天的日期，插入一个链接https://www.deepseek.com/，在邮件里新建一个日程，主题是研讨会，发给我自己当前的QQ邮箱。",
+    "capability": "创建研讨会日程并发送带链接的邮件到当前 QQ 邮箱",
+    "source_dataset": "xiaoyi_100samples_v1.json",
+    "source_case_id": "57_1_1_2"
+  },
+  {
+    "id": "70_xiaoyi_57_1_2",
+    "name": "QQ 邮箱转发首封邮件",
+    "url": "https://mail.qq.com/",
+    "goal": "从头操控：帮我打开QQ邮箱，转发第一封邮件给我自己当前的QQ邮箱，转发邮件的正文内容加上“奥创：这是一封转发的会议邮件”。",
+    "capability": "带指定正文将首封邮件转发到当前 QQ 邮箱",
+    "source_dataset": "xiaoyi_100samples_v1.json",
+    "source_case_id": "57_1_2"
+  },
+  {
+    "id": "71_xiaoyi_57_2_1",
+    "name": "新浪邮箱带链接的格式邮件",
+    "url": "https://mail.sina.com.cn/",
+    "goal": "从头操控：帮我打开新浪邮箱发送邮件。正文是“奥创：这是一封会议邮件”加上今天的日期，字体设置特大，使用邮箱的插入链接功能插入https://www.deepseek.com/。发给我自己当前的新浪邮箱。",
+    "capability": "发送带特大字体及链接的邮件到当前新浪邮箱",
+    "source_dataset": "xiaoyi_100samples_v1.json",
+    "source_case_id": "57_2_1"
+  },
+  {
+    "id": "72_xiaoyi_57_2_4",
+    "name": "新浪邮箱转发首封邮件",
+    "url": "https://mail.sina.com.cn/",
+    "goal": "从头操控：帮我打开新浪邮箱，转发第一封邮件给我自己的邮箱。",
+    "capability": "将首封邮件转发到自己的邮箱",
+    "source_dataset": "xiaoyi_100samples_v1.json",
+    "source_case_id": "57_2_4"
+  },
+  {
+    "id": "73_xiaoyi_57_2_5",
+    "name": "新浪邮箱会议邮件星标切换",
+    "url": "https://mail.sina.com.cn/",
+    "goal": "从头操控：帮我打开新浪邮箱，给内容包含会议的第一封邮件标记为星标邮件，然后再取消星标。如果星标本来就有，则取消就好。",
+    "capability": "对首封匹配会议的邮件执行原星标状态操作",
+    "source_dataset": "xiaoyi_100samples_v1.json",
+    "source_case_id": "57_2_5"
+  },
+  {
+    "id": "74_xiaoyi_57_2_7",
+    "name": "新浪邮箱回复首封邮件",
+    "url": "https://mail.sina.com.cn/",
+    "goal": "从头操控：帮我打开新浪邮箱，回复第一封邮件，内容写已收到。",
+    "capability": "向首封邮件的发件人回复“已收到”",
+    "source_dataset": "xiaoyi_100samples_v1.json",
+    "source_case_id": "57_2_7"
+  },
+  {
+    "id": "75_xiaoyi_57_2_8",
+    "name": "新浪邮箱读取前两封已发送邮件",
+    "url": "https://mail.sina.com.cn/",
+    "goal": "从头操控：请帮我打开新浪邮箱，返回已发送邮件的前2封邮件的收件人、时间、主题和邮件内容。",
+    "capability": "读取私有邮件收件人、时间、主题及正文",
+    "source_dataset": "xiaoyi_100samples_v1.json",
+    "source_case_id": "57_2_8"
+  },
+  {
+    "id": "76_xiaoyi_57_3_1_1",
+    "name": "163 邮箱带链接的格式邮件",
+    "url": "https://mail.163.com/",
+    "goal": "从头操控：帮我打开163邮箱发送邮件。主题写奥创邮件。正文是“奥创：这是一封会议邮件”加上今天的日期，字体设置特大，使用邮箱的插入链接功能插入https://www.deepseek.com/。发给我自己当前的163邮箱。",
+    "capability": "发送指定主题及带链接格式正文到当前 163 邮箱",
+    "source_dataset": "xiaoyi_100samples_v1.json",
+    "source_case_id": "57_3_1_1"
+  },
+  {
+    "id": "77_xiaoyi_57_3_5",
+    "name": "163 邮箱会议邮件红旗切换",
+    "url": "https://mail.163.com/",
+    "goal": "从头操控：帮我打开163邮箱，给内容包含会议的第一封邮件标记为红旗邮件，然后再取消红旗状态。如果红旗本来就有，则取消就好。",
+    "capability": "对首封匹配会议的邮件执行原红旗状态操作",
+    "source_dataset": "xiaoyi_100samples_v1.json",
+    "source_case_id": "57_3_5"
+  },
+  {
+    "id": "78_xiaoyi_57_3_7",
+    "name": "163 邮箱读取前三封已发送邮件",
+    "url": "https://mail.163.com/",
+    "goal": "从头操控：请帮我打开163邮箱，返回已发送邮件的前3封邮件的收件人、时间、主题和邮件内容。",
+    "capability": "读取私有邮件收件人、时间、主题及正文",
+    "source_dataset": "xiaoyi_100samples_v1.json",
+    "source_case_id": "57_3_7"
+  },
+  {
+    "id": "79_xiaoyi_57_3_8",
+    "name": "163 邮箱转发首封邮件到指定地址",
+    "url": "https://mail.163.com/",
+    "goal": "从头操控：帮我打开163邮箱，转发第一封邮件给benchmark-recipient@example.invalid，转发邮件的正文内容加上“奥创：这是一封转发的会议邮件”。",
+    "capability": "按原文将首封私有邮件转发给指定地址",
+    "source_dataset": "xiaoyi_100samples_v1.json",
+    "source_case_id": "57_3_8"
+  },
+  {
+    "id": "80_xiaoyi_57_4_1_1",
+    "name": "139 邮箱带字号和字体的邮件",
+    "url": "https://mail.10086.cn/",
+    "goal": "从头操控：帮我打开139邮箱发送邮件。主题写奥创邮件。正文是“奥创：这是一封会议邮件”加上今天的日期，字体设置三号、楷体。发给我自己当前的139邮箱。",
+    "capability": "发送指定主题及格式正文到当前 139 邮箱",
+    "source_dataset": "xiaoyi_100samples_v1.json",
+    "source_case_id": "57_4_1_1"
+  },
+  {
+    "id": "81_xiaoyi_57_4_1_2",
+    "name": "139 邮箱链接与列表邮件",
+    "url": "https://mail.10086.cn/",
+    "goal": "从头操控：帮我打开139邮箱发送邮件。主题写奥创邮件。正文插入链接https://www.deepseek.com/。插入列表：[1. 张三\n2. 李四\n3. 王五]。发给我自己当前的139邮箱。",
+    "capability": "发送带链接和人员列表的邮件到当前 139 邮箱",
+    "source_dataset": "xiaoyi_100samples_v1.json",
+    "source_case_id": "57_4_1_2"
+  },
+  {
+    "id": "82_xiaoyi_57_4_8",
+    "name": "139 邮箱读取前两封已发送邮件",
+    "url": "https://mail.10086.cn/",
+    "goal": "从头操控：请帮我打开139邮箱，返回已发送邮件的前2封邮件的收件人、时间、主题和邮件内容。",
+    "capability": "读取私有邮件收件人、时间、主题及正文",
+    "source_dataset": "xiaoyi_100samples_v1.json",
+    "source_case_id": "57_4_8"
+  },
+  {
+    "id": "83_xiaoyi_57_4_9",
+    "name": "139 邮箱转发首封邮件到指定地址",
+    "url": "https://mail.10086.cn/",
+    "goal": "从头操控：帮我打开139邮箱，转发第一封邮件给benchmark-recipient@example.invalid，转发邮件的正文内容加上“奥创：这是一封转发的会议邮件”。",
+    "capability": "按原文将首封私有邮件转发给指定地址",
+    "source_dataset": "xiaoyi_100samples_v1.json",
+    "source_case_id": "57_4_9"
+  },
+  {
+    "id": "84_xiaoyi_64_2",
+    "name": "百度网盘查找浏览器笔记",
+    "url": "https://pan.baidu.com/",
+    "goal": "从头操控：帮我打开百度网盘，在“我的文件”里获取标题包含浏览器的笔记，返回笔记内容。最多返回两条笔记就好。如果没有，则返回数据不足。",
+    "capability": "读取本账号中最多两篇匹配标题的网盘笔记",
+    "source_dataset": "xiaoyi_100samples_v1.json",
+    "source_case_id": "64_2"
+  },
+  {
+    "id": "85_xiaoyi_65_1_2",
+    "name": "微博账号教育简历表单",
+    "url": "https://weibo.com/",
+    "goal": "从头操控：请帮我打开微博的账号设置，完成以下的信息填写。家乡为辽宁沈阳。大学为青海大学，入学时间为1999年，院系为外语学院。其余字段不要填。不要保存或提交。",
+    "capability": "填写家乡及教育字段，不保存或提交",
+    "source_dataset": "xiaoyi_100samples_v1.json",
+    "source_case_id": "65_1_2"
+  },
+  {
+    "id": "86_xiaoyi_65_1_3",
+    "name": "微博账号工作简历表单",
+    "url": "https://weibo.com/",
+    "goal": "从头操控：请帮我打开微博的账号设置，完成以下的信息填写。工作信息有1项。公司为海外运营公司，职位为文章编辑师，行业为媒体/公关，工作时间为2000年-2016年，所在省为辽宁省。其余字段不要填。不要保存或提交。",
+    "capability": "填写工作字段，不保存或提交",
+    "source_dataset": "xiaoyi_100samples_v1.json",
+    "source_case_id": "65_1_3"
+  },
+  {
+    "id": "87_xiaoyi_65_2_1",
+    "name": "携程上海双早酒店与起步价",
+    "url": "https://hotels.ctrip.com/",
+    "goal": "从头操控：帮我在携程上搜索酒店。地点为上海。时间为2天后入住，3天后退房。2个成人。双份早餐。返回3家推荐的酒店和对应的价格（起步最低价）。如搜索结果不足3家，则返回所有结果。",
+    "capability": "查询并读取三家酒店起步价，不预订",
+    "source_dataset": "xiaoyi_100samples_v1.json",
+    "source_case_id": "65_2_1"
+  },
+  {
+    "id": "88_xiaoyi_65_4_2",
+    "name": "知乎教育经历与个人简介表单",
+    "url": "https://www.zhihu.com/",
+    "goal": "从头操控：帮我打开知乎编辑个人资料。学校为青海大学本科，专业为计算机科学，2010年入学，2014年毕业。个人简介为本人喜欢AI技术，尤其是大模型方面的，有丰富的研发经验。其余字段不要填。不要保存或提交。",
+    "capability": "填写教育和简介，不保存或提交",
+    "source_dataset": "xiaoyi_100samples_v1.json",
+    "source_case_id": "65_4_2"
+  },
+  {
+    "id": "89_xiaoyi_65_5_2",
+    "name": "腾讯问卷第11至20题",
+    "url": "https://wj.qq.com/s2/26481632/fc56/",
+    "goal": "从头操控：帮我填写问卷https://wj.qq.com/s2/26481632/fc56/。只填11-20题，尽量回答正确，填写就好，不要提交。",
+    "capability": "只填写第11至20题，不提交",
+    "source_dataset": "xiaoyi_100samples_v1.json",
+    "source_case_id": "65_5_2"
+  },
+  {
+    "id": "90_xiaoyi_65_7_2",
+    "name": "北大法宝日期与效力位阶",
+    "url": "https://www.pkulaw.com/",
+    "goal": "从头操控：帮我打开北大法宝网站的法律法规检索页进行高级搜索填写表单，公布日期选2016年4月2号到2025年8月11号，效力位阶从列表选司法解释的两高工作文件。只填写就好，不要提交检索。",
+    "capability": "填写高级检索日期和效力位阶，不提交",
+    "source_dataset": "xiaoyi_100samples_v1.json",
+    "source_case_id": "65_7_2"
+  },
+  {
+    "id": "91_xiaoyi_65_9",
+    "name": "淘宝收货地址表单",
+    "url": "https://www.taobao.com/",
+    "goal": "从头操控：帮我打开淘宝收货地址页面，收货人填测试用户，手机号填00000000000，地址填北京市海淀区测试路1号。填好后不要确认。",
+    "capability": "填写指定地址、姓名和手机号，不确认",
+    "source_dataset": "xiaoyi_100samples_v1.json",
+    "source_case_id": "65_9"
+  },
+  {
+    "id": "92_xiaoyi_3_71",
+    "name": "微博发表 Sunny day",
+    "url": "https://weibo.com/",
+    "goal": "从头操控：帮我发一条微博，文字写Sunny day+今天的日期。例如，Sunny day+2026年6月3号。",
+    "capability": "公开发布含当天日期的微博",
+    "source_dataset": "xiaoyi_100samples_v1.json",
+    "source_case_id": "3_71"
+  },
+  {
+    "id": "93_xiaoyi_3_73",
+    "name": "微博发表含话题和声明的文字",
+    "url": "https://weibo.com/",
+    "goal": "从头操控：帮我发一条微博，文字写“图片”+今天的日期。例如，“图片”+2026年6月3号。话题写香港，内容声明选内容为自主创作。",
+    "capability": "发文字微博并设置话题和声明，原文没有选择本地图片",
+    "source_dataset": "xiaoyi_100samples_v1.json",
+    "source_case_id": "3_73"
+  },
+  {
+    "id": "94_xiaoyi_3_9",
+    "name": "微博首条内容点赞后取消",
+    "url": "https://weibo.com/",
+    "goal": "从头操控：给我的微博主页的第一条微博点赞，然后取消点赞。",
+    "capability": "对自己的首条微博点赞后取消",
+    "source_dataset": "xiaoyi_100samples_v1.json",
+    "source_case_id": "3_9"
+  },
+  {
+    "id": "95_xiaoyi_3_11",
+    "name": "微博创作者中心阅读统计",
+    "url": "https://weibo.com/",
+    "goal": "从头操控：进入微博的创作者中心，依据数据中心的博文数据，查看我的阅读总数和粉丝阅读数。",
+    "capability": "读取已登录账号的阅读总数和粉丝阅读数",
+    "source_dataset": "xiaoyi_100samples_v1.json",
+    "source_case_id": "3_11"
+  },
+  {
+    "id": "96_xiaoyi_3_12",
+    "name": "微博首条内容发表评论",
+    "url": "https://weibo.com/",
+    "goal": "从头操控：帮我打开我的微博主页，找到第一条微博，评论十分赞同。",
+    "capability": "在自己的首条微博发表评论“十分赞同”",
+    "source_dataset": "xiaoyi_100samples_v1.json",
+    "source_case_id": "3_12"
+  },
+  {
+    "id": "97_xiaoyi_3_16",
+    "name": "人民网官方微博前三条",
+    "url": "https://weibo.com/",
+    "goal": "从头操控：帮我打开微博，获取“人民网”官方账号的前3条微博的内容。",
+    "capability": "读取前三条公开微博",
+    "source_dataset": "xiaoyi_100samples_v1.json",
+    "source_case_id": "3_16"
+  },
+  {
+    "id": "98_xiaoyi_3_18",
+    "name": "人民网最新微博收藏后取消",
+    "url": "https://weibo.com/",
+    "goal": "从头操控：帮我打开微博，收藏“人民网”官方账号的最新的第一条微博，然后取消收藏。",
+    "capability": "收藏指定公号首条微博并取消",
+    "source_dataset": "xiaoyi_100samples_v1.json",
+    "source_case_id": "3_18"
+  },
+  {
+    "id": "99_xiaoyi_3_21",
+    "name": "微博人工智能超话前两条",
+    "url": "https://weibo.com/",
+    "goal": "从头操控：帮我打开微博的人工智能超话，获取前2条微博的内容。",
+    "capability": "读取前两条公开超话微博",
+    "source_dataset": "xiaoyi_100samples_v1.json",
+    "source_case_id": "3_21"
+  },
+  {
+    "id": "100_xiaoyi_3_46",
+    "name": "微博刘尼尼主页介绍",
+    "url": "https://weibo.com/",
+    "goal": "从头操控：打开微博博主“刘尼尼”的微博主页，获取全部介绍信息。",
+    "capability": "读取目标主页公开介绍",
+    "source_dataset": "xiaoyi_100samples_v1.json",
+    "source_case_id": "3_46"
+  },
+  {
+    "id": "101_xiaoyi_4_6",
+    "name": "小红书最近五条评论和@",
+    "url": "https://www.xiaohongshu.com/",
+    "goal": "从头操控：请帮我收集我小红书最近的5条“评论和@”。如果没有相关评论和@，则返回数据不足。如果小于5条评论和@，则收集所有评论和@就好。",
+    "capability": "读取已登录本账号评论和提及",
+    "source_dataset": "xiaoyi_100samples_v1.json",
+    "source_case_id": "4_6"
+  },
+  {
+    "id": "102_xiaoyi_4_12",
+    "name": "小红书首页左上首条点赞后取消",
+    "url": "https://www.xiaohongshu.com/",
+    "goal": "从头操控：请打开小红书，给我首页推荐的左上角第一条笔记点赞。然后再取消点赞。",
+    "capability": "点赞指定首页笔记并取消",
+    "source_dataset": "xiaoyi_100samples_v1.json",
+    "source_case_id": "4_12"
+  },
+  {
+    "id": "103_xiaoyi_4_17",
+    "name": "抖音首条已发布内容点赞后取消",
+    "url": "https://www.douyin.com/",
+    "goal": "从头操控：给我的抖音的第一条发布的内容点赞。然后再取消点赞。",
+    "capability": "点赞本账号首条内容并取消",
+    "source_dataset": "xiaoyi_100samples_v1.json",
+    "source_case_id": "4_17"
+  },
+  {
+    "id": "104_xiaoyi_4_20",
+    "name": "抖音首条已发布内容发表评论",
+    "url": "https://www.douyin.com/",
+    "goal": "从头操控：给我的抖音的第一条发布的内容评论，写“好看的照片”。如果没有相关内容，则返回数据不足。",
+    "capability": "若有本账号首条内容，发表评论“好看的照片”",
+    "source_dataset": "xiaoyi_100samples_v1.json",
+    "source_case_id": "4_20"
+  },
+  {
+    "id": "105_xiaoyi_4_22",
+    "name": "抖音创作者中心近30日直播数据",
+    "url": "https://creator.douyin.com/",
+    "goal": "从头操控：帮我导航到抖音创作者中心的首页，展示近30日的直播数据。如果没有相关直播数据，则返回数据不足。",
+    "capability": "读取已登录创作者近30日直播统计",
+    "source_dataset": "xiaoyi_100samples_v1.json",
+    "source_case_id": "4_22"
+  },
+  {
+    "id": "106_xiaoyi_5_8",
+    "name": "知乎首个关注作者与三条动态",
+    "url": "https://www.zhihu.com/",
+    "goal": "从头操控：帮我打开知乎。进入我的关注列表，返回我的关注中的第一个作者及总结该作者最新的三条动态。如果没有相关动态，则返回数据不足。如果小于3条动态，则收集所有动态就好。",
+    "capability": "读取关注列表与目标作者动态",
+    "source_dataset": "xiaoyi_100samples_v1.json",
+    "source_case_id": "5_8"
+  },
+  {
+    "id": "107_xiaoyi_5_13_1",
+    "name": "知乎发表带话题的想法",
+    "url": "https://www.zhihu.com/",
+    "goal": "从头操控：帮我打开知乎。打开首页，帮我发表一条想法，标题为Weather，内容为Sunny day。话题标签选推荐的第一个话题。设置不允许评论。",
+    "capability": "公开发表想法，添加推荐话题并关闭评论",
+    "source_dataset": "xiaoyi_100samples_v1.json",
+    "source_case_id": "5_13_1"
+  },
+  {
+    "id": "108_xiaoyi_5_13_2",
+    "name": "知乎发表含投票的想法",
+    "url": "https://www.zhihu.com/",
+    "goal": "从头操控：帮我打开知乎。打开首页，帮我发表一条想法，标题为Weather，内容为Sunny day。添加一个投票，标题为今天吃什么，选项1为白切鸡，选项2为酱油鸡，结束时间为5天后结束。",
+    "capability": "公开发表想法并创建指定投票",
+    "source_dataset": "xiaoyi_100samples_v1.json",
+    "source_case_id": "5_13_2"
+  },
+  {
+    "id": "109_xiaoyi_5_19",
+    "name": "知乎提问草稿",
+    "url": "https://www.zhihu.com/",
+    "goal": "从头操控：帮我打开知乎。帮我提一个问题，内容为：白切鸡好吃还是酱油鸡好吃。填写就好，不要发布。",
+    "capability": "填写指定问题，不发布",
+    "source_dataset": "xiaoyi_100samples_v1.json",
+    "source_case_id": "5_19"
+  },
+  {
+    "id": "110_xiaoyi_5_25",
+    "name": "百度网盘测试文件分享",
+    "url": "https://pan.baidu.com/",
+    "goal": "从头操控：帮我打开百度网盘。选中文件eval_share.txt，进行分享，可复制进剪贴板或者返回分享链接，做好一个都算对。",
+    "capability": "为 eval_share.txt 创建分享链接，改变访问范围",
+    "source_dataset": "xiaoyi_100samples_v1.json",
+    "source_case_id": "5_25"
+  },
+  {
+    "id": "111_xiaoyi_5_29",
+    "name": "夸克网盘测试文件带提取码分享",
+    "url": "https://pan.quark.cn/",
+    "goal": "从头操控：帮我打开夸克网盘。选中文件eval_share.txt，把它分享出去，分享属性为：有效期7天，需要提取码并返回。",
+    "capability": "为 eval_share.txt 创建有效期七天的提取码链接",
+    "source_dataset": "xiaoyi_100samples_v1.json",
+    "source_case_id": "5_29"
+  }
+]

@@ -59,6 +59,7 @@ dependencies = [
 # click: used for command-line argument parsing
 
 [project.optional-dependencies]
+benchmark = ["httpx[http2]==0.28.1"]
 openai-tools = ["openai>=3.31.0,<4.0.0"]
 cli = []
 core = [
@@ -185,6 +186,11 @@ include = [
     "browser_use/skills/**/*.md",
     "browser_use/py.typed",
     "browser_use/dom/**/*.js",
+    "browser_use/benchmark/*.json",
+    "browser_use/benchmark/*.js",
+    "browser_use/benchmark/static/*",
+    "browser_use/benchmark/docs/demo.mp4",
+    "browser_use/benchmark/LICENSE",
     "!tests/**/*.py",
     "!debug/*",
 ]

@@ -28,6 +28,8 @@ dist/
 *.json
 !/server.json
 !/context7.json
+!/browser_use/benchmark/baseline_success.json
+!/browser_use/benchmark/xiaoyi_selected_20.json
 *.jsonl
 *.log
 *.bak

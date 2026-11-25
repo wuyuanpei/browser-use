@@ -4,6 +4,7 @@ from datetime import datetime, timedelta
 from io import BytesIO
 from pathlib import Path
 from unittest.mock import AsyncMock
+from uuid import UUID
 
 import pytest
 from PIL import Image
@@ -38,14 +39,14 @@ def test_screenshot_configuration():
 	settings = JevSettings()
 	assert (settings.screenshot_policy, settings.vision_max_side, settings.vision_jpeg_quality) == ('off', 1600, 72)
 	assert JevSettings(screenshot_policy='always').screenshot_policy == 'always'
-	with pytest.raises(ValidationError, match='smart screenshot policy is not implemented yet'):
-		JevSettings(screenshot_policy='smart')
+	assert JevSettings(screenshot_policy='smart').screenshot_policy == 'smart'
 	with pytest.raises(ValidationError, match='requires the Jev backend'):
 		JevSettings(system1='llm', system1_llm=create_mock_llm([]), screenshot_policy='always')
+	with pytest.raises(ValidationError, match='requires the Jev backend'):
+		JevSettings(system1='llm', system1_llm=create_mock_llm([]), screenshot_policy='smart')
 
 
-@pytest.mark.parametrize('policy', [None, 'off'])
-async def test_off_request_matches_original_http_body(httpserver, policy, tmp_path, monkeypatch):
+async def fixture_request(httpserver, policy, tmp_path, monkeypatch):
 	settings = JevSettings.model_validate(
 		{
 			'jev_api_key': 'test-only',
@@ -90,7 +91,22 @@ async def test_off_request_matches_original_http_body(httpserver, policy, tmp_pa
 		screenshot=base64.b64encode(png.getvalue()).decode('ascii'),
 	)
 	monkeypatch.setattr(jev_state, 'observe', AsyncMock(return_value=obs))
-	FakeJev(httpserver, [{'operation': 'CLICK', 'target': '保存'}])
+	if policy == 'always':
+		monkeypatch.setattr('browser_use.agent.jev.service.uuid4', lambda: UUID('00000000-0000-4000-8000-000000000001'))
+		httpserver.expect_request('/v1/systemone', method='POST').respond_with_json(
+			{
+				'answers': {
+					'operation': {
+						'choice': 'CLICK',
+						'confidence': 1,
+						'probabilities': {'CLICK': 1, 'WAIT': 0, 'COLLECT': 0, 'UNABLE': 0},
+					},
+					'click_target': {'choice': '7', 'confidence': 1, 'probabilities': {'7': 1}},
+				}
+			}
+		)
+	else:
+		FakeJev(httpserver, [{'operation': 'CLICK', 'target': '保存'}])
 	agent = Agent(
 		task='Save the 草稿',
 		llm=create_mock_llm(),
@@ -109,12 +125,27 @@ async def test_off_request_matches_original_http_body(httpserver, policy, tmp_pa
 		await agent.eventbus.stop(clear=True, timeout=3)
 		await executor.aclose()
 	assert len(httpserver.log) == 1
-	request, _response = httpserver.log[0]
+	return httpserver.log[0][0]
+
+
+@pytest.mark.parametrize('policy', [None, 'off'])
+async def test_off_request_matches_original_http_body(httpserver, policy, tmp_path, monkeypatch):
+	request = await fixture_request(httpserver, policy, tmp_path, monkeypatch)
 	# Captured from d0a9379 by running the same executor route and reading its HTTP request.
 	golden = Path(__file__).with_name('fixtures') / 'jev_off_request.json.golden'
 	assert request.get_data() == golden.read_bytes()
 	assert request.content_type == 'application/json'
 	assert 'TypeSafe-Danger-Zone-Images' not in request.headers
+
+
+async def test_always_request_matches_phase15_multipart(httpserver, tmp_path, monkeypatch):
+	request = await fixture_request(httpserver, 'always', tmp_path, monkeypatch)
+	# Captured from the reconstructed Phase 1.5 worktree with the same UUID and observation.
+	golden = Path(__file__).with_name('fixtures') / 'jev_always_request.json.golden'
+	assert request.mimetype == 'multipart/form-data' and request.headers['TypeSafe-Danger-Zone-Images'] == 'true'
+	assert request.form['request'].encode() == golden.read_bytes()
+	with Image.open(request.files['page-screenshot']) as jpeg:
+		assert (jpeg.format, jpeg.size) == ('JPEG', (100, 70))
 
 
 @pytest.mark.parametrize(

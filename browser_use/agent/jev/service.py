@@ -33,6 +33,7 @@ from browser_use.agent.jev.views import (
 	Candidate,
 	CollectPageParams,
 	DelegateSubgoalParams,
+	DelegateSubgoalParamsSmart,
 	FinishParams,
 	Handback,
 	HandbackReason,
@@ -73,9 +74,15 @@ class _System1Request:
 	stats: dict[str, Any]
 
 
-def _is_repeated_empty(runs: list[SubgoalRun], identity: str) -> bool:
+def _is_review_delegation(previous: SubgoalRun | None, rejected: bool) -> bool:
+	return previous is not None and (rejected or (previous.handback is not None and previous.handback.reason != 'step_done'))
+
+
+def _is_repeated_empty(runs: list[SubgoalRun], identity: str, vision: bool = False) -> bool:
 	recent = runs[-NO_ACTION_HANDBACK_LIMIT:]
-	return len(recent) == NO_ACTION_HANDBACK_LIMIT and all(r.identity == identity and not r.executed_actions for r in recent)
+	return len(recent) == NO_ACTION_HANDBACK_LIMIT and all(
+		(r.identity, r.vision) == (identity, vision) and not r.executed_actions for r in recent
+	)
 
 
 class JevExecutor:
@@ -97,6 +104,7 @@ class JevExecutor:
 		self._planner_attempt = 0
 		self._planner_page_action = False
 		self._vision_disabled: dict[str, Any] | None = None
+		self.current_vision_trigger: str | None = None
 		self._closed = False
 		self.finish_only = False
 		self.defer_final_answer = False
@@ -153,12 +161,12 @@ class JevExecutor:
 		)
 
 	def on_new_task(self):
-		"""Resume a closed Agent only when the user explicitly adds a follow-up."""
+		"""Start a new delegation history, reopening the backend after a completed run."""
+		self._first_run = len(self.runs)
 		if not self._closed:
 			return
 		if self.active_run:
 			self.active_run.status = 'handed_back'
-		self._first_run = len(self.runs)
 		self._handback_message = None
 		self.last_observation = None
 		self._planner_page_action = False
@@ -183,7 +191,8 @@ class JevExecutor:
 
 	def register_actions(self):
 		registry = self.agent.tools.registry
-		models = {'delegate_subgoal': DelegateSubgoalParams, 'finish': FinishParams, 'collect_page': CollectPageParams}
+		delegate_model = DelegateSubgoalParamsSmart if self.settings.screenshot_policy == 'smart' else DelegateSubgoalParams
+		models = {'delegate_subgoal': delegate_model, 'finish': FinishParams, 'collect_page': CollectPageParams}
 		for name, model in models.items():
 			existing = registry.registry.actions.get(name)
 			if name in registry.exclude_actions or (existing and existing.param_model is not model):
@@ -191,7 +200,7 @@ class JevExecutor:
 
 		@registry.action(
 			'Hand one stage of the task to System1, which performs all page actions of that stage.',
-			param_model=DelegateSubgoalParams,
+			param_model=delegate_model,
 			terminates_sequence=True,
 		)
 		async def delegate_subgoal(params: DelegateSubgoalParams, browser_session: BrowserSession):
@@ -222,13 +231,13 @@ class JevExecutor:
 		data = params.model_dump()
 		truncated = []
 		for name, limit in SUBGOAL_FIELD_LIMITS.items():
-			if data[name] and len(data[name]) > limit:
+			if data.get(name) and len(data[name]) > limit:
 				data[name] = data[name][:limit]
 				truncated.append(name)
 		data['max_actions'] = (
 			self.settings.default_max_actions if params.max_actions is None else min(30, max(1, params.max_actions))
 		)
-		params = DelegateSubgoalParams.model_validate(data)
+		params = type(params).model_validate(data)
 		identity = '\n'.join(' '.join(s.split()) for s in (params.objective, params.completion))
 		previous = self.runs[-1] if len(self.runs) > self._first_run else None
 		rejected = bool(
@@ -240,7 +249,16 @@ class JevExecutor:
 				'review_note is required when you re-delegate the same subgoal after rejecting STEP_DONE.',
 				identity,
 			)
-		if _is_repeated_empty(self.runs[self._first_run :], identity):
+		policy = self.settings.screenshot_policy
+		smart = params if policy == 'smart' and isinstance(params, DelegateSubgoalParamsSmart) else None
+		declared = smart.screenshot_required if smart else None
+		reason = smart.screenshot_reason if smart else None
+		source: Literal['policy', 'planner'] | None = None
+		if policy == 'always':
+			source = 'policy'
+		elif declared is True:
+			source = 'planner'
+		if _is_repeated_empty(self.runs[self._first_run :], identity, source is not None):
 			return self._refuse(
 				'no_action_twice',
 				'This subgoal was handed back twice in a row without any executed action. Rewrite it, delegate something else first, or call finish.',
@@ -287,18 +305,36 @@ class JevExecutor:
 			started_step=self.step,
 			start_url=url,
 			start_site=rules.site_of(url),
+			vision=source is not None,
+			vision_source=source,
+			vision_reason=reason,
+			review_delegation=_is_review_delegation(previous, rejected),
+			screenshot_declared=declared,
 			rejected_fingerprint=previous.handback.fingerprint if rejected and previous and previous.handback else None,
 		)
 		self.runs.append(run)
+		previous_reason = previous.handback.reason if previous and previous.handback else None
+		if policy == 'smart':
+			if run.review_delegation and declared is None:
+				self.trace.write(
+					'screenshot_decision_missing', self.step, run_id=run.id, previous_handback_reason=previous_reason
+				)
+			if declared is not None and not (reason or '').strip():
+				self.trace.write('screenshot_reason_missing', self.step, run_id=run.id, screenshot_required=declared)
 		self.trace.write(
 			'subgoal_start',
 			self.step,
 			run_id=run.id,
-			**params.model_dump(exclude={'start_url'}),
+			**params.model_dump(exclude={'start_url', 'screenshot_required', 'screenshot_reason'}),
 			truncated_fields=truncated,
 			start_url=url,
 			start_site=run.start_site,
 			is_rejection_retry=rejected,
+			screenshot_required=declared,
+			screenshot_reason=reason,
+			vision=run.vision,
+			review_delegation=run.review_delegation,
+			previous_handback_reason=previous_reason,
 		)
 		return ActionResult(long_term_memory=f'Delegated {run.id} to System1: {params.objective}')
 
@@ -370,8 +406,8 @@ class JevExecutor:
 		)
 		self._handback_message = render_handback(
 			run,
-			_is_repeated_empty(self.runs[self._first_run :], run.identity),
-			show_screenshots=self.settings.screenshot_policy != 'off',
+			_is_repeated_empty(self.runs[self._first_run :], run.identity, run.vision),
+			screenshot_policy=self.settings.screenshot_policy,
 			vision_disabled_status=self._vision_disabled['status'] if self._vision_disabled else None,
 		)
 		self._log_handback(run, result)
@@ -524,7 +560,8 @@ class JevExecutor:
 		return None
 
 	def _vision_wanted(self, run: SubgoalRun) -> bool:
-		return self._vision_disabled is None and self.settings.screenshot_policy == 'always'
+		policy = self.settings.screenshot_policy
+		return self._vision_disabled is None and (policy == 'always' or (policy == 'smart' and run.vision))
 
 	def _system1_request(
 		self,
@@ -550,7 +587,7 @@ class JevExecutor:
 			'offered_operations': offered,
 			'candidate_counts': counts,
 			'vision': image is not None,
-			'vision_trigger': 'policy' if image else None,
+			'vision_trigger': run.vision_source if image else None,
 			'image_bytes': image.bytes if image else 0,
 			'image_size': [image.width, image.height] if image else None,
 			'dpr': image.scale if image else None,
@@ -582,6 +619,7 @@ class JevExecutor:
 		"""Send this request, attributing every transport attempt to its text or image payload."""
 		stats = request.stats
 		start = monotonic()
+		self.current_vision_trigger = stats['vision_trigger']
 		try:
 			if request.image is None:
 				reply = await self.backend.ask(request.state, request.questions)
@@ -603,6 +641,8 @@ class JevExecutor:
 			if self.backend.name == 'jev':
 				self.usage.record_jev(None, elapsed_ms, max(1, len(exc.attempts)), vision=request.image is not None)
 			return None
+		finally:
+			self.current_vision_trigger = None
 
 		stats.update(
 			returned_model=reply.model,
@@ -676,7 +716,7 @@ class JevExecutor:
 				quality=self.settings.vision_jpeg_quality,
 			)
 			if image is None:
-				self.trace.write('vision_unavailable', self.step, run_id=run.id, vision_trigger='policy')
+				self.trace.write('vision_unavailable', self.step, run_id=run.id, vision_trigger=run.vision_source)
 		request = self._system1_request(run, obs, agent.task, registered, offered, research, image)
 		for name, count in request.stats['candidate_counts'].items():
 			if count > self.settings.max_candidates:

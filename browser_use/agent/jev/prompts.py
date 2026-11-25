@@ -1,3 +1,7 @@
+from typing import Literal
+
+from browser_use.agent.jev.views import DEFAULT_SCREENSHOT_REASON, SubgoalRun
+
 COLLABORATIVE_EXTENSION = """<system1_delegation>
 You can also hand a stage to System1 with delegate_subgoal. System1 is a fast choice model that performs one page action per observation inside the stage you define.
 - Delegate routine multi-step work that needs several rounds of acting, waiting for the page to change, and acting again: filling a form, choosing autocomplete suggestions or dates, paging through results.
@@ -6,6 +10,24 @@ You can also hand a stage to System1 with delegate_subgoal. System1 is a fast ch
 - STEP_DONE in <system1_handback> is only a request: verify the completion condition before you continue.
 - Pages saved by System1 appear in <jev_state> with URL, title and summary only. If pages were saved, an answer helper rewrites the text of your done action from the saved originals.
 </system1_delegation>"""
+
+SYSTEM1_VISION_EXTENSION = """<system1_vision>
+System1 can receive the current viewport image. You never see it yourself.
+- Screenshot decision on review: whenever you delegate after a handback other than an accepted STEP_DONE
+  (including re-delegating after you rejected STEP_DONE), set screenshot_required to true or false and explain
+  it in screenshot_reason. Diagnose the actual execution evidence, not the handback name alone: an action budget
+  that ended while progress was normal is not a visual failure.
+- The first stage and a stage after an accepted STEP_DONE may omit it; they start text-only.
+- Set screenshot_required=true with a specific screenshot_reason when the handback
+  shows System1 chose wrong or ambiguous targets (same-named rows/cards, icon-only buttons), actions had no
+  effect, it could not interpret the layout, overlays or visual-only state (selected tabs, toggles, highlights),
+  or it stopped as uncertain while the needed target is plausibly on the page.
+- Keep screenshot_required=true when re-delegating a stage whose visual difficulty is not resolved,
+  including when the handback says System1 already switched to images.
+- Do not request images for normal stages where text is enough, for an action budget that ended while progress
+  was normal, or for access barriers (login, captcha, missing permission); images do not fix those.
+- Images never give System1 new targets or coordinates; they only help it choose among listed elements.
+</system1_vision>"""
 
 TEXT_PROMPT = """Return a JSON object with exactly one key, text: the exact string to enter in the selected field.
 Infer the value from original_goal, subgoal.inputs and the field's meaning, using the current page and recent actions.
@@ -68,7 +90,11 @@ Return only {"authorized": true or false, "reason": "brief evidence"} as JSON.""
 
 
 def render_handback(
-	run, repeated_empty: bool, *, show_screenshots: bool = False, vision_disabled_status: int | None = None
+	run: SubgoalRun,
+	repeated_empty: bool,
+	*,
+	screenshot_policy: Literal['off', 'always', 'smart'] = 'off',
+	vision_disabled_status: int | None = None,
 ) -> str:
 	handback = run.handback
 	assert handback is not None
@@ -90,15 +116,17 @@ def render_handback(
 		label = f' {action.target_label}' if action.target_label else ''
 		value = f' text={action.text!r}' if action.text is not None else ''
 		lines.append(f'{i}. {action.operation}{label}{value} -> {result}')
-	if show_screenshots:
-		notice = (
-			f'disabled for this task after Jev rejected an image (HTTP {vision_disabled_status}); '
-			if vision_disabled_status
-			else ''
-		)
-		lines.append(
-			f'Screenshots: {notice}{run.vision_decisions} of {run.decisions} System1 decisions in this subgoal used the viewport image.'
-		)
+	if screenshot_policy != 'off':
+		count = f'{run.vision_decisions} of {run.decisions} System1 decisions in this subgoal used the viewport image'
+		if vision_disabled_status is not None:
+			count = f'disabled for this task after Jev rejected an image (HTTP {vision_disabled_status}); {count}'
+		elif screenshot_policy == 'smart':
+			if run.screenshot_declared is True:
+				reason = (run.vision_reason or '').strip() or DEFAULT_SCREENSHOT_REASON
+				count += f' (requested by you: {reason})'
+			else:
+				count += ' (text-only stage)'
+		lines.append(f'Screenshots: {count}.')
 	discarded = sum(a.status == 'discarded' for a in run.actions)
 	if discarded:
 		lines.append(f'{discarded} decided action(s) were discarded before execution (pause or interruption); they did not run.')
@@ -109,10 +137,10 @@ def render_handback(
 		lines.append(
 			'This subgoal has been handed back twice in a row without any executed action; it will not be accepted again unchanged. Rewrite it or delegate something else first.'
 		)
-	lines.extend(
-		[
-			'STEP_DONE is only a request. Verify the completion condition against the current browser_state, then write your verification first in the reason of your next action.',
-			'</system1_handback>',
-		]
+	lines.append(
+		'STEP_DONE is only a request. Verify the completion condition against the current browser_state, then write your verification first in the reason of your next action.'
 	)
+	if screenshot_policy == 'smart' and vision_disabled_status is None and handback.reason != 'step_done':
+		lines.append('Your next delegate_subgoal is a review: set screenshot_required (true or false) with screenshot_reason.')
+	lines.append('</system1_handback>')
 	return '\n'.join(lines)

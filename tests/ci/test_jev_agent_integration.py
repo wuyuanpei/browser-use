@@ -1,5 +1,6 @@
 """Agent entry points, planner output schemas and end-to-end effects on real local pages."""
 
+import hashlib
 import json
 import logging
 import os
@@ -11,6 +12,7 @@ from pytest_httpserver import HTTPServer
 
 from browser_use import Agent, BrowserProfile, BrowserSession, Tools
 from browser_use.agent.jev import JevSettings
+from browser_use.agent.jev.prompts import SYSTEM1_VISION_EXTENSION
 from browser_use.agent.jev.state import read_visible_text
 from browser_use.agent.prompts import SystemPrompt
 from browser_use.agent.views import AgentHistoryList, AgentStepInfo
@@ -66,6 +68,86 @@ def action_names(output):
 
 	item = resolve(schema['properties']['action']['items'])
 	return {name for option in item.get('anyOf', [item]) for name in resolve(option)['properties']}
+
+
+@pytest.fixture(scope='module')
+def phase15_planner():
+	# Full Pydantic output from Phase 1.5. Only definitions shared by the three output modes are stored once.
+	return json.loads((Path(__file__).with_name('fixtures') / 'jev_planner_phase15.json.golden').read_text(encoding='utf-8'))
+
+
+@pytest.mark.parametrize('mode', ['isolated', 'collaborative'])
+@pytest.mark.parametrize(
+	('variant', 'flash', 'thinking'), [('planner', False, True), ('no_thinking', False, False), ('flash', True, True)]
+)
+async def test_planner_screenshot_policy_schema_and_prompt(mode, variant, flash, thinking, phase15_planner, tmp_path):
+	expected = {'$defs': phase15_planner['definitions'][mode], **phase15_planner['output'][variant]}
+	for policy in ('off', 'always', 'smart'):
+		settings = JevSettings(jev_api_key='local-test', mode=mode, screenshot_policy=policy, trace_path=tmp_path / 'trace.jsonl')
+		agent = make_agent(
+			'Check planner contract', [], settings, flash_mode=flash, use_thinking=thinking, max_actions_per_step=1
+		)
+		try:
+			schema = agent._planner_output_format().model_json_schema()
+			prompt = agent._message_manager.system_prompt.content
+			assert isinstance(prompt, str)
+			if policy == 'smart':
+				assert prompt.endswith('\n' + SYSTEM1_VISION_EXTENSION)
+				prompt = prompt.removesuffix('\n' + SYSTEM1_VISION_EXTENSION)
+				# Account for Pydantic's smart model name in the $defs key, title and reference.
+				schema = json.loads(json.dumps(schema).replace('DelegateSubgoalParamsSmart', 'DelegateSubgoalParams'))
+				delegate = schema['$defs']['DelegateSubgoalParams']
+				for key, datatype in (('screenshot_required', 'boolean'), ('screenshot_reason', 'string')):
+					assert key not in delegate['required']
+					field = delegate['properties'].pop(key)
+					assert field['default'] is None and field['anyOf'] == [{'type': datatype}, {'type': 'null'}]
+			assert json.dumps(schema, ensure_ascii=False) == json.dumps(expected, ensure_ascii=False)
+			assert hashlib.sha256(prompt.encode()).hexdigest() == phase15_planner['prompt_sha256'][f'{mode}/{variant}']
+		finally:
+			await agent.eventbus.stop(clear=True, timeout=3)
+			assert agent._jev is not None
+			await agent._jev.aclose()
+
+
+@pytest.mark.parametrize('mode', ['isolated', 'collaborative'])
+def test_smart_vision_extension_for_all_template_inputs(mode, phase15_planner, caplog):
+	inputs = {
+		'planner': {},
+		'no_thinking': {'use_thinking': False},
+		'flash': {'flash_mode': True},
+		'anthropic_flash': {'is_anthropic': True, 'flash_mode': True},
+		'anthropic_45_flash': {'is_anthropic': True, 'model_name': 'claude-opus-4-5', 'flash_mode': True},
+		'browser_use': {'is_browser_use_model': True},
+		'browser_use_no_thinking': {'is_browser_use_model': True, 'use_thinking': False},
+		'browser_use_flash': {'is_browser_use_model': True, 'flash_mode': True},
+		'override': {'override_system_message': 'Custom planner instructions.'},
+		'override_extend': {
+			'override_system_message': 'Custom planner instructions.',
+			'extend_system_message': 'Caller extension.',
+		},
+		'extend': {'extend_system_message': 'Caller extension.'},
+	}
+	# The Browser Use logger has its own handlers and does not propagate to pytest's root logger.
+	logger = logging.getLogger('browser_use.agent.prompts')
+	logger.addHandler(caplog.handler)
+	try:
+		for variant, kwargs in inputs.items():
+			for policy in ('off', 'always', 'smart'):
+				caplog.clear()
+				text = (
+					SystemPrompt(max_actions_per_step=1, jev_mode=mode, jev_screenshot_policy=policy, **kwargs)
+					.get_system_message()
+					.content
+				)
+				assert isinstance(text, str)
+				if 'override_system_message' in kwargs:
+					assert 'Custom system message supplied' in caplog.text
+				elif policy == 'smart':
+					assert text.count(SYSTEM1_VISION_EXTENSION) == 1
+					text = text.replace('\n' + SYSTEM1_VISION_EXTENSION, '')
+				assert hashlib.sha256(text.encode()).hexdigest() == phase15_planner['prompt_sha256'][f'{mode}/{variant}']
+	finally:
+		logger.removeHandler(caplog.handler)
 
 
 @pytest.mark.parametrize('flash,thinking', [(False, True), (False, False), (True, True)])

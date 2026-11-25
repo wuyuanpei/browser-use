@@ -28,9 +28,9 @@ class System1Error(RuntimeError):
 
 
 def image_rejection_status(attempts: list[dict[str, Any]]) -> int | None:
-	"""Return a final client rejection other than a timeout or rate limit."""
+	"""Exclude authentication failures, timeouts and rate limits from image rejections."""
 	status = attempts[-1].get('status') if attempts else None
-	if isinstance(status, int) and 400 <= status < 500 and status not in (408, 429):
+	if isinstance(status, int) and 400 <= status < 500 and status not in (401, 403, 408, 429):
 		return status
 	return None
 

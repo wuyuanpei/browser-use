@@ -797,6 +797,11 @@ button.trace-row:hover { background: #f0f3f5; border-color: #a5b4aa; }
 button.trace-row.active:hover { background: #e0eee5; border-color: #2f8a60; }
 button.trace-row:focus-visible { outline: 2px solid #2f8a60; outline-offset: 1px; }
 .trace-row > span { width: 100%; min-width: 0; }
+.trace-row.has-declaration { aspect-ratio: auto; }
+.screenshot-declaration { display: grid; gap: 4px; overflow-wrap: anywhere; font-size: 12px; }
+@media (min-width: 600px) {
+  .trace-row.has-declaration { grid-column: span 2; }
+}
 .call-status { font-size: 10px; padding: 2px 4px; border-radius: 4px; color: #35704f; background: #eef5ef; }
 .call-status.failed { color: #ae3333; background: #fff0ed; }
 .model-io { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 20px; }

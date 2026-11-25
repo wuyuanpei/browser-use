@@ -56,6 +56,8 @@ repos:
       - id: mixed-line-ending
       - id: fix-byte-order-marker
       - id: end-of-file-fixer
+        # These fixtures store the exact HTTP request bytes, including the end of the body.
+        exclude: '^tests/ci/fixtures/jev_(always|off)_request\.json\.golden$'
       # best practices enforcement
       - id: detect-private-key
       # - id: check-docstring-first

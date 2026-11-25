@@ -7,6 +7,7 @@ from typing import Any, Protocol, cast, get_args
 
 from browser_use.agent.jev import questions as wording
 from browser_use.agent.jev.views import (
+	DEFAULT_SCREENSHOT_REASON,
 	PAGE_TEXT_LIMIT,
 	SCROLL_PAGES,
 	SEGMENT_ACTIONS_LIMIT,
@@ -138,6 +139,12 @@ def build_state(
 	state['original_goal'] = task
 	params = run.params
 	subgoal: dict[str, Any] = {'id': run.id, 'objective': params.objective, 'completion': params.completion}
+	if vision is not None and run.vision_source in ('planner', 'escalation'):
+		subgoal['screenshot_guidance'] = {
+			'required': True,
+			'reason': (run.vision_reason or '').strip() or DEFAULT_SCREENSHOT_REASON,
+			'source': run.vision_source,
+		}
 	if params.inputs:
 		subgoal['inputs'] = params.inputs
 	subgoal.update(may_submit=params.may_submit, requires_action=params.requires_action)

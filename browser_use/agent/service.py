@@ -561,6 +561,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 				is_browser_use_model=is_browser_use_model,
 				model_name=self.llm.model,
 				jev_mode=active_jev.mode if active_jev is not None and active_jev.mode != 'off' else None,
+				jev_screenshot_policy=active_jev.screenshot_policy if active_jev is not None else 'off',
 			).get_system_message(),
 			file_system=self.file_system,
 			state=self.state.message_manager_state,

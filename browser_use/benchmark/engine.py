@@ -296,11 +296,18 @@ class BrowserUseRun:
 		executor = getattr(self._native, '_jev', None)
 		roles = executor.usage_by_role() if executor is not None else {}
 		disabled = roles.get('system1', {}).get('vision_disabled')
+		runs = executor.runs if executor is not None else []
+		reviews = [run for run in runs if run.review_delegation]
 		return redact_secrets(
 			{
 				**self._state,
 				**({'jev_usage_by_role': roles} if roles else {}),
 				'vision_disabled': disabled['status'] if disabled else None,
+				'planner_screenshot_requests': sum(run.screenshot_declared is True for run in runs),
+				'review_delegations': len(reviews),
+				'screenshot_decisions_missing': (
+					sum(run.screenshot_declared is None for run in reviews) if self._state['screenshot_policy'] == 'smart' else 0
+				),
 				'token_usage': token_usage(self._state['model_calls']),
 				'elements': indexed_elements(self._state['page'].get('actions', [])),
 			},
@@ -457,7 +464,7 @@ class BrowserUseRun:
 				request_images=image_files,
 				request_format='multipart/form-data' if images else 'application/json',
 				vision=bool(images),
-				vision_trigger='policy' if images else None,
+				vision_trigger=executor.current_vision_trigger if images else None,
 			) as record:
 				try:
 					reply = await ask(state, questions, images=images)

@@ -28,6 +28,7 @@ let renderedQuestionContexts = null;
 const browserUseProvider = 'browser_use';
 let executionChoice = 'direct';
 let screenshotChoice = 'off';
+let editingRunSettings = false;
 let modelProfiles = [], modelProfileChoice = 'debug';
 const modelProfileLabel = profile => ({ debug: '调试', final_report: '最终报告' })[profile] || '配置未记录';
 const finalReportConfigured = () => modelProfiles.some(profile => profile.id === 'final_report' && profile.configured);
@@ -54,7 +55,7 @@ const handoffLabel = trigger => ({ initial: '初始规划', STEP_DONE: '完成�
   no_progress: '持续无进展', action_cycle: '重复操作', stale_observation: '观察失效' })[trigger] || trigger;
 const providerLabel = p => ({ laya: 'Laya', deepseek: 'DeepSeek', jev: 'Jev', fixture: '本地 fixture', browser_use: 'Browser Use' })[p] || 'Laya';
 const nativeProvider = provider => provider === 'fixture' || provider === 'browser_use';
-const callLabel = c => ({collect:'Collect helper · 页面摘要', summarize:'Summarize helper · 任务输出', summary:'页面摘要助手', answer:'最终答复助手', risk:'提交效果确认', other:'其他模型调用', verify:'Verify helper · 独立复核'})[c?.kind] || (c?.kind === 'planner' ? (c.trigger ? `Planner / ${handoffLabel(c.trigger)}` : 'Planner') : c?.kind === 'text' ? 'Text helper' : c?.kind === 'deepseek' ? `DeepSeek (System1)${c.stage ? ` / 第 ${c.decision_round} 轮 / ${c.stage === 'operation' ? '操作选择' : '目标选择'}` : ''}` : c?.vision_rejected ? 'Jev（截图，被拒）' : jevScreenshot(c) ? 'Jev（截图）' : providerLabel(c?.kind));
+const callLabel = c => ({collect:'Collect helper · 页面摘要', summarize:'Summarize helper · 任务输出', summary:'页面摘要助手', answer:'最终答复助手', risk:'提交效果确认', other:'其他模型调用', verify:'Verify helper · 独立复核'})[c?.kind] || (c?.kind === 'planner' ? (c.trigger ? `Planner / ${handoffLabel(c.trigger)}` : 'Planner') : c?.kind === 'text' ? 'Text helper' : c?.kind === 'deepseek' ? `DeepSeek (System1)${c.stage ? ` / 第 ${c.decision_round} 轮 / ${c.stage === 'operation' ? '操作选择' : '目标选择'}` : ''}` : c?.kind === 'jev' ? jevCallLabel(c) : providerLabel(c?.kind));
 const decisionCount = attempt => attempt?.decision_calls ?? ((attempt?.laya_calls || 0) + (attempt?.deepseek_calls || 0) + (attempt?.jev_calls || 0));
 const callCounts = a => `${decisionCount(a)} / ${a.text_calls || 0} / ${a.planner_calls || 0}<small>收集 ${a.collect_calls || 0} · 总结 ${a.summarize_calls || 0}</small><small>${a.decision_rounds ?? decisionCount(a)} 决策轮 · ${a.replans || 0} 次改计划</small>`;
 function tokenPanel(usage, title = 'Token 消耗', panelKey = 'tokens') {
@@ -273,17 +274,28 @@ function jevScreenshot(call) {
   return call?.kind === 'jev' && (call.vision || call.request_format === 'multipart/form-data'
     || Object.keys(call.request_images || {}).length > 0);
 }
+function jevCallLabel(call) {
+  if (call.vision_rejected) return call.vision_trigger === 'planner' ? 'Jev（截图·Planner，被拒）' : 'Jev（截图，被拒）';
+  if (!jevScreenshot(call)) return 'Jev';
+  return call.vision_trigger === 'planner' ? 'Jev（截图·Planner）' : 'Jev（截图）';
+}
 function traceCard(call, index, active) {
   const label = ({planner:'Planner', text:'Text helper', collect:'Collect', summarize:'Summarize', verify:'Verify'})[call.kind]
     || (call.kind === 'deepseek' ? 'DeepSeek' : call.label);
   const operation = call.operation === 'UNABLE' && call.decision?.forced_unable === true
     ? 'UNABLE(强制)' : call.operation;
-  const action = (call.vision_rejected && `HTTP ${call.attempts.at(-1).status}`) || call.planner_result?.decision || operation || call.field
+  const httpStatus = call.kind === 'jev' && call.status === 'error' ? call.attempts?.at(-1)?.status : null;
+  const action = (httpStatus >= 400 && `HTTP ${httpStatus}`) || call.planner_result?.decision || operation || call.field
     || ({collect:'页面摘要', summarize:'生成任务输出', verify:'核验报告', text:'输入文本'})[call.kind] || '等待结果';
   const status = ({success:'成功', error:'失败', pending:'进行中'})[call.status] || call.status;
-  const description = [`${index + 1}. ${call.label}`, action, call.model, call.target ? `target ${call.target}` : '',
+  const declaration = call.kind === 'planner' && screenshotPolicy(state) === 'smart'
+    ? call.response?.completion?.action?.find(a => a.delegate_subgoal)?.delegate_subgoal : null;
+  const decision = declaration ? `screenshot_required: ${declaration.screenshot_required ?? '未填'}` : '';
+  const reason = declaration ? declaration.screenshot_reason?.trim() || '理由未填' : '';
+  const detail = declaration ? `<span class="screenshot-declaration"><strong>${escape(decision)}</strong><span>${escape(reason)}</span></span>` : '';
+  const description = [`${index + 1}. ${call.label}`, action, decision, reason, call.model, call.target ? `target ${call.target}` : '',
     call.subgoal_id, `${call.latency_ms ?? 0} ms`, status].filter(Boolean).join(' · ');
-  return `<button type="button" class="trace-row ${active ? 'active' : ''}" data-call-id="${call.id}" aria-pressed="${active}" aria-label="${escape(description)}" title="${escape(description)}"><span class="trace-top"><span class="number">${String(index + 1).padStart(2, '0')}</span><span class="call-status ${call.status === 'error' ? 'failed' : ''}">${escape(status)}</span></span><span class="trace-main"><span class="trace-kind">${escape(label)}</span><b>${escape(action)}</b></span><span class="trace-bottom"><span class="time">${call.latency_ms ?? 0} ms</span><small>${call.target ? '#'+escape(call.target) : ''}</small></span></button>`;
+  return `<button type="button" class="trace-row ${declaration ? 'has-declaration' : ''} ${active ? 'active' : ''}" data-call-id="${call.id}" aria-pressed="${active}" aria-label="${escape(description)}" title="${escape(description)}"><span class="trace-top"><span class="number">${String(index + 1).padStart(2, '0')}</span><span class="call-status ${call.status === 'error' ? 'failed' : ''}">${escape(status)}</span></span><span class="trace-main"><span class="trace-kind">${escape(label)}</span><b>${escape(action)}</b></span>${detail}<span class="trace-bottom"><span class="time">${call.latency_ms ?? 0} ms</span><small>${call.target ? '#'+escape(call.target) : ''}</small></span></button>`;
 }
 function renderModelCalls() {
   const calls = executionCalls();
@@ -342,6 +354,7 @@ async function call(name, body = {}) {
   if (!response.ok) throw Error(data.error || "Request failed");
   state = data;
   freeState = data;
+  editingRunSettings = false;
   if (name === "reset") { selectedCallId = null; selectedFrame = null; consumeModelProfile(); }
   render();
   return data;
@@ -353,13 +366,17 @@ function controls() {
   $('model-profile').disabled = busy || automatic || baseline.active || baselineBusy;
   const configuring = !busy && !automatic && !baseline.active && !baselineBusy;
   const jevMode = executionChoice !== 'direct';
-  $('screenshot-off').disabled = !configuring || !jevMode;
-  $('screenshot-always').disabled = !configuring || !jevMode;
-  $('screenshot-off').setAttribute('aria-pressed', String(screenshotChoice === 'off'));
-  $('screenshot-always').setAttribute('aria-pressed', String(screenshotChoice === 'always'));
-  const disabledStatus = state?.vision_disabled;
+  for (const policy of ['off', 'always', 'smart']) {
+    const button = $(`screenshot-${policy}`);
+    button.disabled = !configuring || !jevMode;
+    button.setAttribute('aria-pressed', String(screenshotChoice === policy));
+  }
+  const inspecting = selectedCallId !== null || selectedFrame !== null || (view === 'baseline' && (pinnedRun || pinnedAttempt));
+  const running = view === 'free' ? live : state?.baseline_attempt?.execution_status === 'running';
+  const disabledStatus = (inspecting || running) && !(configuring && editingRunSettings) ? state?.vision_disabled : null;
   $('screenshot-mode-hint').textContent = disabledStatus ? `Jev 拒收截图（HTTP ${disabledStatus}），本任务已改为纯文本`
     : !jevMode ? '选择 Jev 执行模式后可开启截图。'
+    : screenshotChoice === 'smart' ? 'Planner 在复盘时决定是否向 Jev 提交截图。'
     : screenshotChoice === 'always' ? '下次运行向 Jev 提交当前视口截图和候选元素框。' : '下次运行向 Jev 提交纯文本。';
   renderModelProfile();
   $('choose').textContent = state?.planning?.pending ? '请求云端规划' : 'Choose next';
@@ -688,6 +705,10 @@ function selectBaselineGroup(group) {
   try { window.localStorage?.setItem('jev-baseline-group', group); } catch { /* Storage may be disabled. */ }
   renderBaseline();
 }
+function screenshotDecisionCounts(record) {
+  if (screenshotPolicy(record) !== 'smart' || !Number.isInteger(record.screenshot_decisions_missing)) return '';
+  return `Planner 请求截图 ${record.planner_screenshot_requests} · 复盘委托 ${record.review_delegations} · 复盘漏填 ${record.screenshot_decisions_missing}`;
+}
 function renderBaseline() {
   const batch = baseline.batch;
   const attempts = batch?.attempts || [];
@@ -739,6 +760,7 @@ function renderBaseline() {
     const task = baseline.tasks.find(t => t.id === a.task_id);
     const result = resultName(a);
     const reason = a.reason || (typeof a.evaluation === 'object' && a.evaluation?.reason) || '';
+    const screenshotCounts = screenshotDecisionCounts(a);
     return `<article class="baseline-task-card baseline-attempt-card${a.id === selectedAttemptId ? ' selected-attempt' : ''}" data-status="${escape(a.status)}">
       <div class="baseline-attempt-header"><h4>${escape(task?.name || a.task_id)}</h4><button type="button" data-attempt-id="${escape(a.id)}" aria-pressed="${a.id === selectedAttemptId}" ${['queued', 'pending'].includes(a.status) ? 'disabled' : ''}>查看记录</button></div>
       <p class="baseline-attempt-meta">第 ${escape(a.repeat)} 次 · ${providerLabel(a.system1_provider)}${screenshotPolicy(a) !== 'off' ? ' · '+screenshotLabel(screenshotPolicy(a)) : ''} · ${modeLabel(a.execution_mode)} · ${modelProfileLabel(a.model_profile)}</p>
@@ -746,6 +768,7 @@ function renderBaseline() {
       <div class="baseline-task-metrics"><span>${escape(a.actions || 0)} 动作</span>${a.system1_provider === 'jev' && Number.isInteger(a.vision_requests) ? `<span>带图请求 ${a.vision_requests}</span>` : ''}${a.vision_disabled ? `<span>截图已禁用（HTTP ${escape(a.vision_disabled)}）</span>` : ''}<span>${duration(a.elapsed_ms)}</span></div>
       ${reason ? `<p class="attempt-reason" title="${escape(reason)}">${escape(reason)}</p>` : ''}
       <div class="baseline-attempt-calls"><span>System1 / 文本 / 规划</span><div>${callCounts(a)}</div></div>
+      ${screenshotCounts ? `<p class="baseline-attempt-meta">${escape(screenshotCounts)}</p>` : ''}
       ${tokenPanel(a.token_usage, '本次运行 Token', a.id)}
     </article>`;
   }).join('') : '<p class="muted baseline-attempt-empty">尚无运行记录</p>', selectedRunId);
@@ -756,6 +779,8 @@ function renderBaseline() {
     ? `${stats.met} / ${stats.attempts} 目标达成 · ${stats.not_met} 未达成 · ${stats.unknown} 证据不足 · ${stats.evaluation_errors} 评估调用失败 · ${stats.not_run} 未评估 · ${stats.legacy_unknown} 旧档案未判定 · 未判决 ${(100 * (stats.unjudged_rate || 0)).toFixed(1)}%`
     : attempts.length ? `${passed} / ${attempts.length} 通过 · ${blocked} 环境阻塞（旧方法）` : '';
   stableHTML('baseline-token-summary', batch ? tokenPanel(batch.token_usage, '批次累计 Token') : '', selectedRunId);
+  const screenshotCounts = screenshotDecisionCounts(batch);
+  if (screenshotCounts) $('baseline-summary').textContent += ' · ' + screenshotCounts;
   const selected = attempts.find(a => a.id === selectedAttemptId);
   $('baseline-selected').textContent = selected ? `${baseline.tasks.find(t => t.id === selected.task_id)?.name || selected.task_id} · 第 ${selected.repeat} 次 · ${executionName(selected)}${resultName(selected) ? ' · ' + resultName(selected) : ''}` : '未选择运行记录';
   renderBaselineEvaluation(selected);
@@ -773,6 +798,7 @@ async function baselineFetch(path, body) {
 function clearFreeTask() {
   // 新批次拥有浏览器时清除旧的实时计划，历史文件仍然保留。
   freeState = { ...freeState, page: null, status: 'idle', history: [], model_calls: [], decision: null, elements: [], plan: [], planning: null, execution_mode: 'direct' };
+  freeState.vision_disabled = null;
   if (view === 'free') { state = freeState; render(); }
 }
 function acceptBaseline(data) {
@@ -853,7 +879,7 @@ async function baselineAction(name, body = {}) {
   renderBaseline();
   try {
     const data = await baselineFetch(`/${name}`, body);
-    if (name === 'start') { pinnedRun = false; pinnedAttempt = false; clearFreeTask(); consumeModelProfile(); }
+    if (name === 'start') { editingRunSettings = false; pinnedRun = false; pinnedAttempt = false; clearFreeTask(); consumeModelProfile(); }
     if (name === 'delete') {
       pinnedRun = false; pinnedAttempt = false;
       selectedRunId = null; selectedAttemptId = null; selectedFrame = null; selectedCallId = null;
@@ -886,6 +912,7 @@ async function selectView(next) {
   selectedFrame = null;
   if (busy) return;
   view = next;
+  editingRunSettings = false;
   try { window.localStorage?.setItem('jev-task-view', next); } catch { /* Storage may be disabled. */ }
   baselineEpoch++;
   for (const name of ['free', 'baseline']) {
@@ -957,6 +984,7 @@ $('baseline-attempts').addEventListener('click', event => {
   const button = event.target.closest('[data-attempt-id]');
   if (!button || button.disabled) return;
   pinnedAttempt = true;
+  editingRunSettings = false;
   const epoch = ++baselineEpoch;
   selectedAttemptId = button.dataset.attemptId;
   selectedCallId = null;
@@ -971,6 +999,7 @@ $('baseline-runs').addEventListener('change', async () => {
   const epoch = ++baselineEpoch;
   // 请求历史批次期间隐藏旧指令，失败或过期响应也不能将其重新显示。
   pinnedRun = true;
+  editingRunSettings = false;
   pinnedAttempt = false;
   selectedRunId = id;
   selectedAttemptId = null;
@@ -989,6 +1018,7 @@ $('baseline-runs').addEventListener('change', async () => {
   } catch (error) { showBaselineError(error); }
 });
 $('observation-step').addEventListener('change', () => {
+  editingRunSettings = false;
   selectedFrame = $('observation-step').value;
   selectedCallId = null;
   render();
@@ -1023,6 +1053,7 @@ $("history").addEventListener("click", (event) => {
   if (!row) return;
   const call = executionCalls().find(c => c.id === Number(row.dataset.callId));
   if (!call) return;
+  editingRunSettings = false;
   selectedCallId = call.id;
   if (view === 'baseline' || Number.isInteger(call?.observation_index)) {
     selectedFrame = Number.isInteger(call?.observation_index) ? String(call.observation_index) : '-1';
@@ -1147,19 +1178,21 @@ $("download").addEventListener("click", () => {
   URL.revokeObjectURL(url);
 });
 $('model-profile').addEventListener('change', () => {
+  editingRunSettings = true;
   const choice = $('model-profile').value;
   modelProfileChoice = choice === 'final_report' && finalReportConfigured()
     ? 'final_report' : 'debug';
-  renderModelProfile();
+  controls();
 });
 $('execution-mode').value = executionChoice;
 $('execution-mode').addEventListener('change', () => {
+  editingRunSettings = true;
   executionChoice = $('execution-mode').value;
   if (executionChoice === 'direct') screenshotChoice = 'off';
   controls();
 });
-for (const policy of ['off', 'always']) {
-  $(`screenshot-${policy}`).addEventListener('click', () => { screenshotChoice = policy; controls(); });
+for (const policy of ['off', 'always', 'smart']) {
+  $(`screenshot-${policy}`).addEventListener('click', () => { editingRunSettings = true; screenshotChoice = policy; controls(); });
 }
 fetch("/api/state")
   .then((r) => r.json())

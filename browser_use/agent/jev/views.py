@@ -29,7 +29,15 @@ SUMMARY_LIMIT = 400
 ANSWER_LIMIT = 12_000
 LINKS_LIMIT_CHARS = 6_000
 RISK_PAGE_TEXT_LIMIT = 1_500
-SUBGOAL_FIELD_LIMITS = {'objective': 500, 'completion': 500, 'reason': 1_000, 'inputs': 1_000, 'review_note': 300}
+SUBGOAL_FIELD_LIMITS = {
+	'objective': 500,
+	'completion': 500,
+	'reason': 1_000,
+	'inputs': 1_000,
+	'review_note': 300,
+	'screenshot_reason': 300,
+}
+DEFAULT_SCREENSHOT_REASON = 'Planner requested the image without a specific reason.'
 
 
 class JevModel(BaseModel):
@@ -109,8 +117,6 @@ class JevSettings(JevModel):
 
 	@model_validator(mode='after')
 	def _configured_backend(self) -> Self:
-		if self.screenshot_policy == 'smart':
-			raise ValueError('smart screenshot policy is not implemented yet')
 		if self.screenshot_policy != 'off' and self.system1 != 'jev':
 			raise ValueError('Screenshot policy requires the Jev backend')
 		if self.system1 == 'llm' and self.system1_llm is None:
@@ -150,6 +156,27 @@ class DelegateSubgoalParams(JevModel):
 	review_note: str | None = Field(
 		default=None,
 		description='Required when you re-delegate the same objective and completion after rejecting STEP_DONE: what is still missing and why the stage is not done.',
+	)
+
+
+class DelegateSubgoalParamsSmart(DelegateSubgoalParams):
+	screenshot_required: bool | None = Field(
+		default=None,
+		description=(
+			'Whether System1 sees the current viewport image in this stage. REQUIRED (true or false) when you delegate after '
+			'a handback other than an accepted STEP_DONE, including a re-delegation after you rejected STEP_DONE. '
+			'True when System1 chose wrong or ambiguous targets, missed visible targets or evidence, or could not interpret '
+			'the layout (rows/cards/icons/overlays/visual-only state). False when text is enough. '
+			'May be omitted for the first stage and after an accepted STEP_DONE; omitted means text-only. '
+			'Images never add targets or permit coordinates.'
+		),
+	)
+	screenshot_reason: str | None = Field(
+		default=None,
+		description=(
+			'Required whenever you set screenshot_required: the specific visual difficulty System1 should resolve with the '
+			'image, or why text is enough.'
+		),
 	)
 
 
@@ -240,6 +267,11 @@ class SubgoalRun(JevModel):
 	no_effect_streak: int = 0
 	decisions: int = 0
 	vision_decisions: int = 0
+	vision: bool = False
+	vision_source: Literal['policy', 'planner', 'escalation'] | None = None
+	vision_reason: str | None = None
+	review_delegation: bool = False
+	screenshot_declared: bool | None = None
 	rejected_fingerprint: str | None = None  # set when this run re-delegates a rejected STEP_DONE
 	status: Literal['active', 'handed_back'] = 'active'
 	handback: Handback | None = None

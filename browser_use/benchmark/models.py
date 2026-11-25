@@ -56,7 +56,7 @@ class RunSettings(BaseModel):
 
 	profile: Literal['debug', 'final_report']
 	execution_mode: ExecutionMode = 'direct'
-	screenshot_policy: Literal['off', 'always'] = 'off'
+	screenshot_policy: Literal['off', 'always', 'smart'] = 'off'
 	jev: ModelEndpoint | None = None
 	execution: ExecutionModel
 	evaluation: EvaluationModel
@@ -163,10 +163,8 @@ def runtime_settings(
 	if provider not in (None, '', PROVIDER) and not (provider == 'jev' and mode != 'direct'):
 		raise ValueError('测试台使用 Browser Use 执行。')
 	policy = screenshot_policy if screenshot_policy is not None else 'always' if screenshot_mode else 'off'
-	if policy == 'smart':
-		raise ValueError('智能截图暂未实现。')
-	if policy not in ('off', 'always'):
-		raise ValueError('screenshot_policy must be off or always')
+	if policy not in ('off', 'always', 'smart'):
+		raise ValueError('screenshot_policy must be off, always, or smart')
 	if mode == 'direct' and policy != 'off':
 		raise ValueError('BU 直接执行模式只支持关闭模型截图。')
 	jev = None

@@ -2,6 +2,9 @@
 
 import csv
 import json
+import threading
+import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -31,8 +34,8 @@ def test_modes_and_model_profiles_are_independent(monkeypatch, tmp_path: Path):
 	assert runtime_settings().execution_mode == 'direct'
 	with pytest.raises(ValueError, match='直接执行'):
 		runtime_settings(mode='direct', screenshot_policy='always')
-	with pytest.raises(ValueError, match='暂未实现'):
-		runtime_settings(mode='isolated', screenshot_policy='smart')
+	with pytest.raises(ValueError, match='直接执行'):
+		runtime_settings(mode='direct', screenshot_policy='smart')
 	with pytest.raises(ValueError, match='TYPESAFE_API_KEY'):
 		runtime_settings(mode='isolated')
 	path = tmp_path / 'profile.env'
@@ -40,6 +43,7 @@ def test_modes_and_model_profiles_are_independent(monkeypatch, tmp_path: Path):
 	load_profile_environment(path)
 	for mode in ('isolated', 'collaborative'):
 		assert runtime_settings('jev', mode, screenshot_policy='always').screenshot_policy == 'always'
+		assert runtime_settings('jev', mode, screenshot_policy='smart').screenshot_policy == 'smart'
 		for profile in ('debug', 'final_report'):
 			settings = runtime_settings('jev', mode, model_profile=profile)
 			assert settings.execution_mode == mode and settings.profile == profile
@@ -96,7 +100,10 @@ def test_jev_retry_and_legacy_token_totals():
 	assert aggregate_token_usage([{'token_usage': archived}, {'token_usage': usage}])['jev_output_tokens'] == 3
 
 
-def _save_work_fixture(httpserver, httpserver_ipv4, tmp_path, monkeypatch, policy, *, reject_images=False):
+_VISUAL_REASON = 'Find Save beside the current record using its row on screen.'
+
+
+def _save_work_fixture(httpserver, httpserver_ipv4, tmp_path, monkeypatch, policy, *, image_error=None):
 	# Windows may supply a system proxy for localhost. The model server and page both run inside this test.
 	monkeypatch.setenv('NO_PROXY', 'localhost,127.0.0.1,::1')
 	httpserver.expect_request('/task').respond_with_data(
@@ -110,6 +117,13 @@ def _save_work_fixture(httpserver, httpserver_ipv4, tmp_path, monkeypatch, polic
 		return Response('ok')
 
 	httpserver.expect_request('/save', method='POST').respond_with_handler(save)
+	declarations = iter(
+		(
+			{'screenshot_required': False, 'screenshot_reason': 'The Save label is enough.'},
+			{},
+			{'screenshot_required': True, 'screenshot_reason': _VISUAL_REASON},
+		)
+	)
 
 	def completion(request):
 		body = request.get_json()
@@ -131,7 +145,9 @@ def _save_work_fixture(httpserver, httpserver_ipv4, tmp_path, monkeypatch, polic
 		tool = body['tool_choice']['function']['name']
 		if tool == 'AnswerReply':
 			action = {'text': 'The page shows Saved.'}
-		elif any(message['role'] == 'user' and '<system1_handback>' in str(message['content']) for message in body['messages']):
+		elif (policy != 'smart' or saved) and any(
+			message['role'] == 'user' and '<system1_handback>' in str(message['content']) for message in body['messages']
+		):
 			action = {'action': [{'finish': {'success': True, 'reason': 'Observed Saved'}}]}
 		else:
 			action = {
@@ -143,6 +159,7 @@ def _save_work_fixture(httpserver, httpserver_ipv4, tmp_path, monkeypatch, polic
 							'reason': 'Apply the requested change',
 							'requires_action': True,
 							'may_submit': True,
+							**(next(declarations) if policy == 'smart' else {}),
 						}
 					}
 				]
@@ -172,22 +189,25 @@ def _save_work_fixture(httpserver, httpserver_ipv4, tmp_path, monkeypatch, polic
 
 	def choose(request):
 		if request.mimetype == 'multipart/form-data':
-			assert policy == 'always'
+			assert policy != 'off'
 			data = json.loads(request.form['request'])
 			jpeg = request.files['page-screenshot'].read()
 			assert jpeg.startswith(b'\xff\xd8') and request.headers['TypeSafe-Danger-Zone-Images'] == 'true'
 		else:
-			assert request.mimetype == 'application/json' and (policy == 'off' or reject_images)
+			assert request.mimetype == 'application/json' and (policy != 'always' or image_error)
 			data, jpeg = request.get_json(), None
 		requests.append((data, jpeg))
-		if jpeg and reject_images:
-			return Response(json.dumps({'error': 'Image input rejected'}), status=415, mimetype='application/json')
+		if jpeg and image_error:
+			message = 'Image input rejected' if image_error == 415 else 'Authentication failed'
+			return Response(json.dumps({'error': message}), status=image_error, mimetype='application/json')
 		questions = data['questions']
 		answers = {}
 		for name, question in questions.items():
 			criteria = question['criteria']
 			if name == 'operation':
 				choice = 'STEP_DONE' if 'Saved' in data['state']['page']['text'] else 'CLICK'
+				if policy == 'smart' and not jpeg:
+					choice = 'UNABLE'
 			elif name == 'click_target':
 				choice = next(k for k, v in criteria.items() if '"Save"' in v['element'])
 			else:
@@ -274,10 +294,7 @@ def test_workbench_real_page_repredicts_and_keeps_per_role_evidence(
 		run.close()
 
 
-def test_baseline_recovers_after_jev_rejects_image(httpserver, httpserver_ipv4, tmp_path, monkeypatch):
-	settings, saved, requests = _save_work_fixture(
-		httpserver, httpserver_ipv4, tmp_path, monkeypatch, 'always', reject_images=True
-	)
+def _run_save_batch(httpserver, tmp_path, monkeypatch, settings):
 	monkeypatch.setattr('browser_use.benchmark.baseline.runtime_settings', lambda *args, **kwargs: settings)
 	running_status = []
 
@@ -298,12 +315,56 @@ def test_baseline_recovers_after_jev_rejects_image(httpserver, httpserver_ipv4, 
 		'goal': 'Press Save and report the outcome.',
 	}
 	manager.tasks = [task]
-	initial = manager.start(['save_fixture'], 1, 'jev', 'isolated', screenshot_policy='always')
+	initial = manager.start(['save_fixture'], 1, 'jev', 'isolated', screenshot_policy=settings.screenshot_policy)
 	assert manager.thread is not None
 	manager.thread.join(timeout=90)
 	assert not manager.thread.is_alive()
-	run_id = initial['batch']['id']
-	batch = manager.read_run(run_id)
+	return manager, manager.read_run(initial['batch']['id']), running_status
+
+
+@contextmanager
+def _open_inspector(manager, settings, tmp_path, monkeypatch):
+	from browser_use.benchmark import server
+
+	monkeypatch.setenv('TYPESAFE_API_KEY', 'dummy-local-key')
+	monkeypatch.setattr(server, 'BASELINE', manager)
+	with server.InspectorServer(('127.0.0.1', 0), server.Handler) as httpd:
+		port = httpd.server_address[1]
+		origin = f'http://127.0.0.1:{port}'
+		monkeypatch.setattr(server, 'ORIGIN', origin)
+		monkeypatch.setattr(server, 'PORT', port)
+		thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+		thread.start()
+		try:
+			viewer = BrowserUseRun(
+				origin + '/#baseline',
+				'Inspect the saved run.',
+				settings.model_copy(
+					update={
+						'execution_mode': 'direct',
+						'jev': None,
+						'screenshot_policy': 'off',
+						'user_data_dir': str(tmp_path / 'inspector-profile'),
+					}
+				),
+			)
+			try:
+				deadline = time.monotonic() + 10
+				while not viewer._browser.evaluate("Boolean(document.querySelector('#history .trace-row'))"):
+					assert time.monotonic() < deadline, 'Inspector did not render the archived model calls'
+					time.sleep(0.05)
+				yield viewer._browser.evaluate
+			finally:
+				viewer.close()
+		finally:
+			httpd.shutdown()
+			thread.join()
+
+
+def test_baseline_recovers_after_jev_rejects_image(httpserver, httpserver_ipv4, tmp_path, monkeypatch):
+	settings, saved, requests = _save_work_fixture(httpserver, httpserver_ipv4, tmp_path, monkeypatch, 'always', image_error=415)
+	manager, batch, running_status = _run_save_batch(httpserver, tmp_path, monkeypatch, settings)
+	run_id = batch['id']
 	row = batch['attempts'][0]
 	assert row['status'] == 'passed' and saved == [True]
 	assert row['vision_disabled'] == 415 and row['vision_requests'] == 1
@@ -312,7 +373,7 @@ def test_baseline_recovers_after_jev_rejects_image(httpserver, httpserver_ipv4, 
 	assert snapshot['vision_disabled'] == 415
 	assert snapshot['jev_usage_by_role']['system1']['decisions'] == 2
 	calls = snapshot['model_calls']
-	rejected, fallback, done = [call for call in calls if call['kind'] == 'jev']
+	rejected, fallback, done = (call for call in calls if call['kind'] == 'jev')
 	assert rejected['status'] == 'error' and rejected['vision_rejected'] is True and rejected['attempts'][-1]['status'] == 415
 	assert fallback['id'] == rejected['id'] + 1 and fallback['observation_index'] == rejected['observation_index']
 	assert fallback['status'] == done['status'] == 'success'
@@ -327,3 +388,55 @@ def test_baseline_recovers_after_jev_rejects_image(httpserver, httpserver_ipv4, 
 	with (folder / 'summary.csv').open(encoding='utf-8-sig', newline='') as stream:
 		assert next(csv.DictReader(stream))['vision_disabled'] == '415'
 	assert '| 415 |' in (folder / 'report.zh.md').read_text(encoding='utf-8')
+	with _open_inspector(manager, settings, tmp_path, monkeypatch) as evaluate:
+		hint = "document.querySelector('#screenshot-mode-hint').textContent"
+		assert '415' not in evaluate(hint)
+		evaluate(f'document.querySelector(\'[data-call-id="{rejected["id"]}"]\').click()')
+		assert 'HTTP 415' in evaluate(hint)
+		evaluate(
+			"const mode=document.querySelector('#execution-mode'); mode.value='isolated'; mode.dispatchEvent(new Event('change')); document.querySelector('#screenshot-smart').click()"
+		)
+		assert evaluate(hint) == 'Planner 在复盘时决定是否向 Jev 提交截图。'
+
+
+def test_smart_batch_counts_reviews_and_displays_planner_declarations(httpserver, httpserver_ipv4, tmp_path, monkeypatch):
+	settings, saved, requests = _save_work_fixture(httpserver, httpserver_ipv4, tmp_path, monkeypatch, 'smart')
+	manager, batch, running_status = _run_save_batch(httpserver, tmp_path, monkeypatch, settings)
+	row = batch['attempts'][0]
+	assert row['status'] == 'passed' and saved == [True]
+	assert running_status == [(False, None), (False, None), (True, None), (True, None)]
+	assert [bool(image) for _, image in requests] == [False, False, True, True]
+	snapshot = manager.read_attempt(batch['id'], row['id'])
+	jev = [c for c in snapshot['model_calls'] if c['kind'] == 'jev']
+	assert [c['vision_trigger'] for c in jev] == [None, None, 'planner', 'planner']
+	assert jev[-2]['request']['state']['current_subgoal']['screenshot_guidance']['reason'] == _VISUAL_REASON
+	counts = {'planner_screenshot_requests': 1, 'review_delegations': 2, 'screenshot_decisions_missing': 1}
+	folder = manager.folder(batch['id'])
+	with (folder / 'summary.csv').open(encoding='utf-8-sig', newline='') as stream:
+		csv_row = next(csv.DictReader(stream))
+	for key, count in counts.items():
+		assert snapshot[key] == row[key] == batch[key] == int(csv_row[key]) == count
+	report = (folder / 'report.zh.md').read_text(encoding='utf-8')
+	assert 'Planner 请求截图 | 复盘委托 | 复盘漏填' in report and '| 1 | 2 | 1 |' in report
+	with _open_inspector(manager, settings, tmp_path, monkeypatch) as evaluate:
+		kinds = evaluate("[...document.querySelectorAll('#history .trace-kind')].map(e => e.textContent)")
+		assert kinds.count('Jev（截图·Planner）') == 2
+		assert 'Planner 请求截图 1 · 复盘委托 2 · 复盘漏填 1' in evaluate(
+			"document.querySelector('#baseline-summary').textContent"
+		)
+		declarations = evaluate("[...document.querySelectorAll('.screenshot-declaration')].map(e => e.innerText)")
+		assert ['screenshot_required: ' + label for label in ('false', '未填', 'true')] == [
+			d.splitlines()[0] for d in declarations
+		]
+		assert _VISUAL_REASON in declarations[-1]
+
+
+def test_workbench_auth_failure_is_not_an_image_rejection(httpserver, httpserver_ipv4, tmp_path, monkeypatch):
+	settings, saved, requests = _save_work_fixture(httpserver, httpserver_ipv4, tmp_path, monkeypatch, 'always', image_error=401)
+	manager, batch, running_status = _run_save_batch(httpserver, tmp_path, monkeypatch, settings)
+	row = batch['attempts'][0]
+	assert row['vision_disabled'] is None and not saved and running_status == [(True, None)]
+	snapshot = manager.read_attempt(batch['id'], row['id'])
+	(jev,) = (call for call in snapshot['model_calls'] if call['kind'] == 'jev')
+	assert jev['status'] == 'error' and jev['attempts'][-1]['status'] == 401 and not jev.get('vision_rejected')
+	assert len(requests) == 1 and requests[0][1]

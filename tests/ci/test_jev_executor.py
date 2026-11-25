@@ -12,18 +12,29 @@ from unittest.mock import AsyncMock, Mock
 import httpx
 import pytest
 from pytest_httpserver import HTTPServer
-from werkzeug.wrappers import Response
+from werkzeug.wrappers import Request, Response
 
 from browser_use import Agent
 from browser_use.agent.jev import JevChecks, JevSettings, backends, service
 from browser_use.agent.jev.questions import VISION_RULES
-from browser_use.agent.jev.service import _is_repeated_empty
-from browser_use.agent.jev.views import ActionRecord, DelegateSubgoalParams, SubgoalRun
+from browser_use.agent.jev.service import _is_repeated_empty, _is_review_delegation
+from browser_use.agent.jev.views import ActionRecord, DelegateSubgoalParams, DelegateSubgoalParamsSmart, Handback, SubgoalRun
 from browser_use.agent.views import AgentStepInfo
 from tests.ci.conftest import create_mock_llm
 from tests.ci.jev_support import FakeJev, browser_eval, serve_page
 from tests.ci.jev_support import jev_browser as _jev_browser_fixture  # noqa: F401
 from tests.ci.jev_support import jev_httpserver as _threaded_server  # noqa: F401
+
+REVIEW_REMINDER = 'Your next delegate_subgoal is a review: set screenshot_required (true or false) with screenshot_reason.'
+
+
+class _VisionJev(FakeJev):
+	"""Run the same scripted choices against the JSON part of a real multipart request."""
+
+	def _handle(self, request: Request) -> Response:
+		if request.mimetype == 'multipart/form-data':
+			request = Request.from_values(method='POST', json=json.loads(request.form['request']))
+		return super()._handle(request)
 
 
 def planner_action(name, **params):
@@ -211,7 +222,8 @@ async def start_stage(
 	max_candidates=200,
 	body=None,
 	requires=False,
-	screenshot_policy: Literal['off', 'always'] = 'off',
+	screenshot_policy: Literal['off', 'always', 'smart'] = 'off',
+	screenshot_fields=None,
 	save_conversation_path=None,
 ):
 	url = serve_page(
@@ -250,7 +262,13 @@ async def start_stage(
 		max_actions=max_actions,
 		requires_action=requires,
 	)
-	out = await e.delegate(params, session)
+	if screenshot_policy == 'smart':
+		params = DelegateSubgoalParamsSmart.model_validate({**params.model_dump(exclude_unset=True), **(screenshot_fields or {})})
+		out = await agent.tools.registry.execute_action(
+			'delegate_subgoal', params.model_dump(exclude_unset=True), browser_session=session
+		)
+	else:
+		out = await e.delegate(params, session)
 	assert not out.error
 	return agent, e, params
 
@@ -277,6 +295,174 @@ async def test_missing_screenshot_uses_text_in_the_same_decision(jev_browser, ht
 
 def image_requests(server):
 	return server.expect_request('/v1/systemone', method='POST', headers={'TypeSafe-Danger-Zone-Images': 'true'})
+
+
+@pytest.mark.parametrize(
+	('previous_reason', 'rejected', 'review'),
+	[(None, False, False), ('step_done', False, False), ('step_done', True, True)]
+	+ [
+		(reason, False, True)
+		for reason in ('unable', 'low_confidence', 'no_effect', 'repeated_action', 'action_budget', 'system1_error')
+	],
+)
+def test_review_delegation(previous_reason, rejected, review):
+	previous = None
+	if previous_reason is not None:
+		previous = SubgoalRun(
+			id='sg1',
+			identity='stage',
+			params=DelegateSubgoalParams(objective='stage', completion='done', reason='review'),
+			max_actions=1,
+			started_step=1,
+			start_url='http://localhost',
+			start_site='localhost',
+			handback=Handback(reason=previous_reason, detail='observed', step=2),
+		)
+	assert _is_review_delegation(previous, rejected) is review
+
+
+async def test_smart_sends_each_stage_its_declared_input(jev_browser, httpserver, tmp_path, monkeypatch):
+	reason = 'Find Enable in the correct row.'
+	fake = _VisionJev(httpserver, [{'operation': 'CLICK', 'target': 'Enable'}] + [{'operation': 'STEP_DONE'}] * 3)
+	agent, executor, _ = await start_stage(
+		jev_browser,
+		httpserver,
+		tmp_path,
+		screenshot_policy='smart',
+		screenshot_fields={'screenshot_required': True, 'screenshot_reason': reason},
+	)
+	triggers = []
+	ask = executor.backend.ask
+
+	async def capture(state, questions, *, images=None):
+		triggers.append(executor.current_vision_trigger)
+		return await ask(state, questions, images=images)
+
+	monkeypatch.setattr(executor.backend, 'ask', capture)
+	try:
+		await routed(agent)
+		done = await routed(agent)
+		assert f'2 of 2 System1 decisions in this subgoal used the viewport image (requested by you: {reason})' in str(
+			done.context_messages[-1].content
+		)
+		assert REVIEW_REMINDER not in str(done.context_messages[-1].content)
+		for n, declaration in enumerate(({}, {'screenshot_required': False, 'screenshot_reason': 'Label is sufficient.'}), 1):
+			args = {'objective': f'Read stage {n}', 'completion': 'Page visible', 'reason': 'Advanced', **declaration}
+			out = await agent.tools.registry.execute_action('delegate_subgoal', args, browser_session=jev_browser)
+			assert not out.error
+			result = await routed(agent)
+			assert '(text-only stage)' in str(result.context_messages[-1].content)
+		assert triggers == ['planner', 'planner', None, None] and executor.current_vision_trigger is None
+		assert [req.mimetype for req, _ in httpserver.log if req.path == '/v1/systemone'] == [
+			'multipart/form-data',
+			'multipart/form-data',
+			'application/json',
+			'application/json',
+		]
+		for packet in fake.requests[:2]:
+			assert packet['state']['current_subgoal']['screenshot_guidance'] == {
+				'required': True,
+				'reason': reason,
+				'source': 'planner',
+			}
+			assert packet['state']['page']['screenshot'] in packet['assets']
+		for packet in fake.requests[2:]:
+			assert 'screenshot_guidance' not in packet['state']['current_subgoal']
+			assert 'assets' not in packet and 'screenshot' not in packet['state']['page']
+		events = _events(tmp_path / 'trace.jsonl')
+		assert [r['vision_trigger'] for r in events if r['event'] == 'system1_decision'] == triggers
+		starts = [r for r in events if r['event'] == 'subgoal_start']
+		assert [
+			(r['screenshot_required'], r['vision'], r['review_delegation'], r['previous_handback_reason']) for r in starts
+		] == [(True, True, False, None), (None, False, False, 'step_done'), (False, False, False, 'step_done')]
+		assert not any(r['event'] == 'screenshot_decision_missing' for r in events)
+		assert not fake.errors
+	finally:
+		await close_driver(agent)
+
+
+async def test_smart_review_missing_fields_and_changed_vision(jev_browser, httpserver, tmp_path):
+	fake = _VisionJev(httpserver, [{'operation': op} for op in ('UNABLE', 'UNABLE', 'STEP_DONE', 'UNABLE')])
+	agent, executor, params = await start_stage(
+		jev_browser, httpserver, tmp_path, screenshot_policy='smart', checks=JevChecks(confidence='off')
+	)
+	try:
+		first = await routed(agent)
+		assert REVIEW_REMINDER in str(first.context_messages[-1].content)
+		assert not (await executor.delegate(params, jev_browser)).error
+		assert executor.runs[-1].review_delegation and executor.runs[-1].screenshot_declared is None
+		await routed(agent)
+		assert (await executor.delegate(params, jev_browser)).error
+
+		requested = DelegateSubgoalParamsSmart.model_validate(
+			{**params.model_dump(), 'screenshot_required': True, 'screenshot_reason': '  '}
+		)
+		assert not (await executor.delegate(requested, jev_browser)).error
+		done = await routed(agent)
+		assert REVIEW_REMINDER not in str(done.context_messages[-1].content)
+		default_reason = 'Planner requested the image without a specific reason.'
+		assert fake.requests[2]['state']['current_subgoal']['screenshot_guidance']['reason'] == default_reason
+		assert f'(requested by you: {default_reason})' in str(done.context_messages[-1].content)
+		assert (await executor.delegate(requested, jev_browser)).error
+		rejected = requested.model_copy(
+			update={'screenshot_required': False, 'screenshot_reason': None, 'review_note': 'The result is still missing.'}
+		)
+		assert not (await executor.delegate(rejected, jev_browser)).error
+		assert executor.runs[-1].review_delegation and executor.runs[-1].screenshot_declared is False
+		await routed(agent)
+		assert 'assets' not in fake.requests[-1]
+		executor.on_new_task()
+		assert not (await executor.delegate(params, jev_browser)).error
+		assert not executor.runs[-1].review_delegation
+		events = _events(tmp_path / 'trace.jsonl')
+		assert [(r['run_id'], r['previous_handback_reason']) for r in events if r['event'] == 'screenshot_decision_missing'] == [
+			('sg2', 'unable')
+		]
+		assert [(r['run_id'], r['screenshot_required']) for r in events if r['event'] == 'screenshot_reason_missing'] == [
+			('sg3', True),
+			('sg4', False),
+		]
+		assert [r['reason'] for r in events if r['event'] == 'delegate_refused'] == ['no_action_twice', 'review_note_missing']
+		assert not fake.errors
+	finally:
+		await close_driver(agent)
+
+
+async def test_smart_image_rejection_overrides_later_planner_requests(jev_browser, httpserver, tmp_path):
+	fake = _VisionJev(httpserver, [{'operation': 'CLICK', 'target': 'Enable'}, {'operation': 'UNABLE'}, {'operation': 'UNABLE'}])
+	agent, executor, params = await start_stage(
+		jev_browser,
+		httpserver,
+		tmp_path,
+		screenshot_policy='smart',
+		screenshot_fields={'screenshot_required': True, 'screenshot_reason': 'Identify the row by color.'},
+	)
+	try:
+		assert (await routed(agent)).model_output is not None
+		httpserver.expect_oneshot_request(
+			'/v1/systemone', method='POST', headers={'TypeSafe-Danger-Zone-Images': 'true'}
+		).respond_with_data(status=415)
+		first = await routed(agent)
+		assert 'disabled for this task after Jev rejected an image (HTTP 415); 1 of 2' in str(first.context_messages[-1].content)
+		assert REVIEW_REMINDER not in str(first.context_messages[-1].content)
+		assert not (await executor.delegate(params, jev_browser)).error
+		assert executor.runs[-1].screenshot_declared is True
+		second = await routed(agent)
+		assert 'disabled for this task after Jev rejected an image (HTTP 415); 0 of 1' in str(second.context_messages[-1].content)
+		assert REVIEW_REMINDER not in str(second.context_messages[-1].content)
+		rows = [r for r in _events(tmp_path / 'trace.jsonl') if r['event'] == 'system1_decision']
+		assert [r['vision_trigger'] for r in rows] == ['planner', 'planner', None, None]
+		assert rows[1]['outcome'] == rows[2]['fallback_from'] == 'vision_rejected'
+		assert 'screenshot_guidance' not in fake.requests[1]['state']['current_subgoal']
+		assert [req.mimetype for req, _ in httpserver.log if req.path == '/v1/systemone'] == [
+			'multipart/form-data',
+			'multipart/form-data',
+			'application/json',
+			'application/json',
+		]
+		assert executor.current_vision_trigger is None and not fake.errors
+	finally:
+		await close_driver(agent)
 
 
 async def test_rejected_image_falls_back_to_text_for_the_task(jev_browser, httpserver, tmp_path, monkeypatch):
@@ -343,7 +529,7 @@ async def test_rejected_image_falls_back_to_text_for_the_task(jev_browser, https
 			for r in events
 			if r['event'] in {'vision_rejected', 'vision_disabled'}
 		] == [('vision_rejected', 415, run.id, step), ('vision_disabled', 415, run.id, step)]
-		rejected, fallback = [r for r in events if r['event'] == 'system1_decision']
+		rejected, fallback = (r for r in events if r['event'] == 'system1_decision')
 		assert (rejected['outcome'], rejected['vision'], rejected['vision_trigger']) == ('vision_rejected', True, 'policy')
 		assert (fallback['outcome'], fallback['vision'], fallback['vision_trigger'], fallback['fallback_from']) == (
 			'execute',
@@ -422,7 +608,9 @@ async def test_last_attempt_image_rejection_falls_back(jev_browser, httpserver, 
 		await close_driver(agent)
 
 
-@pytest.mark.parametrize(('failure', 'attempts'), [(408, 1), (429, 3), (500, 1), (503, 3), ('transport', 3), ('malformed', 1)])
+@pytest.mark.parametrize(
+	('failure', 'attempts'), [(401, 1), (403, 1), (408, 1), (429, 3), (500, 1), (503, 3), ('transport', 3), ('malformed', 1)]
+)
 async def test_other_image_failures_keep_vision(jev_browser, httpserver, tmp_path, monkeypatch, failure, attempts):
 	monkeypatch.setattr(backends, 'JEV_RETRY_DELAYS', (0, 0))
 	agent, executor, params = await start_stage(jev_browser, httpserver, tmp_path, screenshot_policy='always')
@@ -451,7 +639,8 @@ async def test_other_image_failures_keep_vision(jev_browser, httpserver, tmp_pat
 					httpserver.expect_oneshot_request('/v1/systemone', method='POST').respond_with_data(
 						'not JSON' if failure == 'malformed' else '', status=200 if failure == 'malformed' else failure
 					)
-			assert (await routed(agent)).model_output is None
+			handback = await routed(agent)
+			assert handback.model_output is None and REVIEW_REMINDER not in str(handback.context_messages[-1].content)
 		failed = executor.runs[-1]
 		assert failed.handback and failed.handback.reason == 'system1_error'
 		assert (failed.decisions, failed.vision_decisions) == (1, 0)
@@ -528,7 +717,7 @@ async def test_cancelled_fallback_is_archived_as_text(jev_browser, httpserver, t
 		task.cancel()
 		with pytest.raises(asyncio.CancelledError):
 			await task
-		rejected, interrupted = [r for r in _events(tmp_path / 'trace.jsonl') if r['event'] == 'system1_decision']
+		rejected, interrupted = (r for r in _events(tmp_path / 'trace.jsonl') if r['event'] == 'system1_decision')
 		assert rejected['outcome'] == 'vision_rejected' and rejected['vision'] is True
 		assert interrupted['outcome'] == 'interrupted' and interrupted['fallback_from'] == 'vision_rejected'
 		assert interrupted['vision'] is False and interrupted['image_bytes'] == 0 and interrupted['vision_trigger'] is None
@@ -580,7 +769,9 @@ async def test_handbacks_use_actual_page_and_results(case, steps, limit, expecte
 	)
 	try:
 		for _ in range(len(steps) + 1):
-			if (await routed(agent)).model_output is None:
+			handback_result = await routed(agent)
+			if handback_result.model_output is None:
+				assert REVIEW_REMINDER not in str(handback_result.context_messages[-1].content)
 				break
 		handback = e.runs[-1].handback
 		assert handback and handback.reason == expected, handback

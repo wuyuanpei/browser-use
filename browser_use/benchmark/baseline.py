@@ -29,6 +29,7 @@ from .tasks import VERSION, CaseProbe, EnvironmentBlocked, task_catalog
 from .token_usage import TOKEN_FIELDS, aggregate_token_usage, token_usage
 
 TERMINAL = {'completed', 'cancelled', 'error', 'interrupted'}
+SCREENSHOT_DECISION_COUNTS = ('planner_screenshot_requests', 'review_delegations', 'screenshot_decisions_missing')
 CONFIRMED_SUCCESS = json.loads(Path(__file__).with_name('baseline_success.json').read_text(encoding='utf-8'))
 
 
@@ -149,6 +150,9 @@ class BaselineManager:
 			except (OSError, ValueError, TypeError):
 				continue
 		batch['token_usage'] = aggregate_token_usage(batch['attempts'])
+		for count in SCREENSHOT_DECISION_COUNTS:
+			if all(count in row for row in batch['attempts']):
+				batch[count] = sum(row[count] for row in batch['attempts'])
 		batch['task_token_usage'] = {
 			task: aggregate_token_usage([r for r in batch['attempts'] if r['task_id'] == task])
 			for task in dict.fromkeys(r['task_id'] for r in batch['attempts'])
@@ -340,6 +344,7 @@ class BaselineManager:
 					jev_calls=0,
 					vision_requests=0,
 					vision_disabled=None,
+					**dict.fromkeys(SCREENSHOT_DECISION_COUNTS, 0),
 					decision_calls=0,
 					decision_rounds=0,
 					system1_provider=config['provider'],
@@ -485,6 +490,7 @@ class BaselineManager:
 			'jev_calls',
 			'vision_requests',
 			'vision_disabled',
+			*SCREENSHOT_DECISION_COUNTS,
 			'text_calls',
 			'planner_calls',
 			'replans',
@@ -546,8 +552,8 @@ class BaselineManager:
 			'',
 			'| 任务 | 轮次 | 执行状态 / 评估状态 / 模型判决 | 动作 | '
 			'决策轮 / System1 / 文本 / Planner / 收集 / 总结 / 复核 '
-			'| 带图请求 | 拒图禁用（HTTP） | 改计划 | 耗时(ms) |',
-			'|---|---:|---|---:|---:|---:|---|---:|---:|',
+			'| 带图请求 | 拒图禁用（HTTP） | Planner 请求截图 | 复盘委托 | 复盘漏填 | 改计划 | 耗时(ms) |',
+			'|---|---:|---|---:|---:|---:|---|---:|---:|---:|---:|---:|',
 		]
 		for row in batch['attempts']:
 			final = (row.get('evaluation') or {}).get('final', {})
@@ -562,7 +568,9 @@ class BaselineManager:
 				f'{row.get("decision_calls", row["laya_calls"])} / {row["text_calls"]} / '
 				f'{row.get("planner_calls", 0)} / {row.get("collect_calls", 0)} / '
 				f'{row.get("summarize_calls", 0)} / {row.get("verify_calls", 0)} | '
-				f'{row.get("vision_requests", "—")} | {row.get("vision_disabled") or ""} | {row.get("replans", 0)} | '
+				f'{row.get("vision_requests", "—")} | {row.get("vision_disabled") or ""} | '
+				f'{row.get("planner_screenshot_requests", "—")} | {row.get("review_delegations", "—")} | '
+				f'{row.get("screenshot_decisions_missing", "—")} | {row.get("replans", 0)} | '
 				f'{row["elapsed_ms"]} |'
 			)
 		report += [
@@ -788,6 +796,7 @@ class BaselineManager:
 						jev_calls=roles['system1']['calls'],
 						vision_requests=roles['system1']['vision_requests'],
 						vision_disabled=snapshot.get('vision_disabled'),
+						**{count: snapshot[count] for count in SCREENSHOT_DECISION_COUNTS},
 						decision_calls=roles['system1']['calls'],
 						planner_calls=roles['planner']['calls'],
 						text_calls=roles['text']['calls'],

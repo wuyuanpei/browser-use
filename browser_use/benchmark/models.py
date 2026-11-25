@@ -10,6 +10,7 @@ from dotenv import dotenv_values
 from pydantic import BaseModel, ConfigDict, Field
 
 PROVIDER = 'browser_use'
+ExecutionMode = Literal['direct', 'isolated', 'collaborative']
 DEBUG_PROFILE = 'debug'
 FINAL_REPORT_PROFILE = 'final_report'
 DEEPSEEK_URL = 'https://api.deepseek.com/v1'
@@ -54,10 +55,17 @@ class RunSettings(BaseModel):
 	model_config = ConfigDict(frozen=True)
 
 	profile: Literal['debug', 'final_report']
+	execution_mode: ExecutionMode = 'direct'
+	jev: ModelEndpoint | None = None
 	execution: ExecutionModel
 	evaluation: EvaluationModel
 	headless: bool
 	user_data_dir: str | None
+
+	def system1_config(self) -> dict[str, str]:
+		if self.jev is not None:
+			return {'provider': 'jev', **self.jev.public()}
+		return {'provider': PROVIDER, **self.execution.public()}
 
 
 def load_environment():
@@ -73,7 +81,7 @@ def load_profile_environment(path: Path):
 		raise ValueError('Benchmark model profile configuration file does not exist')
 	prefixes = ('PLANNER_', 'TEXT_MODEL_', 'REPORT_TEXT_MODEL_', 'SYSTEM1_DEEPSEEK_')
 	for key, value in dotenv_values(path, encoding='utf-8-sig', interpolate=False).items():
-		if value is not None and (key in {'TEXT_MODEL', 'REPORT_TEXT_MODEL'} or key.startswith(prefixes)):
+		if value is not None and (key in {'TEXT_MODEL', 'REPORT_TEXT_MODEL', 'TYPESAFE_API_KEY'} or key.startswith(prefixes)):
 			os.environ[key] = value
 
 
@@ -148,13 +156,23 @@ def model_profiles() -> list[dict[str, Any]]:
 def runtime_settings(
 	provider=None, mode=None, screenshot_mode=False, *, screenshot_policy=None, model_profile=None
 ) -> RunSettings:
-	if mode not in (None, 'direct'):
-		raise ValueError('Browser Use 目前支持直接执行。旧记录中的 Planner 详情仍可查看。')
-	if provider not in (None, '', PROVIDER):
+	mode = 'direct' if mode is None else mode
+	if mode not in ('direct', 'isolated', 'collaborative'):
+		raise ValueError('execution_mode must be direct, isolated, or collaborative')
+	if provider not in (None, '', PROVIDER) and not (provider == 'jev' and mode != 'direct'):
 		raise ValueError('测试台使用 Browser Use 执行。')
 	policy = screenshot_policy if screenshot_policy is not None else 'always' if screenshot_mode else 'off'
 	if policy != 'off':
 		raise ValueError('当前两套 DeepSeek 配置使用文本输入，实时预览仍会生成。')
+	jev = None
+	if mode != 'direct':
+		from browser_use.agent.jev import JevSettings
+
+		key = os.getenv('TYPESAFE_API_KEY', '').strip()
+		if not key:
+			raise ValueError('Jev 执行需要服务器配置 TYPESAFE_API_KEY。')
+		defaults = JevSettings()
+		jev = ModelEndpoint(model=defaults.jev_model, base_url=defaults.jev_base_url, api_key=key)
 	profile = DEBUG_PROFILE if model_profile is None else model_profile
 	if profile not in (DEBUG_PROFILE, FINAL_REPORT_PROFILE):
 		raise ValueError('model_profile must be debug or final_report')
@@ -180,6 +198,8 @@ def runtime_settings(
 
 	return RunSettings(
 		profile=profile,
+		execution_mode=mode,
+		jev=jev,
 		execution=ExecutionModel(
 			model=endpoint.model, base_url=endpoint.base_url, api_key=endpoint.api_key, timeout=timeout, max_tokens=max_tokens
 		),

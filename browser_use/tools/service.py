@@ -2270,8 +2270,9 @@ Validated Code (after quote fixing):
 		Enable direct action calls like tools.navigate(url=..., browser_session=...).
 		This provides a simpler API for tests and direct usage while maintaining backward compatibility.
 		"""
-		# Check if this is a registered action
-		if name in self.registry.registry.actions:
+		# Shallow-copying a Tools instance probes attributes before its registry is installed.
+		registry = vars(self).get('registry')
+		if registry is not None and name in registry.registry.actions:
 			from typing import Union
 
 			from pydantic import create_model

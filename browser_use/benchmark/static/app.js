@@ -26,7 +26,7 @@ const percent = (value) => `${(value * 100).toFixed(value < 0.01 ? 1 : 0)}%`;
 let selectedCallId = null;
 let renderedQuestionContexts = null;
 const browserUseProvider = 'browser_use';
-const executionChoice = 'direct';
+let executionChoice = 'direct';
 const screenshotChoice = 'off';
 let modelProfiles = [], modelProfileChoice = 'debug';
 const modelProfileLabel = profile => ({ debug: '调试', final_report: '最终报告' })[profile] || '配置未记录';
@@ -48,13 +48,13 @@ function consumeModelProfile() {
 }
 const screenshotPolicy = record => record?.screenshot_policy || (record?.screenshot_mode ? 'always' : 'off');
 const screenshotLabel = policy => ({ off: '始终关闭', always: '始终开启', smart: '智能截图' })[policy] || '始终关闭';
-const modeLabel = mode => mode === 'planned' ? 'Planner 子任务' : '直接执行';
+const modeLabel = mode => ({ direct: 'BU 直接执行', isolated: 'Jev 隔离模式', collaborative: 'Jev 协作模式', planned: 'Planner 子任务' })[mode] || '直接执行';
 const handoffLabel = trigger => ({ initial: '初始规划', STEP_DONE: '完成检查', UNABLE: '无法推进',
   subgoal_action_budget: '子任务动作上限', subgoal_round_budget: '子任务决策上限',
   no_progress: '持续无进展', action_cycle: '重复操作', stale_observation: '观察失效' })[trigger] || trigger;
 const providerLabel = p => ({ laya: 'Laya', deepseek: 'DeepSeek', jev: 'Jev', fixture: '本地 fixture', browser_use: 'Browser Use' })[p] || 'Laya';
 const nativeProvider = provider => provider === 'fixture' || provider === 'browser_use';
-const callLabel = c => ({collect:'Collect helper · 页面摘要', summarize:'Summarize helper · 任务输出', verify:'Verify helper · 独立复核'})[c?.kind] || (c?.kind === 'planner' ? `Planner / ${handoffLabel(c.trigger)}` : c?.kind === 'text' ? 'Text helper' : c?.kind === 'deepseek' ? `DeepSeek (System1)${c.stage ? ` / 第 ${c.decision_round} 轮 / ${c.stage === 'operation' ? '操作选择' : '目标选择'}` : ''}` : jevScreenshot(c) ? 'Jev（截图）' : providerLabel(c?.kind));
+const callLabel = c => ({collect:'Collect helper · 页面摘要', summarize:'Summarize helper · 任务输出', summary:'页面摘要助手', answer:'最终答复助手', risk:'提交效果确认', other:'其他模型调用', verify:'Verify helper · 独立复核'})[c?.kind] || (c?.kind === 'planner' ? (c.trigger ? `Planner / ${handoffLabel(c.trigger)}` : 'Planner') : c?.kind === 'text' ? 'Text helper' : c?.kind === 'deepseek' ? `DeepSeek (System1)${c.stage ? ` / 第 ${c.decision_round} 轮 / ${c.stage === 'operation' ? '操作选择' : '目标选择'}` : ''}` : jevScreenshot(c) ? 'Jev（截图）' : providerLabel(c?.kind));
 const decisionCount = attempt => attempt?.decision_calls ?? ((attempt?.laya_calls || 0) + (attempt?.deepseek_calls || 0) + (attempt?.jev_calls || 0));
 const callCounts = a => `${decisionCount(a)} / ${a.text_calls || 0} / ${a.planner_calls || 0}<small>收集 ${a.collect_calls || 0} · 总结 ${a.summarize_calls || 0}</small><small>${a.decision_rounds ?? decisionCount(a)} 决策轮 · ${a.replans || 0} 次改计划</small>`;
 function tokenPanel(usage, title = 'Token 消耗', panelKey = 'tokens') {
@@ -253,7 +253,9 @@ function renderModelCalls() {
   const historyHTML = rows.length ? rows.map((call, index) => traceCard(call, index, call === selectedRow)).join('')
     : '<p class="muted">No model calls yet.</p>';
   stableHTML('history', historyHTML, `${view}/${selectedRunId}/${selectedAttemptId}/${state.started_at ?? state.goal ?? ''}`);
-  $("step-count").textContent = `${state.decision_rounds ?? state.decisions?.length ?? 0} rounds / ${calls.length} execution calls / ${state.history?.length || 0} actions`;
+  const roleUsage = state.jev_usage_by_role;
+  const actualRequests = roleUsage ? Object.values(roleUsage).reduce((n, role) => n + role.calls, 0) : calls.length;
+  $("step-count").textContent = `${state.decision_rounds ?? state.decisions?.length ?? 0} rounds / ${actualRequests} execution calls / ${state.history?.length || 0} actions`;
   $("selected-call").textContent = selected
     ? `${selectedRow?.label || callLabel(selected)} / Call ${selectedRow?.members.map(c => c.id).join(', ') || selected.id} / ${selected.model || selected.status}`
     : 'No call selected';
@@ -267,7 +269,7 @@ function renderModelCalls() {
     ? `<p class="context-total">${contexts.length} sequences / ${contexts.reduce((n, c) => n + c.input_tokens, 0)} input tokens total</p>` + contexts.map(c =>
       `<section class="question-context"><h3>${escape(c.question)}</h3><p class="context-metrics">Pass ${escape(c.pass)} / <strong>${escape(c.input_tokens)} / ${escape(c.max_tokens)} tokens</strong></p><pre>${escape(c.context)}</pre></section>`
     ).join('')
-    : nativeProvider(selected?.kind) || ['deepseek', 'planner', 'text', 'collect', 'summarize', 'verify'].includes(selected?.kind) ? `<pre data-panel="messages">${escape(JSON.stringify(selected.request?.messages || [], null, 2))}</pre>`
+    : nativeProvider(selected?.kind) || ['deepseek', 'planner', 'text', 'summary', 'answer', 'risk', 'other', 'collect', 'summarize', 'verify'].includes(selected?.kind) ? `<pre data-panel="messages">${escape(JSON.stringify(selected.request?.messages || [], null, 2))}</pre>`
     : selected?.kind === 'jev' ? `${requestImages(selected)}<pre>${escape(formatPayload({ state: selected.request?.state, questions: selected.request?.questions }))}</pre><p class="muted">Jev 服务端未提供最终编码上下文；此处为实际提交内容。${selected.request_format === 'multipart/form-data' ? ' 图片以 multipart 文件提交，HTTP 请求面板显示 JSON 部分。' : ''}</p>`
     : selected?.kind === 'laya' ? '<p class="muted">Per-question context unavailable in this response.</p>' : '';
   if (renderedQuestionContexts !== contextHTML) {
@@ -367,7 +369,7 @@ function renderPlanning() {
   const planned = state.execution_mode === 'planned';
   $('planning-panel').hidden = !planned;
   $('plan').hidden = planned;
-  $('planner-endpoint').hidden = !planned && executionChoice !== 'planned';
+  $('planner-endpoint').hidden = !planned && !['isolated', 'collaborative'].includes(state.execution_mode);
   $('planner-address').textContent = (state.planner || state.planner_default || freeState?.planner_default)?.base_url || 'Unavailable';
   $('planner-name').textContent = `Planner · ${(state.planner || state.planner_default || freeState?.planner_default)?.model || 'Unavailable'}`;
   // 旧 trace 不包含结构化计划，避免以新运行的计划填充历史。
@@ -449,14 +451,15 @@ function render() {
   if (!state) return;
   const provider = state.system1_provider || browserUseProvider;
   const native = nativeProvider(provider);
+  const buRun = native || ['isolated', 'collaborative'].includes(state.execution_mode);
   const config = provider === browserUseProvider ? modelProfiles.find(p => p.id === 'debug')?.planner : null;
   const policy = state.page ? screenshotPolicy(state) : screenshotChoice;
   const modelName = state.system1_model || config?.model;
   $('system1-name').textContent = `${native ? '执行 LLM' : 'System1'} · ${providerLabel(provider)}${modelName ? ' · '+modelName : ''}${policy !== 'off' ? ' · '+screenshotLabel(policy) : ''}`;
   $("laya-address").textContent = state.system1_base_url || config?.base_url || state.laya_base_url || freeState?.laya_base_url || "Unavailable";
   $("text-model-address").textContent = state.text_model_base_url || freeState?.text_model_base_url || "Unavailable";
-  $('text-model-name').textContent = `${native ? '终验模型' : 'Text model'} · ${state.text_model || freeState?.text_model || 'Unavailable'}`;
-  $("helper").textContent = `${native ? '终验模型' : 'Text helper'} · ${state.text_model || freeState?.text_model || 'Unavailable'}`;
+  $('text-model-name').textContent = `${buRun ? '终验模型' : 'Text model'} · ${state.text_model || freeState?.text_model || 'Unavailable'}`;
+  $("helper").textContent = `${buRun ? '终验模型' : 'Text helper'} · ${state.text_model || freeState?.text_model || 'Unavailable'}`;
   renderPlanning();
   $("plan").innerHTML = (state.plan || [])
     .map(
@@ -1094,10 +1097,18 @@ $('model-profile').addEventListener('change', () => {
   renderModelProfile();
 });
 $('execution-mode').value = executionChoice;
+$('execution-mode').addEventListener('change', () => {
+  executionChoice = $('execution-mode').value;
+});
 fetch("/api/state")
   .then((r) => r.json())
   .then((s) => {
     freeState = s;
+    for (const mode of ['isolated', 'collaborative']) {
+      const option = $('execution-mode').querySelector(`[value="${mode}"]`);
+      option.disabled = s.jev_configured === false;
+      if (option.disabled) option.title = '服务器需要配置 TYPESAFE_API_KEY';
+    }
     modelProfiles = s.model_profiles || [];
     renderModelProfile();
     if (view === 'free') { state = s; render(); }

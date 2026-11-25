@@ -4,16 +4,19 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import os
 import tempfile
 import threading
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Coroutine, Iterator
 from contextlib import contextmanager, suppress
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, TypeVar
+from uuid import uuid4
 
 from .decision_guard import decision_validity, read_document, same_document, stale_disposition, target_guard
 from .models import PROVIDER, RunSettings, redact_secrets
@@ -32,6 +35,7 @@ if TYPE_CHECKING:
 MAX_STEPS = 100
 VIEWPORT = {'width': 1366, 'height': 780}
 BrowserMode = Literal['isolated', 'attached_chrome']
+_Result = TypeVar('_Result')
 
 
 class RunCancelled(RuntimeError):
@@ -105,8 +109,10 @@ class _BrowserLoop:
 			self.loop.run_until_complete(self.loop.shutdown_asyncgens())
 			self.loop.close()
 
-	def run(self, operation, *, cancel=None, timeout=90):
-		async def bounded():
+	def run(
+		self, operation: Coroutine[Any, Any, _Result], *, cancel: Callable[[], str | None] | None = None, timeout: float = 90
+	) -> _Result:
+		async def bounded() -> _Result:
 			if cancel is None:
 				return await asyncio.wait_for(operation, timeout=timeout)
 			task = asyncio.create_task(operation)
@@ -200,19 +206,26 @@ class BrowserUseRun:
 		should_cancel: Callable[[], str | None] | None = None,
 		probe: CaseProbe | None = None,
 		record_dir: Path | None = None,
+		jev_artifact_dir: Path | None = None,
 		chrome: ChromeAttachment | None = None,
 	):
-		self._secrets = (settings.execution.api_key, settings.evaluation.api_key)
+		self._secrets = (settings.execution.api_key, settings.evaluation.api_key, settings.jev.api_key if settings.jev else None)
 		self._on_event, self._should_cancel, self._probe = on_event, should_cancel, probe
 		self._record_dir = record_dir
 		self._chrome = chrome
 		self._stale_streak: list[str] = []
+		self._jev_dir = None
+		if settings.jev is not None:
+			self._jev_dir = jev_artifact_dir or Path.cwd() / 'artifacts' / 'jev-runs' / uuid4().hex
+			self._jev_dir.mkdir(parents=True, exist_ok=True)
+		self._model_role: ContextVar[str | None] = ContextVar('benchmark_jev_model_role', default=None)
+		config = settings.system1_config()
 		self._state: dict[str, Any] = dict(
 			goal=goal,
-			system1_provider=PROVIDER,
-			system1_model=settings.execution.model,
-			system1_base_url=settings.execution.public()['base_url'],
-			execution_mode='direct',
+			system1_provider=config['provider'],
+			system1_model=config['model'],
+			system1_base_url=config['base_url'],
+			execution_mode=settings.execution_mode,
 			screenshot_mode=False,
 			screenshot_policy='off',
 			model_profile=settings.profile,
@@ -238,6 +251,8 @@ class BrowserUseRun:
 			record=bool(record_dir),
 			free_step_supported=True,
 		)
+		if self._jev_dir is not None:
+			self._state.update(jev_trace_path=str(self._jev_dir / 'jev_trace.jsonl'), planner=settings.execution.public())
 		if scenario is not None:
 			self._state['scenario'] = scenario
 		self._started = time.monotonic()
@@ -278,9 +293,11 @@ class BrowserUseRun:
 			self._on_event(RunEvent(name, payload, self.snapshot(), preview))
 
 	def snapshot(self) -> dict[str, Any]:
+		executor = getattr(self._native, '_jev', None)
 		return redact_secrets(
 			{
 				**self._state,
+				**({'jev_usage_by_role': executor.usage_by_role()} if executor is not None else {}),
 				'token_usage': token_usage(self._state['model_calls']),
 				'elements': indexed_elements(self._state['page'].get('actions', [])),
 			},
@@ -348,7 +365,9 @@ class BrowserUseRun:
 
 		async def traced(messages, output_format=None, **kwargs):
 			request = dict(model=execution.model, messages=[message.model_dump(mode='json') for message in messages])
-			with self.model_call(PROVIDER, model=execution.model, request=request) as record:
+			role = self._model_role.get()
+			kind = role or PROVIDER
+			with self.model_call(kind, model=execution.model, request=request, **({'role': role} if role else {})) as record:
 				reply = await original(messages, output_format=output_format, **kwargs)
 				record['response'] = reply.model_dump(mode='json', exclude_none=True)
 				return reply
@@ -358,6 +377,19 @@ class BrowserUseRun:
 			return False
 
 		object.__setattr__(llm, 'ainvoke', traced)
+		jev_config = {}
+		if settings.jev is not None and self._jev_dir is not None:
+			from browser_use.agent.jev import JevSettings
+
+			assert settings.execution_mode in ('isolated', 'collaborative')
+			jev_config['jev'] = JevSettings(
+				mode=settings.execution_mode,
+				jev_base_url=settings.jev.base_url,
+				jev_model=settings.jev.model,
+				jev_api_key=settings.jev.api_key,
+				trace_path=self._jev_dir / 'jev_trace.jsonl',
+				capture_dir=self._jev_dir / 'jev_captures',
+			)
 		self._native = Agent(
 			task=self._state['goal'],
 			llm=llm,
@@ -371,7 +403,10 @@ class BrowserUseRun:
 			max_actions_per_step=1,
 			enable_planning=False,
 			file_system_path=str(Path(self._temp.name) / 'agent-files'),
+			**jev_config,
 		)
+		if executor := getattr(self._native, '_jev', None):
+			self._trace_jev_calls(executor)
 		self._check_cancelled()
 		self._browser_start_dispatched = True
 		if self._chrome is None:
@@ -380,6 +415,39 @@ class BrowserUseRun:
 		await browser.navigate_to(url)
 		self._check_cancelled()
 		await self._browser.bind()
+
+	def _trace_jev_calls(self, executor):
+		"""Capture actual requests on this run's native clients; the executor owns costs and roles."""
+		invoke = executor.usage.invoke
+
+		async def with_role(step, role, llm, messages, **kwargs):
+			token = self._model_role.set(role)
+			try:
+				return await invoke(step, role, llm, messages, **kwargs)
+			finally:
+				self._model_role.reset(token)
+
+		executor.usage.invoke = with_role
+		ask = executor.backend.ask
+		model = self._state['system1_model']
+
+		async def capture_jev(state, questions):
+			request = {'model': model, 'state': state, 'questions': questions}
+			with self.model_call('jev', role='system1', model=model, request=request, bu_step=executor.step) as record:
+				try:
+					reply = await ask(state, questions)
+				except BaseException as error:
+					record['attempts'] = getattr(error, 'attempts', getattr(executor.backend, 'last_attempts', []))
+					raise
+				record['attempts'] = reply.attempts
+				record['response'] = {
+					'model': reply.model,
+					'answers': json.loads(reply.model_dump_json(include={'answers'}))['answers'],
+					'usage': {'input_tokens': reply.input_tokens, 'output_tokens': reply.output_tokens},
+				}
+				return reply
+
+		executor.backend.ask = capture_jev
 
 	def observe(self, phase: str = 'step', reason: str | None = None):
 		page = self._browser.observe()
@@ -499,8 +567,18 @@ class BrowserUseRun:
 	def _choose(self):
 		if self._state['decision_rounds'] >= MAX_STEPS:
 			raise RunCancelled('timeout')
+		calls_before = len(self._state['model_calls'])
 		raw, operation, target, guard, document, stable = self._bridge.run(
 			self._predict(), cancel=self._should_cancel, timeout=150
+		)
+		executor = getattr(self._native, '_jev', None)
+		source = executor.step_source() if executor is not None else 'llm'
+		role = 'system1' if source == 'system1' else 'planner'
+		calls = self._state['model_calls'][calls_before:]
+		call = (
+			next((c for c in reversed(calls) if c.get('role') == role), None)
+			if executor is not None
+			else next((c for c in reversed(calls) if c['kind'] == PROVIDER), None)
 		)
 		decision = dict(
 			operation=operation,
@@ -510,7 +588,9 @@ class BrowserUseRun:
 			target_guard=guard,
 			document_guard=document,
 			document_stable_during_capture=stable,
-			provider=self._state['system1_provider'],
+			provider='jev' if source == 'system1' else PROVIDER,
+			decision_source=source,
+			model_call_id=call['id'] if call is not None else None,
 			fingerprint=self._state['page']['fingerprint'],
 			observation_index=self._state['observation_index'],
 			probabilities={},
@@ -518,8 +598,20 @@ class BrowserUseRun:
 		self._state['decisions'].append(decision)
 		self._state['decision_rounds'] += 1
 		self._state.update(decision=decision, status='predicted')
-		if self._state['model_calls']:
-			self._state['model_calls'][-1].update(decision=decision, operation=operation, target=target)
+		if call is not None:
+			if source == 'system1':
+				answers = call['response']['answers']
+				selected = answers['operation']
+				target_answer = answers.get(selected['choice'].lower() + '_target') or {}
+				decision.update(
+					system1_operation=selected['choice'],
+					operation_probabilities=selected.get('probabilities', {}),
+					target_confidence=target_answer.get('confidence'),
+					native_target_key=target_answer.get('choice'),
+					native_target_probabilities=target_answer.get('probabilities'),
+					latency_ms=call['latency_ms'],
+				)
+			call.update(decision=decision, operation=operation, target=target)
 		self._emit('decision', decision=decision)
 
 	def _execute(self, expected_fingerprint):
@@ -559,6 +651,8 @@ class BrowserUseRun:
 		action = dict(
 			kind=operation,
 			operation=operation,
+			decision_source=decision.get('decision_source'),
+			model_call_id=decision.get('model_call_id'),
 			target=decision['target'],
 			label=decision['target'],
 			native_action=decision['native_action'],
@@ -581,10 +675,11 @@ class BrowserUseRun:
 			raise
 		result = results[-1] if results else {}
 		action.update(result=results, elapsed_ms=round((time.monotonic() - self._started) * 1000))
-		if operation != 'done':
+		if operation not in {'done', 'finish'}:
 			self._state['history'].append(action)
 		self._emit('action_executed', action=action)
 		if result.get('is_done'):
+			self.finish_execution()
 			answer = result.get('extracted_content') or result.get('long_term_memory') or ''
 			self._state.update(
 				status='blocked' if result.get('success') is False else 'done', plan_index=1, result={'markdown': answer}
@@ -606,9 +701,17 @@ class BrowserUseRun:
 				self._bridge.close()
 			self._temp.cleanup()
 
+	def finish_execution(self):
+		"""Flush Jev's last action outcome and role totals while the test page is still observable."""
+		executor = getattr(self._native, '_jev', None)
+		if executor is not None:
+			self._bridge.run(executor.aclose(), timeout=20)
+
 	async def _close_browser(self):
 		try:
 			if self._native is not None:
+				if executor := getattr(self._native, '_jev', None):
+					await executor.aclose()
 				await self._native.eventbus.stop(clear=True, timeout=1)
 		finally:
 			browser = self._browser.native

@@ -74,6 +74,7 @@ def response_state():
 		'model_profile': state.get('model_profile', DEBUG_PROFILE),
 		'model_profile_default': DEBUG_PROFILE,
 		'model_profiles': profiles,
+		'jev_configured': bool(os.getenv('TYPESAFE_API_KEY', '').strip()),
 		'server_runtime': {
 			'process_id': os.getpid(),
 			'observation_sha256': hashlib.sha256(READ_STATE.encode()).hexdigest(),

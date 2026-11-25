@@ -2,6 +2,7 @@
 
 TOKEN_FIELDS = (
 	'jev_input_tokens',
+	'jev_output_tokens',
 	'planner_input_tokens',
 	'planner_output_tokens',
 	'planner_total_tokens',
@@ -25,7 +26,7 @@ def token_usage(calls):
 			else 'planner'
 			if kind == 'planner'
 			else 'other'
-			if kind in {'text', 'summarize', 'collect', 'deepseek', 'browser_use'}
+			if kind in {'text', 'summarize', 'collect', 'summary', 'answer', 'risk', 'other', 'deepseek', 'browser_use'}
 			else None
 		)
 		if group is None:
@@ -41,11 +42,14 @@ def token_usage(calls):
 					result['other_cached_input_tokens'] += cached
 					break
 		incomplete = False
+		if group == 'jev' and call.get('role') == 'system1':
+			# One inspected decision can include multiple billable HTTP attempts.
+			missing += max(0, len(call.get('attempts') or []) - 1)
 		for direction, aliases in (
 			('input', ('input_tokens', 'prompt_tokens')),
 			('output', ('output_tokens', 'completion_tokens')),
 		):
-			if group == 'jev' and direction == 'output':
+			if group == 'jev' and direction == 'output' and 'output_tokens' not in usage and call.get('role') != 'system1':
 				continue
 			value = next((usage[k] for k in aliases if type(usage.get(k)) is int and usage[k] >= 0), None)
 			if value is None:
@@ -53,7 +57,7 @@ def token_usage(calls):
 			else:
 				result[f'{group}_{direction}_tokens'] += value
 		missing += incomplete
-	result['jev_total_tokens'] = result['jev_input_tokens']
+	result['jev_total_tokens'] = result['jev_input_tokens'] + result['jev_output_tokens']
 	for group in ('planner', 'other'):
 		result[f'{group}_total_tokens'] = result[f'{group}_input_tokens'] + result[f'{group}_output_tokens']
 	result['llm_total_tokens'] = result['planner_total_tokens'] + result['other_total_tokens']
@@ -68,5 +72,5 @@ def aggregate_token_usage(attempts):
 			result['unavailable_attempts'] += 1
 			continue
 		for field in (*TOKEN_FIELDS, 'missing_usage_calls'):
-			result[field] += usage.get(field, 0) if field == 'other_cached_input_tokens' else usage[field]
+			result[field] += usage.get(field, 0) if field in ('other_cached_input_tokens', 'jev_output_tokens') else usage[field]
 	return {**result, 'complete': not (result['missing_usage_calls'] or result['unavailable_attempts'])}

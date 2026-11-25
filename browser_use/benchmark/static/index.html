@@ -44,10 +44,11 @@
             <button id="screenshot-smart" type="button" aria-pressed="false" disabled>智能开关</button>
           </div>
         </div>
-        <label for="execution-mode">执行模式(暂不支持)</label>
+        <label for="execution-mode">执行模式</label>
         <select id="execution-mode">
-          <option value="direct" selected>直接执行</option>
-          <option value="planned" disabled>Planner 子任务</option>
+          <option value="direct" selected>BU 直接执行</option>
+          <option value="isolated">Jev 隔离模式</option>
+          <option value="collaborative">Jev 协作模式</option>
         </select>
         <label for="model-profile">下次运行配置</label>
         <select id="model-profile" aria-describedby="model-profile-hint">
@@ -56,7 +57,7 @@
         </select>
         <span id="model-profile-current" class="muted"></span>
         <span id="model-profile-hint" class="muted">默认使用调试配置；最终报告配置仅用于本次显式选择的运行。</span>
-        <span id="screenshot-mode-hint" class="muted">Browser Use 当前使用文本直接执行，实时预览独立保存。</span>
+        <span id="screenshot-mode-hint" class="muted">模型使用文本输入，实时预览独立保存。</span>
       </div>
       <nav class="view-tabs" role="tablist" aria-label="任务模式">
         <button type="button" id="free-tab" role="tab" aria-controls="free-panel" aria-selected="true">自由任务</button>

@@ -1,4 +1,5 @@
 import importlib.resources
+import logging
 from datetime import datetime
 from typing import TYPE_CHECKING, Literal, Optional
 
@@ -36,6 +37,7 @@ class SystemPrompt:
 		is_anthropic: bool = False,
 		is_browser_use_model: bool = False,
 		model_name: str | None = None,
+		jev_mode: Literal['isolated', 'collaborative'] | None = None,
 	):
 		self.max_actions_per_step = max_actions_per_step
 		self.use_thinking = use_thinking
@@ -43,26 +45,46 @@ class SystemPrompt:
 		self.is_anthropic = is_anthropic
 		self.is_browser_use_model = is_browser_use_model
 		self.model_name = model_name
+		self.jev_mode = jev_mode
 		# Check if this is an Anthropic 4.5 model that needs longer prompts for caching
 		self.is_anthropic_4_5 = _is_anthropic_4_5_model(model_name)
 		prompt = ''
 		if override_system_message is not None:
 			prompt = override_system_message
+			if jev_mode is not None:
+				self._log_jev_override_system_message()
 		else:
 			self._load_prompt_template()
 			prompt = self.prompt_template.format(max_actions=self.max_actions_per_step)
+			if jev_mode == 'collaborative':
+				from browser_use.agent.jev.prompts import COLLABORATIVE_EXTENSION
+
+				prompt += f'\n{COLLABORATIVE_EXTENSION}'
 
 		if extend_system_message:
 			prompt += f'\n{extend_system_message}'
 
 		self.system_message = SystemMessage(content=prompt, cache=True)
 
+	@staticmethod
+	def _log_jev_override_system_message() -> None:
+		logging.getLogger(__name__).warning(
+			'Custom system message supplied. Include the Jev planner and verification rules in the override.'
+		)
+
 	def _load_prompt_template(self) -> None:
 		"""Load the prompt template from the markdown file."""
 		try:
 			# Choose the appropriate template based on model type and mode
 			# Browser-use models use simplified prompts optimized for fine-tuned models
-			if self.is_browser_use_model:
+			if self.jev_mode == 'isolated':
+				if self.flash_mode:
+					template_filename = 'system_prompt_planner_flash.md'
+				elif self.use_thinking:
+					template_filename = 'system_prompt_planner.md'
+				else:
+					template_filename = 'system_prompt_planner_no_thinking.md'
+			elif self.is_browser_use_model:
 				if self.flash_mode:
 					template_filename = 'system_prompt_browser_use_flash.md'
 				elif self.use_thinking:

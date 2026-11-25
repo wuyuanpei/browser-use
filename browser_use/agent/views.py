@@ -362,6 +362,7 @@ class RerunSummaryAction(BaseModel):
 class StepMetadata(BaseModel):
 	"""Metadata for a single step including timing and token information"""
 
+	decision_source: Literal['llm', 'system1'] = 'llm'
 	step_start_time: float
 	step_end_time: float
 	step_number: int

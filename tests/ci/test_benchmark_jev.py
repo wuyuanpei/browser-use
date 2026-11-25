@@ -2,12 +2,15 @@
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 from pytest_httpserver import HTTPServer
 from werkzeug.wrappers import Response
 
-from browser_use.benchmark.engine import BrowserUseRun
+from browser_use.benchmark.chrome_attachment import _OwnedClient
+from browser_use.benchmark.engine import BrowserUnavailable, BrowserUseRun
 from browser_use.benchmark.models import (
 	EvaluationModel,
 	ExecutionModel,
@@ -17,6 +20,69 @@ from browser_use.benchmark.models import (
 	runtime_settings,
 )
 from browser_use.benchmark.token_usage import aggregate_token_usage, token_usage
+
+
+@pytest.mark.parametrize('actual_context', ['dashboard', 'other'])
+async def test_chrome_120_default_tab_requires_dashboard_context(actual_context, monkeypatch):
+	client = _OwnedClient('ws://127.0.0.1', 'http://127.0.0.1:8824')
+	client.context_id = 'dashboard'
+	unsupported_id = RuntimeError({'code': -32000, 'message': 'Failed to find browser context with id dashboard'})
+	request = AsyncMock(
+		side_effect=[
+			unsupported_id,
+			{'targetId': 'new'},
+			{'targetInfo': {'url': 'about:blank', 'browserContextId': actual_context}},
+			{},
+		]
+	)
+	monkeypatch.setattr(client, '_request', request)
+	cleanup = AsyncMock()
+	monkeypatch.setattr(client, 'close_case', cleanup)
+	if actual_context == 'dashboard':
+		assert await client.new_page() == 'new'
+		assert request.await_args_list[-1].args == ('Target.attachToTarget', {'targetId': 'new', 'flatten': True})
+	else:
+		with pytest.raises(BrowserUnavailable, match='未落在测试台所在的 Chrome 资料'):
+			await client.new_page()
+		cleanup.assert_awaited_once()
+		assert request.await_count == 3
+	assert request.await_args_list[1].args == ('Target.createTarget', {'url': 'about:blank', 'background': True})
+
+
+@pytest.mark.parametrize('recover', [True, False])
+def test_workbench_resamples_unavailable_document_once(monkeypatch, recover):
+	from browser_use.benchmark.engine import _BoundBrowser
+
+	browser = _BoundBrowser(SimpleNamespace(run=lambda call: call))
+	monkeypatch.setattr(browser, 'bind', lambda: 'owned-tab')
+	pages = [None, {'url': 'about:blank', 'text': '', 'actions': []} if recover else None]
+	calls = []
+
+	def sample(_script):
+		calls.append(True)
+		return pages.pop(0)
+
+	monkeypatch.setattr(browser, 'evaluate', sample)
+	if recover:
+		assert browser.observe()['target_id'] == 'owned-tab'
+	else:
+		with pytest.raises(RuntimeError, match='Browser document is unavailable'):
+			browser.observe()
+	assert len(calls) == 2
+
+
+def test_workbench_explains_prediction_deadline_before_dispatch(monkeypatch):
+	def expire(operation, **_kwargs):
+		operation.close()
+		raise TimeoutError
+
+	run = object.__new__(BrowserUseRun)
+	monkeypatch.setattr(run, '_bridge', SimpleNamespace(run=expire), raising=False)
+	run._state = {'decision_rounds': 0, 'model_calls': []}
+	run._should_cancel = None
+	with pytest.raises(TimeoutError, match='prediction timed out before dispatch'):
+		run._choose()
+	assert run._state['decision_rounds'] == 0
 
 
 def test_modes_and_model_profiles_are_independent(monkeypatch, tmp_path: Path):
@@ -81,8 +147,25 @@ def test_workbench_real_page_repredicts_and_keeps_per_role_evidence(
 		tool = body['tool_choice']['function']['name']
 		if tool == 'AnswerReply':
 			action = {'text': 'The page shows Saved.'}
-		elif any(message['role'] == 'user' and '<system1_handback>' in str(message['content']) for message in body['messages']):
-			action = {'action': [{'finish': {'success': True, 'reason': 'Observed Saved'}}]}
+		elif handbacks := [
+			message
+			for message in body['messages']
+			if message['role'] == 'user' and '<system1_handback>' in str(message['content'])
+		]:
+			if 'sg2' in str(handbacks[-1]['content']):
+				action = {'action': [{'finish': {'success': True, 'reason': 'Observed Saved'}}]}
+			else:
+				action = {
+					'action': [
+						{
+							'delegate_subgoal': {
+								'objective': 'Verify the save',
+								'completion': 'Saved is visible',
+								'reason': 'Check the result',
+							}
+						}
+					]
+				}
 		else:
 			action = {
 				'action': [
@@ -157,15 +240,35 @@ def test_workbench_real_page_repredicts_and_keeps_per_role_evidence(
 		jev_artifact_dir=tmp_path / 'attempt',
 	)
 	try:
+		native = run._native
+		assert native is not None
+		predict = native._get_next_action
+		timeout = True
+
+		async def time_out_once(summary):
+			nonlocal timeout
+			if timeout:
+				timeout = False
+				raise TimeoutError('simulated planner call timeout')
+			await predict(summary)
+
+		monkeypatch.setattr(native, '_get_next_action', time_out_once)
 		first = run.command('tick')
+		assert not timeout
 		assert first['history'][-1]['operation'] == 'delegate_subgoal'
+		run.record_timeout_evidence()
+		partial = run.snapshot()
+		assert not partial.get('result')
+		assert 'Save work' in partial['partial_result']['markdown'] or 'Ready' in partial['partial_result']['markdown']
 		discarded = run.command('predict')['decision']
 		assert discarded['decision_source'] == 'system1'
 		run._browser.evaluate("history.replaceState(null,'','?after=stale')")
 		retry = run.command('act')
 		assert retry['stale_retries'] == 1 and not saved
 		run.command('tick')
+		run.command('tick')
 		final = run.command('tick')
+		assert final['replans'] == 1
 		assert final['status'] == 'done' and final['result']['markdown'] == 'The page shows Saved.' and len(saved) == 1
 		assert run._browser.evaluate("document.querySelector('output').textContent") == 'Saved'
 		assert final['execution_mode'] == 'isolated' and final['system1_provider'] == 'jev'
@@ -177,8 +280,8 @@ def test_workbench_real_page_repredicts_and_keeps_per_role_evidence(
 		answer_call = next(c for c in calls.values() if c['role'] == 'answer')
 		assert 'decision' not in answer_call
 		roles = final['jev_usage_by_role']
-		assert (roles['planner']['calls'], roles['system1']['calls'], roles['answer']['calls']) == (2, 3, 1)
-		assert roles['system1']['prompt_tokens'] == 75 and final['token_usage']['jev_total_tokens'] == 81
+		assert (roles['planner']['calls'], roles['system1']['calls'], roles['answer']['calls']) == (3, 4, 1)
+		assert roles['system1']['prompt_tokens'] == 100 and final['token_usage']['jev_total_tokens'] == 108
 		events = [json.loads(line) for line in Path(final['jev_trace_path']).read_text(encoding='utf-8').splitlines()]
 		assert events[-1]['event'] == 'usage_summary'
 		assert [e['status'] for e in events if e['event'] == 'action_result'] == ['discarded', 'executed_ok']

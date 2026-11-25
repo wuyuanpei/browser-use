@@ -115,10 +115,15 @@ class _OwnedClient(TimeoutWrappedCDPClient):
 	async def new_page(self) -> str:
 		if not self.context_id:
 			raise BrowserUnavailable('尚未确定 Chrome 测试台资料。')
+		blank = {'url': 'about:blank', 'background': True}
 		try:
-			reply = await self._request(
-				'Target.createTarget', {'url': 'about:blank', 'background': True, 'browserContextId': self.context_id}
-			)
+			try:
+				reply = await self._request('Target.createTarget', {**blank, 'browserContextId': self.context_id})
+			except RuntimeError as error:
+				# Chrome 120 reports the default profile ID but rejects it as an explicit creation parameter.
+				if error.args != ({'code': -32000, 'message': f'Failed to find browser context with id {self.context_id}'},):
+					raise
+				reply = await self._request('Target.createTarget', blank)
 		except Exception:
 			raise BrowserUnavailable('无法在测试台所在的 Chrome 资料中创建标签。') from None
 		target_id = reply['targetId']

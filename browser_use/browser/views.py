@@ -110,6 +110,7 @@ class BrowserStateSummary:
 	pagination_buttons: list[PaginationButton] = field(default_factory=list)  # Detected pagination buttons
 	closed_popup_messages: list[str] = field(default_factory=list)  # Messages from auto-closed JavaScript dialogs
 	state_error: str | None = None  # Safe, model-visible explanation when the current state could not be captured
+	jev_viewport: dict[str, Any] | None = field(default=None, repr=False)
 
 
 @dataclass

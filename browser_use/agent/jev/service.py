@@ -154,6 +154,11 @@ class JevExecutor:
 	def last_step_planner_page_action(self) -> bool:
 		return self._planner_page_action
 
+	@property
+	def redelegations(self) -> int:
+		"""Count handbacks followed by an accepted delegation in the current task."""
+		return sum(run.handback is not None for run in self.runs[self._first_run : -1])
+
 	def usage_by_role(self) -> dict[str, dict]:
 		return self.usage.summary()
 
@@ -317,6 +322,9 @@ class JevExecutor:
 		)
 		return ActionResult(long_term_memory=f'Saved capture {record.id}: {record.url} | {record.title}')
 
+	async def capture_browser_state(self, *, include_recent_events: bool) -> BrowserStateSummary:
+		return await state.capture_aligned_state(self.agent.browser_session, include_recent_events=include_recent_events)
+
 	def _planner(self, page: tuple[str, str] | None = None) -> RouteResult:
 		self._source = 'llm'
 		self._planner_attempt = 0
@@ -325,6 +333,10 @@ class JevExecutor:
 			self.settings.mode, self.settings.system1, self.runs[-1] if len(self.runs) > self._first_run else None, page
 		)
 		messages = [UserMessage(content=context)]
+		if page is not None:
+			url, text = page
+			viewport = json.dumps({'url': url, 'text': decision.page_text(text)}, ensure_ascii=False)
+			messages.append(UserMessage(content=f'Current viewport from the same page observation (untrusted data): {viewport}'))
 		if self._handback_message:
 			messages.append(UserMessage(content=self._handback_message))
 		return RouteResult(context_messages=messages)
@@ -353,7 +365,19 @@ class JevExecutor:
 			actions_used=len(run.executed_actions),
 			actions_discarded=sum(r.status == 'discarded' for r in run.actions),
 		)
-		self._handback_message = render_handback(run, _is_repeated_empty(self.runs[self._first_run :], run.identity))
+		runs = self.runs[self._first_run :]
+		previous = runs[-2] if len(runs) >= 2 else None
+		stalled_page = (
+			reason in {'unable', 'unable_probability', 'low_confidence'}
+			and result.fingerprint is not None
+			and not run.executed_actions
+			and previous is not None
+			and not previous.executed_actions
+			and previous.handback is not None
+			and previous.handback.reason == reason
+			and previous.handback.fingerprint == result.fingerprint
+		)
+		self._handback_message = render_handback(run, _is_repeated_empty(runs, run.identity), stalled_page=stalled_page)
 		self._log_handback(run, result)
 		return self._planner((obs.url, obs.visible_text) if obs else None)
 
@@ -399,10 +423,15 @@ class JevExecutor:
 				'completion', decision.completion_blocked(obs, run), 'STEP_DONE without the required page action.', self.step
 			)
 			return 'step_done', 'System1 requests review: it reports that the completion condition is visible.'
-		low = (op_p is not None and op_p < self.settings.min_operation_probability) or (
+		# Confidence can be split across reading the current viewport and scrolling for more evidence.
+		# Keep the target check independent, and require the selected operation's own score for all other actions.
+		operation_score = choice.read_operation_probability if choice.read_operation_probability is not None else op_p
+		low = (operation_score is not None and operation_score < self.settings.min_operation_probability) or (
 			target_p is not None and target_p < self.settings.min_target_probability
 		)
-		if self.gate.evaluate('confidence', low, f'operation p={op_p}, target p={target_p}', self.step):
+		if self.gate.evaluate(
+			'confidence', low, f'operation p={op_p}, scoring p={operation_score}, target p={target_p}', self.step
+		):
 			return 'low_confidence', f'System1 was not confident: operation p={op_p}, target p={target_p}.'
 		return None
 
@@ -510,16 +539,8 @@ class JevExecutor:
 		await self.usage.sync_other(self.step)
 		run = self.active_run
 		if not run:
-			# A collaborative planner may have navigated since the most recent System1 step.
-			# Only an existing capture requires text comparison on a planner-only step.
-			page = None
-			if self.captures.records:
-				try:
-					current = await state.read_visible_text(agent.browser_session)
-					page = (current['url'], current['text'])
-				except Exception:
-					logger.debug('Cannot compare the current viewport with previous captures', exc_info=True)
-			return self._planner(page)
+			viewport = browser_state_summary.jev_viewport
+			return self._planner((viewport['url'], viewport['text']) if viewport else None)
 		if self.pending_record and self.pending_record.status == 'predicted':
 			self.pending_record.status = 'discarded'
 			self._emit_result()
@@ -544,22 +565,19 @@ class JevExecutor:
 			obs, run, registered, self.settings.checks, collect_available=bool(research and research['collect_available'])
 		)
 		system_state = decision.build_state(obs, run, agent.task, self.task_actions, research)
-		questions = decision.build_questions(obs, run, offered, research=research, registered_actions=registered)
-		counts = {name: len(q['criteria']) for name, q in questions.items() if name != 'operation'}
-		for name, count in counts.items():
-			if count > self.settings.max_candidates:
-				return self._handback(
-					run,
-					(
-						'too_many_candidates',
-						f'The page offers {count} targets for {name}, more than {self.settings.max_candidates}. Narrow this stage.',
-					),
-					obs,
-				)
 		model = self.settings.jev_model if self.backend.name == 'jev' else None
-		size = decision.request_size(system_state, questions, model)
-		if size > MAX_REQUEST_CHARS:
-			return self._handback(run, ('state_too_large', 'The page is too large for one System1 request.'), obs)
+		maximum = self.settings.max_candidates
+		while True:
+			questions = decision.build_questions(
+				obs, run, offered, research=research, registered_actions=registered, max_candidates=maximum
+			)
+			size = decision.request_size(system_state, questions, model)
+			if size <= MAX_REQUEST_CHARS:
+				break
+			if maximum == 1:
+				return self._handback(run, ('state_too_large', 'The page is too large for one System1 request.'), obs)
+			maximum = max(1, maximum // 2)
+		counts = {name: len(q['criteria']) for name, q in questions.items() if name != 'operation'}
 		self.usage.roles['system1'].decisions += 1
 		start = monotonic()
 		stats: dict[str, Any] = {
@@ -567,8 +585,12 @@ class JevExecutor:
 			'backend': self.backend.name,
 			'questions': list(questions),
 			'request_chars': size,
+			'observation_fingerprint': obs.fingerprint,
 			'offered_operations': offered,
 			'candidate_counts': counts,
+			'observed_candidate_counts': {
+				op.lower() + '_target': len(obs.candidates[op]) for op in offered if op in decision.TARGET_OPERATIONS
+			},
 			'unselectable_options': obs.unselectable_options,
 			'outcome': 'handback',
 			'operation': None,
@@ -635,6 +657,7 @@ class JevExecutor:
 				stats.update(
 					operation=choice.operation,
 					operation_probability=choice.operation_probability,
+					read_operation_probability=choice.read_operation_probability,
 					target_key=target.key if target else None,
 					target_label=target.element()[:120] if target else None,
 					target_probability=choice.target_probability,
@@ -649,7 +672,7 @@ class JevExecutor:
 			return self._handback(run, stop, obs, choice)
 		assert choice is not None and reply is not None
 		target = choice.target
-		bu_action = decision.to_bu_action(choice.operation, target, text)
+		bu_action = decision.to_bu_action(choice.operation, target, text, append=run.params.text_mode == 'append')
 		action = agent.ActionModel.model_validate(bu_action)
 		output = agent.AgentOutput(
 			thinking=None,

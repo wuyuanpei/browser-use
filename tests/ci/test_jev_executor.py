@@ -13,6 +13,9 @@ from browser_use.agent.jev import JevChecks, JevSettings
 from browser_use.agent.jev.service import _is_repeated_empty
 from browser_use.agent.jev.views import ActionRecord, DelegateSubgoalParams, SubgoalRun
 from browser_use.agent.views import AgentStepInfo
+from browser_use.benchmark.tasks import INSPECT_PAGE
+from browser_use.browser.events import TypeTextEvent
+from browser_use.browser.session import BrowserSession
 from tests.ci.conftest import create_mock_llm
 from tests.ci.jev_support import FakeJev, browser_eval, serve_page
 from tests.ci.jev_support import jev_browser as _jev_browser_fixture  # noqa: F401
@@ -64,6 +67,235 @@ def test_only_adjacent_empty_subgoals_count():
 	assert _is_repeated_empty([a, a], 'A')
 	a.actions[-1].status = 'unknown'
 	assert not _is_repeated_empty([a, a], 'A')
+
+
+@pytest.mark.parametrize(('filler_count', 'operation'), [(30, 'CLICK'), (215, 'CLICK'), (619, 'CLICK'), (619, 'TYPE_TEXT')])
+async def test_dense_inbox_keeps_compose_and_search(jev_browser, httpserver, tmp_path, filler_count, operation):
+	filler = ''.join(
+		f'<button style="height:22px;overflow:hidden;white-space:nowrap">邮件 {i}</button>' for i in range(filler_count)
+	)
+	url = serve_page(
+		httpserver,
+		'/dense-inbox',
+		'<div style="display:flex;flex-direction:column-reverse">'
+		f'<div style="display:grid;grid-template-columns:repeat(32,minmax(0,1fr));width:1100px">{filler}</div>'
+		"<button onclick=\"document.querySelector('output').textContent='草稿已打开'\">写信</button>"
+		'<input type="search" placeholder="搜索邮件" oninput="document.querySelector(\'output\').textContent=this.value">'
+		'<output></output></div>',
+	)
+	search = operation == 'TYPE_TEXT'
+	target = '搜索邮件' if search else '写信'
+	fake = FakeJev(httpserver, [{'operation': operation, 'target': target}, {'operation': 'STEP_DONE'}])
+	objective = '在搜索邮件框输入会议' if search else '打开写信编辑器'
+	planner = create_mock_llm([subgoal(objective), planner_action('finish', success=True, reason='Inbox action applied')])
+	agent = Agent(
+		task=f'Visit {url} and {objective}.',
+		llm=planner,
+		browser_session=jev_browser,
+		use_judge=False,
+		jev=JevSettings(
+			jev_api_key='test',
+			jev_base_url=httpserver.url_for('/'),
+			text_llm=create_mock_llm(['{"text":"会议"}']),
+			answer_llm=create_mock_llm(['{"text":"Inbox action applied"}']),
+			trace_path=tmp_path / 'trace.jsonl',
+		),
+	)
+	observed = []
+
+	async def inspect(at_step):
+		if at_step.history.is_done():
+			observed.append(await browser_eval(jev_browser, 'document.querySelector("output").textContent'))
+
+	history = await agent.run(max_steps=5, on_step_end=inspect)
+	assert fake.requests and not fake.errors
+	questions = fake.requests[0]['questions']
+	assert len(questions['click_target']['criteria']) == min(filler_count + 2, 200)
+	assert any('搜索邮件' in entry['element'] for entry in questions['type_text_target']['criteria'].values())
+	first = next(event for event in _events(tmp_path / 'trace.jsonl') if event['event'] == 'system1_decision')
+	assert first['observed_candidate_counts']['click_target'] == filler_count + 2
+	assert history.is_successful() and observed == (['会议'] if search else ['草稿已打开'])
+
+
+@pytest.mark.parametrize('mode,expected', [('append', '前缀关键点'), ('replace', '关键点')])
+async def test_jev_applies_explicit_rich_text_mode(jev_browser, httpserver, tmp_path, mode, expected):
+	url = serve_page(
+		httpserver,
+		'/rich-text',
+		'<div id="editor" aria-label="正文" role="textbox" contenteditable="true">'
+		'<p id="tail">前缀</p><ul id="items"><li>第一项</li><li>第二项</li><li>第三项</li></ul></div>'
+		'<script>if (location.search.includes("append")) {'
+		'editor.prepend(items);'
+		'editor.focus(); getSelection().collapse(tail.firstChild, tail.textContent.length);'
+		'document.execCommand("bold"); document.execCommand("italic");'
+		'let drop = true; editor.addEventListener("beforeinput", e => {'
+		'if (drop && e.data === "关") { drop = false; e.preventDefault(); }'
+		'}); }</script>',
+	)
+	fake = FakeJev(httpserver, [{'operation': 'TYPE_TEXT', 'target': '正文'}, {'operation': 'STEP_DONE'}])
+	plan = planner_action(
+		'delegate_subgoal',
+		objective='写入关键点',
+		completion='正文显示关键点',
+		reason='按任务填写',
+		inputs='关键点',
+		text_mode=mode,
+		requires_action=True,
+	)
+	agent = Agent(
+		task=f'Open {url}?{mode} and use {mode} to write 关键点 in the rich text editor.',
+		llm=create_mock_llm([plan, planner_action('finish', success=True, reason='Text present')]),
+		browser_session=jev_browser,
+		use_judge=False,
+		jev=JevSettings(
+			jev_api_key='local-test',
+			jev_base_url=httpserver.url_for('/'),
+			trace_path=tmp_path / 'trace.jsonl',
+			text_llm=create_mock_llm(['{"text":"关键点"}']),
+			answer_llm=create_mock_llm(['{"text":"Text present"}']),
+		),
+	)
+	proof = []
+
+	async def inspect(running):
+		if running.history.is_done():
+			proof.append(
+				await browser_eval(
+					jev_browser,
+					'[(document.querySelector("#tail") || editor).textContent, editor.querySelectorAll("li").length, '
+					'[...editor.querySelectorAll("i, em")].some(el => el.textContent === "关键点"), '
+					'[...editor.querySelectorAll("b, strong")].some(el => el.textContent === "关键点")]',
+				)
+			)
+			proof.append((await browser_eval(jev_browser, INSPECT_PAGE))['facts']['rich_text'][0])
+
+	await agent.run(max_steps=5, on_step_end=inspect)
+	assert not fake.errors
+	assert proof[0] == [expected, 3 if mode == 'append' else 0, mode == 'append', mode == 'append']
+	assert proof[1]['text'].endswith(expected)
+	assert proof[1]['format'] == ([{'bold': True, 'italic': True, 'runs': ['关键点']}] if mode == 'append' else [])
+	assert proof[1]['unordered_lists'] == ([['第一项', '第二项', '第三项']] if mode == 'append' else [])
+
+
+async def test_replacing_empty_editor_preserves_managed_nodes(jev_browser, httpserver):
+	url = serve_page(
+		httpserver,
+		'/empty-editor',
+		'<div id="editor" contenteditable="true"><div data-editor-block><br></div></div>'
+		'<script>editor.addEventListener("beforeinput", e => {'
+		'if (!editor.querySelector("[data-editor-block]")) e.preventDefault();'
+		'});</script>',
+	)
+	await jev_browser.navigate_to(url)
+	summary = await jev_browser.get_browser_state_summary()
+	target = next(node for node in summary.dom_state.selector_map.values() if node.attributes.get('id') == 'editor')
+	event = jev_browser.event_bus.dispatch(TypeTextEvent(node=target, text='hello', clear=True))
+	await event.event_result(raise_if_any=True, raise_if_none=False)
+	assert await browser_eval(jev_browser, 'editor.querySelector("[data-editor-block]").innerText') == 'hello'
+
+
+async def test_append_does_not_fall_back_to_focused_field(jev_browser, httpserver, monkeypatch):
+	from browser_use.browser.watchdogs.default_action_watchdog import DefaultActionWatchdog
+
+	url = serve_page(httpserver, '/append', '<input id="target" value="prefix"><input id="other" value="unrelated">')
+	await jev_browser.navigate_to(url)
+	summary = await jev_browser.get_browser_state_summary()
+	target = next(node for node in summary.dom_state.selector_map.values() if node.attributes.get('id') == 'target')
+	await browser_eval(jev_browser, 'other.focus()')
+
+	async def lose_target(*_args, **_kwargs):
+		raise RuntimeError('editable target detached')
+
+	monkeypatch.setattr(DefaultActionWatchdog, '_input_text_element_node_impl', lose_target)
+	monkeypatch.setattr(DefaultActionWatchdog, '_click_element_node_impl', lose_target)
+	event = jev_browser.event_bus.dispatch(TypeTextEvent(node=target, text='suffix', clear=False))
+	with pytest.raises(RuntimeError, match='editable target detached'):
+		await event.event_result(raise_if_any=True, raise_if_none=False)
+	assert await browser_eval(jev_browser, '[target.value, other.value]') == ['prefix', 'unrelated']
+
+
+async def test_jev_reobserves_when_categories_load_during_native_capture(jev_browser, httpserver, monkeypatch, tmp_path):
+	url = serve_page(
+		httpserver,
+		'/load-category',
+		'<main id="panel">Nothing loaded yet</main><output></output>',
+	)
+	fake = FakeJev(httpserver, [{'operation': 'CLICK', 'target': 'Beauty'}, {'operation': 'STEP_DONE'}])
+	plan = create_mock_llm([subgoal('Find Beauty'), planner_action('finish', success=True, reason='Beauty selected')])
+	agent = Agent(
+		task=f'Open {url} and select Beauty.',
+		llm=plan,
+		browser_session=jev_browser,
+		use_judge=False,
+		jev=JevSettings(
+			jev_api_key='test',
+			jev_base_url=httpserver.url_for('/'),
+			trace_path=tmp_path / 'trace.jsonl',
+			answer_llm=create_mock_llm(['{"text":"Beauty selected"}']),
+		),
+	)
+	executor = agent._jev
+	assert executor is not None
+	capture = jev_browser.get_browser_state_summary
+	switched = False
+
+	async def change_during_capture(**kwargs):
+		nonlocal switched
+		summary = await capture(**kwargs)
+		if not switched and executor.active_run and summary.url == url:
+			switched = True
+			await browser_eval(
+				jev_browser,
+				"""panel.innerHTML = `<button onclick="this.parentElement.textContent='Beauty selected'">Beauty</button>`""",
+			)
+		return summary
+
+	monkeypatch.setattr(BrowserSession, 'get_browser_state_summary', lambda self, **kwargs: change_during_capture(**kwargs))
+	history = await agent.run(max_steps=6)
+	assert switched and history.is_successful()
+	assert not fake.errors
+	request = fake.requests[0]
+	assert 'Beauty' in request['state']['page']['text'] and 'Nothing loaded yet' not in request['state']['page']['text']
+	assert any('Beauty' in v['element'] for v in request['questions']['click_target']['criteria'].values())
+	rows = _events(tmp_path / 'trace.jsonl')
+	handback = next(row for row in rows if row['event'] == 'handback' and row['reason'] == 'step_done')
+	same_step = next(row for row in rows if row['event'] == 'system1_decision' and row['step'] == handback['step'])
+	assert handback['fingerprint'] == same_step['observation_fingerprint']
+
+
+async def test_read_only_operation_can_use_split_confidence(jev_browser, httpserver):
+	url = serve_page(httpserver, '/split-confidence', '<main style="height:200vh"><p>Visible article</p></main>')
+	fake = FakeJev(
+		httpserver,
+		[
+			{'operation': 'COLLECT', 'operation_probs': {'COLLECT': 0.58, 'SCROLL_DOWN': 0.41, 'UNABLE': 0.01}},
+			{'operation': 'STEP_DONE'},
+		],
+	)
+	planner = create_mock_llm(
+		[
+			planner_action(
+				'delegate_subgoal', objective='Read the article', completion='Article saved', reason='Capture visible text'
+			),
+			planner_action('finish', success=True, reason='Article saved'),
+		]
+	)
+	agent = Agent(
+		task=f'Visit {url} and save the visible article.',
+		llm=planner,
+		browser_session=jev_browser,
+		use_judge=False,
+		jev=JevSettings(
+			jev_api_key='test',
+			jev_base_url=httpserver.url_for('/'),
+			summary_llm=create_mock_llm(['{"text":"Visible article"}']),
+			answer_llm=create_mock_llm(['{"text":"Article saved"}']),
+		),
+	)
+
+	history = await agent.run(max_steps=5)
+	assert not fake.errors
+	assert any('collect_page' in action for action in history.model_actions())
 
 
 async def test_replan_after_intervening_prerequisite(jev_browser, httpserver: HTTPServer, tmp_path: Path):
@@ -283,13 +515,13 @@ async def test_handbacks_use_actual_page_and_results(case, steps, limit, expecte
 		await close_driver(agent)
 
 
-@pytest.mark.parametrize('case', ['step_limit', 'step_error', 'out_of_scope', 'too_many_candidates', 'state_too_large'])
-async def test_prechecks_do_not_call_model(case, jev_browser, httpserver, tmp_path):
+@pytest.mark.parametrize('case', ['step_limit', 'step_error', 'out_of_scope', 'candidate_limit', 'state_too_large'])
+async def test_prechecks_and_candidate_limit(case, jev_browser, httpserver, tmp_path):
 	agent, e, _ = await start_stage(
 		jev_browser,
 		httpserver,
 		tmp_path,
-		max_candidates=1 if case == 'too_many_candidates' else 200,
+		max_candidates=1 if case == 'candidate_limit' else 200,
 		goal='long original goal ' * 8000 if case == 'state_too_large' else 'Check controls',
 	)
 	fake = FakeJev(httpserver, [])
@@ -305,8 +537,14 @@ async def test_prechecks_do_not_call_model(case, jev_browser, httpserver, tmp_pa
 			summary = await agent._prepare_context(AgentStepInfo(0, 20))
 		out = await e.route(agent, summary)
 		assert out.model_output is None
-		assert e.runs[-1].handback and e.runs[-1].handback.reason == case
-		assert fake.requests == []
+		handback = e.runs[-1].handback
+		if case == 'candidate_limit':
+			assert handback and handback.reason == 'unable_probability'
+			assert len(fake.requests) == 1
+			assert len(fake.requests[0]['questions']['click_target']['criteria']) == 1
+		else:
+			assert handback and handback.reason == case
+			assert fake.requests == []
 	finally:
 		await close_driver(agent)
 

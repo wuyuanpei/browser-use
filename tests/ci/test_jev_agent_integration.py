@@ -4,16 +4,19 @@ import json
 import logging
 import os
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 from pydantic import BaseModel, ValidationError
 from pytest_httpserver import HTTPServer
 
-from browser_use import Agent, BrowserProfile, BrowserSession, Tools
+from browser_use import Agent, BrowserProfile, BrowserSession, ChatDeepSeek, Tools
 from browser_use.agent.jev import JevSettings
 from browser_use.agent.jev.state import read_visible_text
 from browser_use.agent.prompts import SystemPrompt
 from browser_use.agent.views import AgentHistoryList, AgentStepInfo
+from browser_use.llm.exceptions import ModelProviderError
 from tests.ci.conftest import create_mock_llm
 from tests.ci.jev_support import FakeJev, serve_page, serve_two_page_site
 from tests.ci.jev_support import jev_browser as _jev_browser_fixture  # noqa: F401
@@ -152,6 +155,59 @@ async def test_forced_finish_and_planner_retries(tmp_path, caplog):
 	assert len(final_logs) == 1 and 'Unable to continue' in final_logs[0]
 	usage = a._jev.usage_by_role()['planner']
 	assert (usage['decisions'], usage['calls'], usage['missing_usage_calls']) == (1, 2, 2)
+
+
+@pytest.mark.parametrize('invalid', [subgoal('Read the page', 'Page visible', review_note_placeholder='invalid'), '{"action":'])
+@pytest.mark.parametrize('recover', [True, False])
+async def test_planner_repairs_malformed_deepseek_output(httpserver, tmp_path, monkeypatch, invalid, recover):
+	serve_page(httpserver, '/repair', '<main>Visible evidence</main>')
+	second = finish() if recover else invalid
+	responses = [
+		SimpleNamespace(
+			usage=None,
+			choices=[
+				SimpleNamespace(message=SimpleNamespace(tool_calls=[SimpleNamespace(function=SimpleNamespace(arguments=raw))]))
+			],
+		)
+		for raw in (invalid, second)
+	]
+	create = AsyncMock(side_effect=responses)
+	monkeypatch.setattr(
+		ChatDeepSeek, '_client', lambda self: SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+	)
+	agent = Agent(
+		task='Read the page',
+		llm=ChatDeepSeek(api_key='local-test'),
+		jev=JevSettings(jev_api_key='local-test', answer_llm=create_mock_llm([json.dumps({'text': 'Reviewed'})])),
+		browser_session=isolated_browser(),
+		use_judge=False,
+		enable_signal_handler=False,
+		initial_actions=[{'navigate': {'url': httpserver.url_for('/repair')}}],
+	)
+	history = await agent.run(max_steps=2)
+	assert create.await_count == 2
+	assert create.await_args is not None
+	messages = json.dumps(create.await_args.kwargs['messages'])
+	expected_diagnostic = 'review_note_placeholder' if 'review_note_placeholder' in invalid else 'Invalid JSON'
+	assert expected_diagnostic in messages
+	assert history.is_done() and history.is_successful() is recover
+	assert not any('delegate_subgoal' in action for action in history.model_actions())
+
+
+@pytest.mark.parametrize(
+	'error', [TimeoutError('request timed out'), ModelProviderError('authentication failed', status_code=401)]
+)
+async def test_planner_does_not_reprompt_for_transport_or_auth_errors(monkeypatch, error):
+	agent = make_agent('Read the page', [], JevSettings(jev_api_key='local-test'))
+	request = AsyncMock(side_effect=error)
+	monkeypatch.setattr(agent.llm, 'ainvoke', request)
+
+	history = await agent.run(max_steps=1)
+
+	assert request.await_count == 1
+	assert not history.is_done()
+	expected = 'timed out' if isinstance(error, TimeoutError) else 'authentication failed'
+	assert any(expected in item for item in history.errors() if item)
 
 
 @pytest.mark.parametrize('flash,thinking', [(False, True), (False, False), (True, True)])

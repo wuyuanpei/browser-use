@@ -181,6 +181,9 @@ class _BoundBrowser:
 		target = self.bridge.run(self.bind())
 		page = self.evaluate(READ_STATE)
 		if not isinstance(page, dict):
+			# Retry only the read on the owned tab, never the event that caused navigation.
+			page = self.evaluate(READ_STATE)
+		if not isinstance(page, dict):
 			raise RuntimeError('Browser document is unavailable')
 		page.update(target_id=target, document_id=document_key(page)[1], observed_at=datetime.now(timezone.utc).isoformat())
 		page['dom_fingerprint'] = page['fingerprint'] = fingerprint(page)
@@ -297,7 +300,15 @@ class BrowserUseRun:
 		return redact_secrets(
 			{
 				**self._state,
-				**({'jev_usage_by_role': executor.usage_by_role()} if executor is not None else {}),
+				**(
+					{
+						'jev_usage_by_role': executor.usage_by_role(),
+						'replans': executor.redelegations,
+						'research': {'pages': [record.model_dump() for record in executor.captures.records]},
+					}
+					if executor is not None
+					else {}
+				),
 				'token_usage': token_usage(self._state['model_calls']),
 				'elements': indexed_elements(self._state['page'].get('actions', [])),
 			},
@@ -483,7 +494,7 @@ class BrowserUseRun:
 			elapsed = round((time.monotonic() - self._record_started) * 1000)
 			(self._record_dir / f'{elapsed:06d}.jpg').write_bytes(base64.b64decode(image, validate=True))
 
-	async def _predict(self):
+	async def _predict(self, *, retry_timeout: bool = True):
 		from browser_use.agent.views import AgentStepInfo
 
 		agent = self._native
@@ -501,7 +512,14 @@ class BrowserUseRun:
 		document['url'] = summary.url
 		self._summary = summary
 		agent.state.last_model_output = agent.state.last_result = None
-		await agent._get_next_action(summary)
+		try:
+			await agent._get_next_action(summary)
+		except TimeoutError:
+			if not retry_timeout or agent._jev is None:
+				raise
+			# No action has been dispatched. Reobserve before the single prediction retry.
+			self._emit('prediction_retry', reason='model_timeout')
+			return await self._predict(retry_timeout=False)
 		model_output = agent.state.last_model_output
 		if model_output is None:
 			raise RuntimeError('Browser Use did not return a decision')
@@ -568,9 +586,14 @@ class BrowserUseRun:
 		if self._state['decision_rounds'] >= MAX_STEPS:
 			raise RunCancelled('timeout')
 		calls_before = len(self._state['model_calls'])
-		raw, operation, target, guard, document, stable = self._bridge.run(
-			self._predict(), cancel=self._should_cancel, timeout=150
-		)
+		try:
+			raw, operation, target, guard, document, stable = self._bridge.run(
+				self._predict(), cancel=self._should_cancel, timeout=150
+			)
+		except TimeoutError as error:
+			if str(error):
+				raise
+			raise TimeoutError('Browser Use prediction timed out before dispatch') from error
 		executor = getattr(self._native, '_jev', None)
 		source = executor.step_source() if executor is not None else 'llm'
 		role = 'system1' if source == 'system1' else 'planner'
@@ -700,6 +723,19 @@ class BrowserUseRun:
 			if self._chrome is None:
 				self._bridge.close()
 			self._temp.cleanup()
+
+	def record_timeout_evidence(self):
+		"""Expose captured material without assigning a successful result to an unfinished run."""
+		executor = getattr(self._native, '_jev', None)
+		captures = executor.captures.records if executor is not None else []
+		lines = ['# 任务超时后的部分证据', '', '下列内容是在中断前保存的页面材料。剩余条件和最终结果尚未确认。']
+		for page in captures[-8:]:
+			lines.extend(['', f'## {page.title or "已保存页面"}', '', page.url, '', page.summary or page.text[:1500]])
+		if page := self._state.get('page'):
+			if page.get('text'):
+				lines.extend(['', '## 最后一次网页采样', '', page['url'], '', page['text'][:1500]])
+		self._state['partial_result'] = {'markdown': '\n'.join(lines)}
+		self._emit('partial_result')
 
 	def finish_execution(self):
 		"""Flush Jev's last action outcome and role totals while the test page is still observable."""

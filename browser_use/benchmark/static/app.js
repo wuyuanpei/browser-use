@@ -56,7 +56,7 @@ const providerLabel = p => ({ laya: 'Laya', deepseek: 'DeepSeek', jev: 'Jev', fi
 const nativeProvider = provider => provider === 'fixture' || provider === 'browser_use';
 const callLabel = c => ({collect:'Collect helper · 页面摘要', summarize:'Summarize helper · 任务输出', summary:'页面摘要助手', answer:'最终答复助手', risk:'提交效果确认', other:'其他模型调用', verify:'Verify helper · 独立复核'})[c?.kind] || (c?.kind === 'planner' ? (c.trigger ? `Planner / ${handoffLabel(c.trigger)}` : 'Planner') : c?.kind === 'text' ? 'Text helper' : c?.kind === 'deepseek' ? `DeepSeek (System1)${c.stage ? ` / 第 ${c.decision_round} 轮 / ${c.stage === 'operation' ? '操作选择' : '目标选择'}` : ''}` : jevScreenshot(c) ? 'Jev（截图）' : providerLabel(c?.kind));
 const decisionCount = attempt => attempt?.decision_calls ?? ((attempt?.laya_calls || 0) + (attempt?.deepseek_calls || 0) + (attempt?.jev_calls || 0));
-const callCounts = a => `${decisionCount(a)} / ${a.text_calls || 0} / ${a.planner_calls || 0}<small>收集 ${a.collect_calls || 0} · 总结 ${a.summarize_calls || 0}</small><small>${a.decision_rounds ?? decisionCount(a)} 决策轮 · ${a.replans || 0} 次改计划</small>`;
+const callCounts = a => `${decisionCount(a)} / ${a.text_calls || 0} / ${a.planner_calls || 0}<small>收集 ${a.collect_calls || 0} · 总结 ${a.summarize_calls || 0}</small><small>${a.decision_rounds ?? decisionCount(a)} 决策轮 · ${a.replans || 0} 次交回后再委派</small>`;
 function tokenPanel(usage, title = 'Token 消耗', panelKey = 'tokens') {
   if (!usage) return '<p class="token-note">Token 用量暂无记录</p>';
   const n = key => Number.isFinite(usage[key]) ? escape(usage[key].toLocaleString('en-US')) : '—';
@@ -416,7 +416,7 @@ function sourceLink(url, label = '原文链接') {
 }
 function taskResult() {
   // New task output belongs to the task, independently of the selected notebook step.
-  return Array.isArray(state?.research?.pages) ? state?.result : researchVersion()?.result;
+  return (Array.isArray(state?.research?.pages) ? state?.result : researchVersion()?.result) || state?.partial_result;
 }
 function renderResearch() {
   const research = state?.research, version = researchVersion();

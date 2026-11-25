@@ -249,10 +249,13 @@ class FakeJev:
 					choice, p = self._find(question['criteria'], step['target']), step.get('target_p', 0.95)
 				else:
 					choice, p = keys[0], 0.95
+				probabilities = step.get('operation_probs') if name == 'operation' else None
 				answers[name] = {
 					'choice': choice,
 					'confidence': step.get('confidence', p),
-					'probabilities': _distribute(keys, choice, p, step.get('unable_p') if name == 'operation' else None),
+					'probabilities': {key: probabilities.get(key, 0.0) for key in keys}
+					if probabilities is not None
+					else _distribute(keys, choice, p, step.get('unable_p') if name == 'operation' else None),
 				}
 		except (LookupError, ValueError) as exc:
 			self.errors.append(str(exc))

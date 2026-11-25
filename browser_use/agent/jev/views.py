@@ -124,6 +124,10 @@ class DelegateSubgoalParams(JevModel):
 	inputs: str | None = Field(
 		default=None, description='Values System1 must enter, e.g. "From=Zurich; To=London". Omit if nothing needs typing.'
 	)
+	text_mode: Literal['replace', 'append'] = Field(
+		default='replace',
+		description='How to type into an existing field. Use append for text that must preserve and follow its current contents. Use a separate stage when another field needs replacement.',
+	)
 	may_submit: bool = Field(
 		default=False,
 		description='Allow submits (search, filter, next, pressing Enter) and irreversible or account-changing clicks (send, pay, delete) in this stage. Irreversible clicks are still confirmed with you one by one.',

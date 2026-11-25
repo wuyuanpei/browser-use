@@ -534,7 +534,7 @@ class BaselineManager:
 			'',
 			'| 任务 | 轮次 | 执行状态 / 评估状态 / 模型判决 | 动作 | '
 			'决策轮 / System1 / 文本 / Planner / 收集 / 总结 / 复核 '
-			'| 改计划 | 耗时(ms) |',
+			'| 交回后再委派 | 耗时(ms) |',
 			'|---|---:|---|---:|---:|---:|---:|',
 		]
 		for row in batch['attempts']:
@@ -748,6 +748,8 @@ class BaselineManager:
 			result = snapshot.get('result')
 			atomic_json(folder / 'result.json', result)
 			(folder / 'result.md').write_text((result or {}).get('markdown', ''), encoding='utf-8')
+			if partial := snapshot.get('partial_result'):
+				(folder / 'partial-result.md').write_text(partial['markdown'], encoding='utf-8')
 			calls = snapshot.get('model_calls', [])
 			verify_calls = [call for call in calls if call['kind'] == 'verify']
 			verify_usage = Counter()
@@ -775,6 +777,7 @@ class BaselineManager:
 						jev_calls=roles['system1']['calls'],
 						decision_calls=roles['system1']['calls'],
 						planner_calls=roles['planner']['calls'],
+						replans=snapshot.get('replans', 0),
 						text_calls=roles['text']['calls'],
 						collect_calls=roles['summary']['calls'],
 						summarize_calls=roles['answer']['calls'],
@@ -854,7 +857,8 @@ class BaselineManager:
 			with self.lock:
 				row.update(status='environment_blocked', execution_status='environment_blocked', reason=str(error))
 		except Exception as error:
-			message = str(error)
+			message = str(error) or type(error).__name__
+			status = 'timeout' if isinstance(error, TimeoutError) or 'budget' in message.lower() else 'error'
 			if (
 				'Model connection failed' in message
 				or 'Model provider returned HTTP' in message
@@ -863,11 +867,7 @@ class BaselineManager:
 			):
 				fatal = message
 			with self.lock:
-				row.update(
-					status='timeout' if 'budget' in message.lower() else 'error',
-					execution_status='timeout' if 'budget' in message.lower() else 'error',
-					reason=message,
-				)
+				row.update(status=status, execution_status=status, reason=message)
 			append('error', {'error': message})
 		finally:
 			try:
@@ -882,6 +882,8 @@ class BaselineManager:
 						evaluations.append(
 							{'phase': 'final', 'time': now(), 'sample_status': 'error', 'evidence': {}, 'reason': str(error)}
 						)
+					if row.get('execution_status') == 'timeout':
+						agent.record_timeout_evidence()
 				execution_ended_at = now()
 				execution_status = row.get('execution_status', 'error')
 				execution_reason = row.get('execution_reason', row.get('reason', ''))

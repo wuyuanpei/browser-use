@@ -5,7 +5,9 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+from collections import Counter
 from collections.abc import Iterator
+from dataclasses import replace
 from typing import Any
 from urllib.parse import urljoin
 
@@ -13,7 +15,7 @@ from browser_use.agent.jev import rules
 from browser_use.agent.jev.views import Candidate, JevSettings, Observation
 from browser_use.browser.session import BrowserSession
 from browser_use.browser.views import BrowserStateSummary
-from browser_use.dom.views import EnhancedDOMTreeNode
+from browser_use.dom.views import EnhancedDOMTreeNode, SerializedDOMState
 
 logger = logging.getLogger(__name__)
 
@@ -77,7 +79,15 @@ VISIBLE_TEXT_SCRIPT = r"""(() => {
 		const text = (a.innerText || a.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim();
 		if (text) links.push({ text: text.slice(0, 300), url: a.href });
 	}
-	return { url: location.href, title: document.title, text: lines.join('\n').slice(0, LIMIT), links, viewport: { width: vw, height: vh } };
+	let scrollAtCenter = null;
+	for (let el = document.elementFromPoint(vw / 2, vh / 2); el; el = el.parentElement) {
+		if (el === document.scrollingElement || !/^(auto|scroll)$/.test(getComputedStyle(el).overflowY)) continue;
+		const total = el.scrollHeight - el.clientHeight;
+		if (total < 1) continue;
+		scrollAtCenter = [Math.max(0, el.scrollTop), Math.max(0, total - el.scrollTop)];
+		break;
+	}
+	return { centerScroll: scrollAtCenter, url: location.href, title: document.title, document: performance.timeOrigin, scroll: [scrollX, scrollY], text: lines.join('\n').slice(0, LIMIT), links, viewport: { width: vw, height: vh } };
 })()"""
 
 
@@ -90,11 +100,36 @@ async def read_visible_text(browser_session: BrowserSession) -> dict[str, Any]:
 		)
 		value = result['result'].get('value')
 		if isinstance(value, dict) and 'text' in value:
-			return value
+			return {**value, 'target_id': cdp.target_id}
 		logger.debug('Could not read viewport: %s', result.get('exceptionDetails', {}).get('text'))
 	except Exception as exc:
 		logger.debug('Could not read viewport: %s', exc)
 	return {'text': '', 'links': [], 'viewport': {'width': 0, 'height': 0}, 'url': '', 'title': ''}
+
+
+async def capture_aligned_state(browser: BrowserSession, *, include_recent_events: bool) -> BrowserStateSummary:
+	"""Bracket the native DOM capture with viewport reads to catch navigation and delayed content."""
+	before = await read_visible_text(browser)
+	for _ in range(2):
+		summary = await browser.get_browser_state_summary(include_screenshot=True, include_recent_events=include_recent_events)
+		after = await read_visible_text(browser)
+		matches_url = not summary.url or summary.url == after['url']
+		if matches_url and after['url'] and before == after:
+			summary.jev_viewport = after
+			return summary
+		before = after
+
+	# These selectors must not survive a capture made across two versions of the page.
+	browser.update_cached_selector_map({})
+	detail = 'Page changed while taking its DOM snapshot. Observe again before choosing an element.'
+	return replace(
+		summary,
+		dom_state=SerializedDOMState(_root=None, selector_map={}),
+		screenshot=None,
+		url=after['url'] or summary.url,
+		title=after['title'] or summary.title,
+		state_error=summary.state_error or detail,
+	)
 
 
 _STATES = frozenset({'checked', 'selected', 'expanded', 'pressed', 'disabled', 'required', 'readonly'})
@@ -228,6 +263,97 @@ def _context(node: EnhancedDOMTreeNode) -> tuple[dict[str, str], str | None, str
 		str(form.backend_node_id) if form else None,
 		str(dialog.backend_node_id) if dialog else None,
 	)
+
+
+def _scope_text(scope: EnhancedDOMTreeNode) -> str:
+	parts = []
+	length = 0
+	pending = [scope]
+	for _ in range(80):
+		if not pending or length >= 120:
+			break
+		node = pending.pop()
+		if node.is_visible is False or 'hidden' in node.attributes or node.attributes.get('aria-hidden') == 'true':
+			continue
+		if node.tag_name == '#text':
+			if text := _short(node.node_value, 120):
+				parts.append(text)
+				length += len(text) + 1
+		elif node.tag_name not in {'script', 'style', 'noscript', 'template'}:
+			pending.extend(reversed(node.children[:80]))
+	return ' '.join(parts)[:120]
+
+
+def _nearby_text(node: EnhancedDOMTreeNode, name: str) -> str:
+	"""Describe the closest content around a repeated control without using page-wide text."""
+	fallback = ''
+	parent = node.parent
+	for _ in range(6):
+		if parent is None or parent.tag_name in {'body', 'html', '#document'}:
+			break
+		text = _scope_text(parent)
+		if text and text != name:
+			fallback = fallback or text
+			if parent.tag_name in {'article', 'li'} or parent.attributes.get('role') in {'article', 'listitem'}:
+				return text
+		parent = parent.parent
+	return fallback
+
+
+def _covers_click(surface: EnhancedDOMTreeNode, clicked: EnhancedDOMTreeNode) -> bool:
+	area, rect = clicked.absolute_position, surface.absolute_position
+	if not area or not rect:
+		return False
+	x, y = area.x + area.width / 2, area.y + area.height / 2
+	return rect.x < x < rect.x + rect.width and rect.y < y < rect.y + rect.height
+
+
+def _drop_click_wrappers(clicks: list[Candidate], nodes: dict[int, EnhancedDOMTreeNode]) -> list[Candidate]:
+	# Nested layout elements can describe the same click several times. Keep the inner
+	# surface only when the outer candidate's click point is already inside it.
+	indexed = {id(nodes[candidate.index]): candidate for candidate in clicks if candidate.index is not None}
+	wrappers: dict[int, Candidate] = {}
+	removed: set[str] = set()
+	for candidate in clicks:
+		if candidate.index is None or not candidate.name:
+			continue
+		node = nodes[candidate.index]
+		parent = node.parent
+		# A bare hash link can be the text surface of a clickable list item.
+		# Keep links with their own navigation or handlers as separate controls.
+		if (
+			node.tag_name == 'a'
+			and candidate.role == 'link'
+			and node.attributes.get('href') == '#'
+			and not node.has_js_click_listener
+			and not {'target', 'download'} & node.attributes.keys()
+			and parent is not None
+			and parent.tag_name == 'li'
+			and parent.has_js_click_listener
+			and (owner := indexed.get(id(parent))) is not None
+			and owner.role == 'listitem'
+			and owner.name == candidate.name
+			and _covers_click(node, parent)
+		):
+			removed.add(candidate.key)
+		if (
+			candidate.role in {'div', 'span'}
+			and node.tag_name == candidate.role
+			and not node.has_js_click_listener
+			and not (node.snapshot_node and node.snapshot_node.is_clickable)
+			and not {'role', 'tabindex', 'aria-label', 'aria-labelledby'} & node.attributes.keys()
+			and not (candidate.editable or candidate.states or candidate.risky_effect or candidate.is_submit)
+		):
+			wrappers[id(node)] = candidate
+	for candidate in wrappers.values():
+		assert candidate.index is not None
+		node = nodes[candidate.index]
+		parent = node.parent
+		while parent is not None and (outer := wrappers.get(id(parent))) is not None:
+			if outer.name == candidate.name and outer.role == candidate.role and _covers_click(node, parent):
+				removed.add(outer.key)
+			parent = parent.parent
+	return [candidate for candidate in clicks if candidate.key not in removed]
 
 
 def _options(node: EnhancedDOMTreeNode) -> list[EnhancedDOMTreeNode]:
@@ -393,9 +519,15 @@ def fingerprint(obs: Observation) -> str:
 
 
 async def observe(browser_session: BrowserSession, summary: BrowserStateSummary, settings: JevSettings, step: int) -> Observation:
-	rendered = await read_visible_text(browser_session)
+	rendered = summary.jev_viewport
+	if rendered is None:
+		rendered = (
+			await read_visible_text(browser_session)
+			if not summary.state_error
+			else {'text': '', 'links': [], 'viewport': {}, 'title': ''}
+		)
 	# A newly focused target can have an empty cached URL before TargetInfoChanged arrives.
-	page_url = summary.url or rendered['url']
+	page_url = summary.url or rendered.get('url', '')
 	info = summary.page_info
 	viewport = rendered.get('viewport') or {}
 	width = info.viewport_width if info else int(viewport.get('width', 0))
@@ -411,9 +543,12 @@ async def observe(browser_session: BrowserSession, summary: BrowserStateSummary,
 	}
 	candidates: dict[str, list[Candidate]] = {op: [] for op in ('CLICK', 'TYPE_TEXT', 'SELECT', 'SCROLL_UP', 'SCROLL_DOWN')}
 	page = Candidate(key='page', kind='scroll', role='page', name='the whole page')
-	if above > 0:
+	center_above, center_below = rendered.get('centerScroll') or (0, 0)
+	if center_above or center_below:
+		scroll.update(center_pixels_above=round(center_above), center_pixels_below=round(center_below))
+	if center_above or above > 0:
 		candidates['SCROLL_UP'].append(page)
-	if below > 0:
+	if center_below or below > 0:
 		candidates['SCROLL_DOWN'].append(page)
 	unselectable = 0
 	for index, node in summary.dom_state.selector_map.items():
@@ -429,6 +564,12 @@ async def observe(browser_session: BrowserSession, summary: BrowserStateSummary,
 		if node.is_actually_scrollable:
 			candidates['SCROLL_UP'].append(field)
 			candidates['SCROLL_DOWN'].append(field)
+	clicks = candidates['CLICK'] = _drop_click_wrappers(candidates['CLICK'], summary.dom_state.selector_map)
+	names = Counter((field.role, field.name) for field in clicks if field.name)
+	for field in clicks:
+		if field.index is not None and names[field.role, field.name] > 1:
+			if text := _nearby_text(summary.dom_state.selector_map[field.index], field.name):
+				field.context['nearby_text'] = text
 	tabs: list[dict[str, str]] = []
 	for tab in summary.tabs:
 		if tab.target_id != browser_session.agent_focus_target_id:

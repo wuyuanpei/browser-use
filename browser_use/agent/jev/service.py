@@ -1,6 +1,7 @@
 """Run bounded System1 subgoals inside Browser Use's native Agent step loop."""
 
 import asyncio
+import base64
 import json
 import logging
 import os
@@ -9,9 +10,10 @@ from pathlib import Path
 from time import monotonic
 from typing import TYPE_CHECKING, Any, Literal
 from urllib.parse import urlsplit
+from uuid import uuid4
 
 from browser_use.agent.jev import decision, rules, state
-from browser_use.agent.jev.backends import JevBackend, System1Error, make_backend
+from browser_use.agent.jev.backends import JevBackend, System1Error, image_rejection_status, make_backend
 from browser_use.agent.jev.checks import CheckGate
 from browser_use.agent.jev.helpers import ModelHelpers
 from browser_use.agent.jev.prompts import render_handback
@@ -36,9 +38,11 @@ from browser_use.agent.jev.views import (
 	HandbackReason,
 	JevSettings,
 	Observation,
+	Operation,
 	SubgoalRun,
 	System1Reply,
 )
+from browser_use.agent.jev.vision import PreparedImage, prepare_screenshot
 from browser_use.agent.views import ActionResult, AgentOutput
 from browser_use.browser.session import BrowserSession
 from browser_use.browser.views import BrowserStateSummary
@@ -58,6 +62,15 @@ Stop = tuple[HandbackReason, str]
 class RouteResult:
 	model_output: AgentOutput | None = None
 	context_messages: list[UserMessage] = field(default_factory=list)
+
+
+@dataclass
+class _System1Request:
+	state: dict[str, Any]
+	questions: dict[str, dict[str, Any]]
+	model: str | None
+	image: PreparedImage | None
+	stats: dict[str, Any]
 
 
 def _is_repeated_empty(runs: list[SubgoalRun], identity: str) -> bool:
@@ -83,7 +96,7 @@ class JevExecutor:
 		self._source: _SOURCE = 'llm'
 		self._planner_attempt = 0
 		self._planner_page_action = False
-		self._saved_decision: dict | None = None
+		self._vision_disabled: dict[str, Any] | None = None
 		self._closed = False
 		self.finish_only = False
 		self.defer_final_answer = False
@@ -116,6 +129,9 @@ class JevExecutor:
 					'max_candidates',
 					'answer_timeout',
 					'jev_timeout',
+					'screenshot_policy',
+					'vision_max_side',
+					'vision_jpeg_quality',
 				}
 			),
 		)
@@ -146,7 +162,6 @@ class JevExecutor:
 		self._handback_message = None
 		self.last_observation = None
 		self._planner_page_action = False
-		self._saved_decision = None
 		self.finish_only = False
 		self.backend = self._make_backend()
 		self._closed = False
@@ -353,7 +368,12 @@ class JevExecutor:
 			actions_used=len(run.executed_actions),
 			actions_discarded=sum(r.status == 'discarded' for r in run.actions),
 		)
-		self._handback_message = render_handback(run, _is_repeated_empty(self.runs[self._first_run :], run.identity))
+		self._handback_message = render_handback(
+			run,
+			_is_repeated_empty(self.runs[self._first_run :], run.identity),
+			show_screenshots=self.settings.screenshot_policy != 'off',
+			vision_disabled_status=self._vision_disabled['status'] if self._vision_disabled else None,
+		)
 		self._log_handback(run, result)
 		return self._planner((obs.url, obs.visible_text) if obs else None)
 
@@ -503,10 +523,112 @@ class JevExecutor:
 			return 'risk_denied', f'You did not authorize {detail} ({reason}).'
 		return None
 
+	def _vision_wanted(self, run: SubgoalRun) -> bool:
+		return self._vision_disabled is None and self.settings.screenshot_policy == 'always'
+
+	def _system1_request(
+		self,
+		run: SubgoalRun,
+		obs: Observation,
+		task: str,
+		registered: set[str],
+		offered: list[Operation],
+		research: dict | None,
+		image: PreparedImage | None,
+	) -> _System1Request:
+		system_state = decision.build_state(
+			obs, run, task, self.task_actions, research, vision=(str(uuid4()), image) if image else None
+		)
+		questions = decision.build_questions(obs, run, offered, research=research, registered_actions=registered, vision=image)
+		counts = {name: len(q['criteria']) for name, q in questions.items() if name != 'operation'}
+		model = self.settings.jev_model if self.backend.name == 'jev' else None
+		stats: dict[str, Any] = {
+			'run_id': run.id,
+			'backend': self.backend.name,
+			'questions': list(questions),
+			'request_chars': decision.request_size(system_state, questions, model, with_image=image is not None),
+			'offered_operations': offered,
+			'candidate_counts': counts,
+			'vision': image is not None,
+			'vision_trigger': 'policy' if image else None,
+			'image_bytes': image.bytes if image else 0,
+			'image_size': [image.width, image.height] if image else None,
+			'dpr': image.scale if image else None,
+			'rect_count': len(
+				{key for name in counts for key, criterion in questions[name]['criteria'].items() if 'rect' in criterion}
+			),
+			'unselectable_options': obs.unselectable_options,
+			'outcome': 'handback',
+			'operation': None,
+			'operation_probability': None,
+			'target_label': None,
+			'target_key': None,
+			'target_probability': None,
+			'returned_model': None,
+			'unable_probability': None,
+			'choice_is_argmax': None,
+			'answers': {},
+			'attempts': [],
+			'bu_action': None,
+			'input_tokens': None,
+			'output_tokens': None,
+			'cost_usd': None,
+		}
+		if self._vision_disabled is not None:
+			stats['vision_disabled'] = True
+		return _System1Request(system_state, questions, model, image, stats)
+
+	async def _ask_once(self, request: _System1Request) -> System1Reply | None:
+		"""Send this request, attributing every transport attempt to its text or image payload."""
+		stats = request.stats
+		start = monotonic()
+		try:
+			if request.image is None:
+				reply = await self.backend.ask(request.state, request.questions)
+			else:
+				reply = await self.backend.ask(
+					request.state, request.questions, images={'page-screenshot': request.image.jpeg_b64}
+				)
+		except asyncio.CancelledError:
+			elapsed_ms = round((monotonic() - start) * 1000)
+			attempts = self.backend.last_attempts if isinstance(self.backend, JevBackend) else []
+			if attempts:
+				self.usage.record_jev(None, elapsed_ms, len(attempts), vision=request.image is not None)
+			stats.update(outcome='interrupted', error='CancelledError', latency_ms=elapsed_ms, attempts=attempts)
+			self._record_decision(request, None)
+			raise
+		except System1Error as exc:
+			elapsed_ms = round((monotonic() - start) * 1000)
+			stats.update(error=str(exc), attempts=exc.attempts, latency_ms=elapsed_ms)
+			if self.backend.name == 'jev':
+				self.usage.record_jev(None, elapsed_ms, max(1, len(exc.attempts)), vision=request.image is not None)
+			return None
+
+		stats.update(
+			returned_model=reply.model,
+			input_tokens=reply.input_tokens,
+			output_tokens=reply.output_tokens,
+			latency_ms=reply.latency_ms,
+			attempts=reply.attempts,
+			answers=reply.answers,
+		)
+		if self.backend.name == 'jev':
+			self.usage.record_jev(reply, reply.latency_ms, vision=request.image is not None)
+			stats['cost_usd'] = (
+				reply.input_tokens * JEV_INPUT_USD_PER_MTOK / 1_000_000 if reply.input_tokens is not None else None
+			)
+		return reply
+
+	def _disable_vision(self, run: SubgoalRun, status: int) -> None:
+		self.trace.write('vision_rejected', self.step, run_id=run.id, status=status)
+		self.usage.record_vision_rejection(status, self.step)
+		if self._vision_disabled is None:
+			self._vision_disabled = {'status': status, 'step': self.step, 'run_id': run.id}
+			self.trace.write('vision_disabled', **self._vision_disabled)
+
 	async def route(self, agent: 'Agent', browser_state_summary: BrowserStateSummary) -> RouteResult:
 		self._source = 'llm'
 		self._routed_target = (self.step, agent.browser_session.agent_focus_target_id)
-		self._saved_decision = None
 		await self.usage.sync_other(self.step)
 		run = self.active_run
 		if not run:
@@ -543,10 +665,20 @@ class JevExecutor:
 		offered = decision.offered_operations(
 			obs, run, registered, self.settings.checks, collect_available=bool(research and research['collect_available'])
 		)
-		system_state = decision.build_state(obs, run, agent.task, self.task_actions, research)
-		questions = decision.build_questions(obs, run, offered, research=research, registered_actions=registered)
-		counts = {name: len(q['criteria']) for name, q in questions.items() if name != 'operation'}
-		for name, count in counts.items():
+		image = None
+		if self._vision_wanted(run):
+			image = await asyncio.to_thread(
+				prepare_screenshot,
+				browser_state_summary.screenshot,
+				obs.viewport_width,
+				obs.viewport_height,
+				max_side=self.settings.vision_max_side,
+				quality=self.settings.vision_jpeg_quality,
+			)
+			if image is None:
+				self.trace.write('vision_unavailable', self.step, run_id=run.id, vision_trigger='policy')
+		request = self._system1_request(run, obs, agent.task, registered, offered, research, image)
+		for name, count in request.stats['candidate_counts'].items():
 			if count > self.settings.max_candidates:
 				return self._handback(
 					run,
@@ -556,98 +688,61 @@ class JevExecutor:
 					),
 					obs,
 				)
-		model = self.settings.jev_model if self.backend.name == 'jev' else None
-		size = decision.request_size(system_state, questions, model)
-		if size > MAX_REQUEST_CHARS:
-			return self._handback(run, ('state_too_large', 'The page is too large for one System1 request.'), obs)
+		size_error: Stop = ('state_too_large', 'The page is too large for one System1 request.')
+		if request.stats['request_chars'] > MAX_REQUEST_CHARS:
+			return self._handback(run, size_error, obs)
+
 		self.usage.roles['system1'].decisions += 1
-		start = monotonic()
-		stats: dict[str, Any] = {
-			'run_id': run.id,
-			'backend': self.backend.name,
-			'questions': list(questions),
-			'request_chars': size,
-			'offered_operations': offered,
-			'candidate_counts': counts,
-			'unselectable_options': obs.unselectable_options,
-			'outcome': 'handback',
-			'operation': None,
-			'operation_probability': None,
-			'target_label': None,
-			'target_key': None,
-			'target_probability': None,
-			'returned_model': None,
-			'unable_probability': None,
-			'choice_is_argmax': None,
-			'answers': {},
-			'attempts': [],
-			'bu_action': None,
-			'input_tokens': None,
-			'output_tokens': None,
-			'cost_usd': None,
-		}
+		run.decisions += 1
+		reply = await self._ask_once(request)
+		rejected = image_rejection_status(request.stats['attempts']) if reply is None and image is not None else None
+		if rejected is not None:
+			self._disable_vision(run, rejected)
+			request.stats['outcome'] = 'vision_rejected'
+			self._record_decision(request, None)
+			request = self._system1_request(run, obs, agent.task, registered, offered, research, None)
+			request.stats['fallback_from'] = 'vision_rejected'
+			if request.stats['request_chars'] > MAX_REQUEST_CHARS:
+				return self._handback(run, size_error, obs)
+			reply = await self._ask_once(request)
+
+		stats = request.stats
+		if reply is None:
+			detail = f'The System1 request failed: {stats["error"]}'
+			if rejected is not None:
+				detail += f' Screenshots were disabled after Jev rejected an image (HTTP {rejected}).'
+			self._record_decision(request, None)
+			return self._handback(run, ('system1_error', detail), obs)
+		if request.image is not None:
+			run.vision_decisions += 1
 		choice = None
 		text = None
-		reply: System1Reply | None = None
 		try:
-			reply = await self.backend.ask(system_state, questions)
-		except asyncio.CancelledError:
-			elapsed_ms = round((monotonic() - start) * 1000)
-			attempts = self.backend.last_attempts if isinstance(self.backend, JevBackend) else []
-			if attempts:
-				self.usage.record_jev(None, elapsed_ms, len(attempts))
-			self.trace.write(
-				'system1_decision',
-				self.step,
-				**{**stats, 'outcome': 'interrupted', 'error': 'CancelledError', 'latency_ms': elapsed_ms, 'attempts': attempts},
+			threshold = (
+				self.settings.unable_probability_handback if self.settings.checks.mode('confidence') == 'enforce' else None
 			)
-			raise
-		except System1Error as exc:
-			attempts = exc.attempts
-			stats.update(attempts=attempts, latency_ms=round((monotonic() - start) * 1000))
-			if self.backend.name == 'jev':
-				self.usage.record_jev(None, stats['latency_ms'], max(1, len(attempts)))
-			stop = ('system1_error', f'The System1 request failed: {exc}')
+			choice = decision.combine(reply, request.questions, obs, unable_threshold=threshold)
+		except decision.InvalidAnswer as exc:
+			stop = ('invalid_answer', f'System1 returned an invalid answer: {exc}')
+			stats['choice_is_argmax'] = decision.argmax_flags(reply)
 		else:
+			target = choice.target
 			stats.update(
-				returned_model=reply.model,
-				input_tokens=reply.input_tokens,
-				output_tokens=reply.output_tokens,
-				latency_ms=reply.latency_ms,
-				attempts=reply.attempts,
-				answers=reply.answers,
+				operation=choice.operation,
+				operation_probability=choice.operation_probability,
+				target_key=target.key if target else None,
+				target_label=target.element()[:120] if target else None,
+				target_probability=choice.target_probability,
+				unable_probability=choice.unable_probability,
+				choice_is_argmax=choice.choice_is_argmax,
 			)
-			if self.backend.name == 'jev':
-				self.usage.record_jev(reply, reply.latency_ms)
-				stats['cost_usd'] = (
-					reply.input_tokens * JEV_INPUT_USD_PER_MTOK / 1_000_000 if reply.input_tokens is not None else None
-				)
-			try:
-				threshold = (
-					self.settings.unable_probability_handback if self.settings.checks.mode('confidence') == 'enforce' else None
-				)
-				choice = decision.combine(reply, questions, obs, unable_threshold=threshold)
-			except decision.InvalidAnswer as exc:
-				stop = ('invalid_answer', f'System1 returned an invalid answer: {exc}')
-				stats['choice_is_argmax'] = decision.argmax_flags(reply)
-			else:
-				target = choice.target
-				stats.update(
-					operation=choice.operation,
-					operation_probability=choice.operation_probability,
-					target_key=target.key if target else None,
-					target_label=target.element()[:120] if target else None,
-					target_probability=choice.target_probability,
-					unable_probability=choice.unable_probability,
-					choice_is_argmax=choice.choice_is_argmax,
-				)
-				stop = self._choice_check(run, obs, choice)
-				if not stop:
-					stop, text = await self._action_check(run, obs, choice)
+			stop = self._choice_check(run, obs, choice)
+			if not stop:
+				stop, text = await self._action_check(run, obs, choice)
 		if stop:
-			self.trace.write('system1_decision', self.step, **stats)
+			self._record_decision(request, reply)
 			return self._handback(run, stop, obs, choice)
-		assert choice is not None and reply is not None
+		assert choice is not None
 		target = choice.target
 		bu_action = decision.to_bu_action(choice.operation, target, text)
 		action = agent.ActionModel.model_validate(bu_action)
@@ -678,22 +773,31 @@ class JevExecutor:
 		self._record_target = target
 		self._source = 'system1'
 		stats.update(outcome='execute', bu_action=bu_action)
-		self.trace.write('system1_decision', self.step, **stats)
-		if agent.settings.save_conversation_path:
-			request = {'model': model, 'state': system_state, 'questions': questions}
-			self._saved_decision = {
-				'request': request,
-				'reply': reply.model_dump(),
-				'decision': {k: v for k, v in stats.items() if k != 'answers'},
-			}
+		self._record_decision(request, reply)
 		logger.info('System1 %s selected %s', run.id, output.memory)
 		return RouteResult(model_output=output)
 
-	def save_system1_step(self, agent: 'Agent', save_conversation_path: str | Path):
-		if self._saved_decision is not None:
-			path = Path(save_conversation_path) / f'system1_{agent.id}_{self.step}.json'
-			path.parent.mkdir(parents=True, exist_ok=True)
-			path.write_text(json.dumps(self._saved_decision, ensure_ascii=False, allow_nan=False, default=str), encoding='utf-8')
+	def _record_decision(self, request: _System1Request, reply: System1Reply | None) -> None:
+		stats = request.stats
+		self.trace.write('system1_decision', self.step, **stats)
+		directory = self.agent.settings.save_conversation_path
+		if not directory:
+			return
+		suffix = '_vision_rejected' if stats['outcome'] == 'vision_rejected' else ''
+		path = Path(directory) / f'system1_{self.agent.id}_{self.step}{suffix}.json'
+		path.parent.mkdir(parents=True, exist_ok=True)
+		record = {
+			'request': decision.request_body(
+				request.state, request.questions, request.model, with_image=request.image is not None
+			),
+			'reply': reply.model_dump() if reply else None,
+			'decision': {k: v for k, v in stats.items() if k != 'answers'},
+		}
+		if request.image is not None:
+			jpeg = path.with_suffix('.jpg')
+			jpeg.write_bytes(base64.b64decode(request.image.jpeg_b64, validate=True))
+			record['request_images'] = {'page-screenshot': jpeg.name}
+		path.write_text(json.dumps(record, ensure_ascii=False, allow_nan=False, default=str), encoding='utf-8')
 
 	def on_dispatch(self, agent: 'Agent'):
 		record = self.pending_record

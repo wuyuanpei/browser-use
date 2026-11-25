@@ -1,13 +1,19 @@
 import asyncio
+import base64
 import json
 import threading
 import time
+from email import policy
+from email.parser import BytesParser
+from io import BytesIO
 
 import pytest
+from PIL import Image
 from werkzeug.wrappers import Response
 
 from browser_use.agent.jev import JevSettings
-from browser_use.agent.jev.backends import JevBackend, System1Error
+from browser_use.agent.jev.backends import JevBackend, LLMBackend, System1Error
+from tests.ci.conftest import create_mock_llm
 
 QUESTIONS = {'operation': {'type': 'choice', 'criteria': {'WAIT': 'Wait'}, 'instructions': 'Choose'}}
 REPLY = {
@@ -57,6 +63,65 @@ async def test_retry_backoff(httpserver, backend):
 	reply = await backend.ask({}, QUESTIONS)
 	assert [a['status'] for a in reply.attempts] == [429, 529, 200]
 	assert reply.latency_ms >= 1490
+
+
+async def test_image_upload_replays_identical_multipart_after_429(httpserver, backend):
+	ref = '08a2f291-22a1-43cb-90fb-891609c73308'
+	state = {'page': {'screenshot': ref, 'viewport': {'width': 80, 'height': 40}}}
+	buffer = BytesIO()
+	Image.new('RGB', (80, 40), '#40b2a8').save(buffer, format='JPEG')
+	jpeg = buffer.getvalue()
+	images = {'page-screenshot': base64.b64encode(jpeg).decode('ascii')}
+	httpserver.expect_ordered_request(PATH).respond_with_data('', status=429)
+	httpserver.expect_ordered_request(PATH).respond_with_json(REPLY)
+	result = await backend.ask(state, QUESTIONS, images=images)
+	assert [a['status'] for a in result.attempts] == [429, 200]
+	assert (result.image_count, result.image_bytes) == (1, len(jpeg))
+
+	first, second = (request for request, _response in httpserver.log)
+	assert first.content_type == second.content_type
+	assert first.get_data() == second.get_data()
+	assert first.mimetype == 'multipart/form-data' and first.mimetype_params['boundary']
+	assert first.headers['Authorization'] == f'Bearer {KEY}'
+	assert first.headers['TypeSafe-Danger-Zone-Images'] == 'true'
+	mime = BytesParser(policy=policy.default).parsebytes(
+		f'Content-Type: {first.content_type}\r\n\r\n'.encode('ascii') + first.get_data()
+	)
+	request_part, image_part = mime.iter_parts()
+	assert request_part.get_param('name', header='Content-Disposition') == 'request'
+	assert request_part.get_filename() is None and request_part.get_content_type() == 'application/json'
+	request_json = request_part.get_payload(decode=True)
+	assert isinstance(request_json, bytes)
+	assert json.loads(request_json) == {
+		'model': 'jev-latest',
+		'state': state,
+		'questions': QUESTIONS,
+		'assets': {ref: {'type': 'image', 'part': 'page-screenshot', 'format': 'jpg'}},
+	}
+	assert image_part.get_param('name', header='Content-Disposition') == 'page-screenshot'
+	assert image_part.get_filename() == 'page-screenshot.jpg' and image_part.get_content_type() == 'image/jpeg'
+	assert image_part.get_payload(decode=True) == jpeg
+
+	httpserver.expect_oneshot_request(PATH).respond_with_json(REPLY)
+	text_reply = await backend.ask(state, QUESTIONS)
+	text_request, _ = httpserver.log[-1]
+	assert text_request.content_type == 'application/json' and 'TypeSafe-Danger-Zone-Images' not in text_request.headers
+	assert text_request.get_json() == {'model': 'jev-latest', 'state': state, 'questions': QUESTIONS}
+	assert (text_reply.image_count, text_reply.image_bytes) == (0, 0)
+
+
+async def test_rejected_image_returns_status_without_resubmitting(httpserver, backend):
+	httpserver.expect_oneshot_request(PATH).respond_with_data('invalid image', status=415)
+	with pytest.raises(System1Error) as error:
+		await backend.ask({'page': {'screenshot': 'viewport-id'}}, QUESTIONS, images={'page-screenshot': 'AQI='})
+	assert [attempt['status'] for attempt in error.value.attempts] == [415]
+	assert len(httpserver.log) == 1
+
+
+async def test_llm_backend_rejects_images():
+	backend = LLMBackend(JevSettings(system1='llm', system1_llm=create_mock_llm([])))
+	with pytest.raises(ValueError, match='require the Jev backend'):
+		await backend.ask({}, QUESTIONS, images={'page-screenshot': 'AQI='})
 
 
 @pytest.mark.parametrize(('statuses', 'expected'), [([503, 503, 503], 3), ([400], 1), ([302], 1)])

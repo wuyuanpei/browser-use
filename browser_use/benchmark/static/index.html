@@ -36,12 +36,12 @@
         <select id="system1-provider" disabled>
           <option value="none">无</option>
         </select>
-        <div class="screenshot-mode-control" role="group" aria-label="模型截图模式(暂不支持)" aria-describedby="screenshot-mode-hint">
-          <span>模型截图模式(暂不支持)</span>
+        <div class="screenshot-mode-control" role="group" aria-label="Jev 截图模式" aria-describedby="screenshot-mode-hint">
+          <span>Jev 截图模式</span>
           <div class="screenshot-mode-options">
             <button id="screenshot-off" type="button" aria-pressed="true">始终关闭</button>
             <button id="screenshot-always" type="button" aria-pressed="false" disabled>始终开启</button>
-            <button id="screenshot-smart" type="button" aria-pressed="false" disabled>智能开关</button>
+            <button id="screenshot-smart" type="button" aria-pressed="false" disabled title="智能截图暂未实现">智能开关</button>
           </div>
         </div>
         <label for="execution-mode">执行模式</label>
@@ -57,7 +57,7 @@
         </select>
         <span id="model-profile-current" class="muted"></span>
         <span id="model-profile-hint" class="muted">默认使用调试配置；最终报告配置仅用于本次显式选择的运行。</span>
-        <span id="screenshot-mode-hint" class="muted">模型使用文本输入，实时预览独立保存。</span>
+        <span id="screenshot-mode-hint" class="muted">选择 Jev 执行模式后可开启截图。</span>
       </div>
       <nav class="view-tabs" role="tablist" aria-label="任务模式">
         <button type="button" id="free-tab" role="tab" aria-controls="free-panel" aria-selected="true">自由任务</button>
@@ -138,10 +138,7 @@ Find one-way flights from Zurich to London on September 20, 2026, for one adult 
           ><span id="status" role="status">Ready to explore</span>
         </div>
         <div class="controls" id="free-controls"><label class="overlay-control"><input name="pace" id="pace" type="checkbox"> Slow motion</label>
-          <label class="overlay-control"
-            ><input name="overlays" id="overlays" type="checkbox" checked />
-            Targets</label
-          ><button type="button" id="choose" disabled>Choose next</button
+          <button type="button" id="choose" disabled>Choose next</button
           ><button type="button" id="execute" disabled>Execute choice</button
           ><button type="button" id="auto" disabled>Run automatically</button
           ><button type="button" id="stop" hidden>Pause</button>
@@ -159,6 +156,7 @@ Find one-way flights from Zurich to London on September 20, 2026, for one adult 
       </section>
       <div id="observation-toolbar" class="observation-toolbar" hidden>
         <label for="observation-step">观察步骤 <select id="observation-step"></select></label>
+        <label><input id="overlays" name="overlays" type="checkbox" checked /> 显示元素框</label>
         <span id="observation-status" role="status"></span>
       </div>
       <section id="research-panel" class="research-panel">

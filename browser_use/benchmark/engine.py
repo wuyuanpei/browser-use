@@ -226,8 +226,8 @@ class BrowserUseRun:
 			system1_model=config['model'],
 			system1_base_url=config['base_url'],
 			execution_mode=settings.execution_mode,
-			screenshot_mode=False,
-			screenshot_policy='off',
+			screenshot_mode=settings.screenshot_policy == 'always',
+			screenshot_policy=settings.screenshot_policy,
 			model_profile=settings.profile,
 			browser_mode='attached_chrome' if chrome is not None else 'isolated',
 			text_model=settings.evaluation.model,
@@ -294,10 +294,13 @@ class BrowserUseRun:
 
 	def snapshot(self) -> dict[str, Any]:
 		executor = getattr(self._native, '_jev', None)
+		roles = executor.usage_by_role() if executor is not None else {}
+		disabled = roles.get('system1', {}).get('vision_disabled')
 		return redact_secrets(
 			{
 				**self._state,
-				**({'jev_usage_by_role': executor.usage_by_role()} if executor is not None else {}),
+				**({'jev_usage_by_role': roles} if roles else {}),
+				'vision_disabled': disabled['status'] if disabled else None,
 				'token_usage': token_usage(self._state['model_calls']),
 				'elements': indexed_elements(self._state['page'].get('actions', [])),
 			},
@@ -384,6 +387,7 @@ class BrowserUseRun:
 			assert settings.execution_mode in ('isolated', 'collaborative')
 			jev_config['jev'] = JevSettings(
 				mode=settings.execution_mode,
+				screenshot_policy=settings.screenshot_policy,
 				jev_base_url=settings.jev.base_url,
 				jev_model=settings.jev.model,
 				jev_api_key=settings.jev.api_key,
@@ -418,6 +422,9 @@ class BrowserUseRun:
 
 	def _trace_jev_calls(self, executor):
 		"""Capture actual requests on this run's native clients; the executor owns costs and roles."""
+		from browser_use.agent.jev.backends import System1Error, image_rejection_status
+		from browser_use.agent.jev.decision import request_body
+
 		invoke = executor.usage.invoke
 
 		async def with_role(step, role, llm, messages, **kwargs):
@@ -431,13 +438,33 @@ class BrowserUseRun:
 		ask = executor.backend.ask
 		model = self._state['system1_model']
 
-		async def capture_jev(state, questions):
-			request = {'model': model, 'state': state, 'questions': questions}
-			with self.model_call('jev', role='system1', model=model, request=request, bu_step=executor.step) as record:
+		async def capture_jev(state, questions, *, images=None):
+			request = request_body(state, questions, model, with_image=bool(images))
+			image_files = {}
+			if images:
+				assert self._jev_dir is not None
+				name = f'system1_images/{executor.step}-{len(self._state["model_calls"]) + 1}.jpg'
+				path = self._jev_dir / name
+				path.parent.mkdir(exist_ok=True)
+				path.write_bytes(base64.b64decode(images['page-screenshot'], validate=True))
+				image_files['page-screenshot'] = name
+			with self.model_call(
+				'jev',
+				role='system1',
+				model=model,
+				request=request,
+				bu_step=executor.step,
+				request_images=image_files,
+				request_format='multipart/form-data' if images else 'application/json',
+				vision=bool(images),
+				vision_trigger='policy' if images else None,
+			) as record:
 				try:
-					reply = await ask(state, questions)
+					reply = await ask(state, questions, images=images)
 				except BaseException as error:
 					record['attempts'] = getattr(error, 'attempts', getattr(executor.backend, 'last_attempts', []))
+					if images and isinstance(error, System1Error) and image_rejection_status(error.attempts) is not None:
+						record['vision_rejected'] = True
 					raise
 				record['attempts'] = reply.attempts
 				record['response'] = {
@@ -448,6 +475,15 @@ class BrowserUseRun:
 				return reply
 
 		executor.backend.ask = capture_jev
+
+	def request_image(self, reference: str | None) -> bytes:
+		"""Read the JPEG bound to this live run's exact model request."""
+		if reference and self._jev_dir is not None:
+			for call in self._state['model_calls']:
+				name = call.get('request_images', {}).get('page-screenshot')
+				if name and call['request']['state']['page'].get('screenshot') == reference:
+					return (self._jev_dir / name).read_bytes()
+		raise ValueError('Unknown Jev screenshot')
 
 	def observe(self, phase: str = 'step', reason: str | None = None):
 		page = self._browser.observe()

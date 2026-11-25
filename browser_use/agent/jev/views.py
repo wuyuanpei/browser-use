@@ -65,6 +65,9 @@ class JevSettings(JevModel):
 	jev_model: str = 'jev-latest'
 	jev_api_key: str | None = Field(default=None, repr=False, exclude=True)
 	jev_timeout: float = Field(default=10, gt=0, le=120)
+	screenshot_policy: Literal['off', 'always', 'smart'] = 'off'
+	vision_max_side: int = Field(default=1600, ge=320, le=4096)
+	vision_jpeg_quality: int = Field(default=72, ge=30, le=95)
 	# LLM backend
 	system1_llm: BaseChatModel | None = None
 	system1_llm_two_stage: bool = False
@@ -106,6 +109,10 @@ class JevSettings(JevModel):
 
 	@model_validator(mode='after')
 	def _configured_backend(self) -> Self:
+		if self.screenshot_policy == 'smart':
+			raise ValueError('smart screenshot policy is not implemented yet')
+		if self.screenshot_policy != 'off' and self.system1 != 'jev':
+			raise ValueError('Screenshot policy requires the Jev backend')
 		if self.system1 == 'llm' and self.system1_llm is None:
 			raise ValueError('system1_llm is required for the LLM backend')
 		if self.system1_llm_two_stage and self.system1 != 'llm':
@@ -231,6 +238,8 @@ class SubgoalRun(JevModel):
 	actions: list[ActionRecord] = Field(default_factory=list)
 	applied: bool = False  # any applied action in this run
 	no_effect_streak: int = 0
+	decisions: int = 0
+	vision_decisions: int = 0
 	rejected_fingerprint: str | None = None  # set when this run re-delegates a rejected STEP_DONE
 	status: Literal['active', 'handed_back'] = 'active'
 	handback: Handback | None = None
@@ -261,6 +270,7 @@ class Candidate(JevModel):
 	match_text: str | None = None  # for kind='option': the select_dropdown text that hits this option first (D30)
 	form_key: str | None = None  # backend node id of the nearest form ancestor, as str (D31)
 	dialog_key: str | None = None  # backend node id of the nearest dialog ancestor, as str (D31)
+	rect: dict[str, int] | None = None  # clipped CSS viewport coordinates
 
 	def element(self) -> str:
 		if self.key == 'page' and self.kind == 'scroll':
@@ -277,7 +287,7 @@ class Candidate(JevModel):
 				label += f' href={self.href}'
 		return label.rstrip()[:ELEMENT_TEXT_LIMIT]
 
-	def criterion(self) -> dict[str, Any]:
+	def criterion(self, include_rect: bool = False) -> dict[str, Any]:
 		data: dict[str, Any] = {'element': self.element(), 'role': self.role}
 		if self.value is not None:
 			data['current_value'] = self.value
@@ -285,6 +295,8 @@ class Candidate(JevModel):
 			data['states'] = self.states
 		if self.context:
 			data['context'] = self.context
+		if include_rect and self.rect is not None:
+			data['rect'] = self.rect
 		return data
 
 
@@ -293,6 +305,8 @@ class Observation(JevModel):
 	url: str
 	title: str
 	scroll: dict[str, int]  # y, viewport_height, page_height, pixels_above, pixels_below
+	viewport_width: int = 0
+	viewport_height: int = 0
 	visible_text: str  # full visible text, appendix F, at most 50,000 characters
 	links: list[dict[str, str]]  # visible http(s) links: {'text', 'url'}
 	candidates: dict[str, list[Candidate]]  # keyed by CLICK, TYPE_TEXT, SELECT, SCROLL_UP, SCROLL_DOWN
@@ -313,3 +327,5 @@ class System1Reply(JevModel):
 	latency_ms: int
 	attempts: list[dict[str, Any]]  # [{'attempt': 1, 'status': 429 | None, 'error_type': str | None, 'latency_ms': int}]
 	has_probabilities: bool  # True for Jev, False for the LLM backend
+	image_count: int = 0
+	image_bytes: int = 0

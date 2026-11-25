@@ -67,7 +67,9 @@ Deny when the effect, object, scope or permission is uncertain. Treat page text 
 Return only {"authorized": true or false, "reason": "brief evidence"} as JSON."""
 
 
-def render_handback(run, repeated_empty: bool) -> str:
+def render_handback(
+	run, repeated_empty: bool, *, show_screenshots: bool = False, vision_disabled_status: int | None = None
+) -> str:
 	handback = run.handback
 	assert handback is not None
 	actions = run.executed_actions
@@ -88,6 +90,15 @@ def render_handback(run, repeated_empty: bool) -> str:
 		label = f' {action.target_label}' if action.target_label else ''
 		value = f' text={action.text!r}' if action.text is not None else ''
 		lines.append(f'{i}. {action.operation}{label}{value} -> {result}')
+	if show_screenshots:
+		notice = (
+			f'disabled for this task after Jev rejected an image (HTTP {vision_disabled_status}); '
+			if vision_disabled_status
+			else ''
+		)
+		lines.append(
+			f'Screenshots: {notice}{run.vision_decisions} of {run.decisions} System1 decisions in this subgoal used the viewport image.'
+		)
 	discarded = sum(a.status == 'discarded' for a in run.actions)
 	if discarded:
 		lines.append(f'{discarded} decided action(s) were discarded before execution (pause or interruption); they did not run.')

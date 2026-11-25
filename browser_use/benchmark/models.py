@@ -56,6 +56,7 @@ class RunSettings(BaseModel):
 
 	profile: Literal['debug', 'final_report']
 	execution_mode: ExecutionMode = 'direct'
+	screenshot_policy: Literal['off', 'always'] = 'off'
 	jev: ModelEndpoint | None = None
 	execution: ExecutionModel
 	evaluation: EvaluationModel
@@ -162,8 +163,12 @@ def runtime_settings(
 	if provider not in (None, '', PROVIDER) and not (provider == 'jev' and mode != 'direct'):
 		raise ValueError('测试台使用 Browser Use 执行。')
 	policy = screenshot_policy if screenshot_policy is not None else 'always' if screenshot_mode else 'off'
-	if policy != 'off':
-		raise ValueError('当前两套 DeepSeek 配置使用文本输入，实时预览仍会生成。')
+	if policy == 'smart':
+		raise ValueError('智能截图暂未实现。')
+	if policy not in ('off', 'always'):
+		raise ValueError('screenshot_policy must be off or always')
+	if mode == 'direct' and policy != 'off':
+		raise ValueError('BU 直接执行模式只支持关闭模型截图。')
 	jev = None
 	if mode != 'direct':
 		from browser_use.agent.jev import JevSettings
@@ -199,6 +204,7 @@ def runtime_settings(
 	return RunSettings(
 		profile=profile,
 		execution_mode=mode,
+		screenshot_policy=policy,
 		jev=jev,
 		execution=ExecutionModel(
 			model=endpoint.model, base_url=endpoint.base_url, api_key=endpoint.api_key, timeout=timeout, max_tokens=max_tokens

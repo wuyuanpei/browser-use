@@ -223,6 +223,7 @@ class BaselineManager:
 		snapshot.setdefault('system1_provider', row.get('system1_provider', 'laya'))
 		snapshot.setdefault('screenshot_mode', row.get('screenshot_mode', False))
 		snapshot.setdefault('screenshot_policy', row.get('screenshot_policy', 'always' if snapshot['screenshot_mode'] else 'off'))
+		snapshot.setdefault('vision_disabled', row.get('vision_disabled'))
 		# 老归档只在返回对象中补默认值，不迁移或覆写原始文件。
 		snapshot.setdefault('execution_mode', row.get('execution_mode', 'direct'))
 		snapshot.setdefault('model_profile', row.get('model_profile', DEBUG_PROFILE))
@@ -269,10 +270,12 @@ class BaselineManager:
 		return self.clean(snapshot)
 
 	def frame(self, run_id, attempt_id, name):
-		if not isinstance(name, str) or not re.fullmatch(r'\d{6}\.jpg', name):
+		if isinstance(name, str) and re.fullmatch(r'\d{6}\.jpg', name):
+			name = f'screenshots/{name}'
+		elif not isinstance(name, str) or not re.fullmatch(r'system1_images/[0-9]+-[0-9]+\.jpg', name):
 			raise ValueError('Invalid screenshot name')
 		folder = self.attempt_folder(run_id, attempt_id)
-		path = (folder / 'screenshots' / name).resolve()
+		path = (folder / name).resolve()
 		if not path.is_relative_to(folder) or not path.is_file():
 			raise ValueError('Unknown screenshot')
 		return path.read_bytes()
@@ -294,6 +297,7 @@ class BaselineManager:
 			system1_provider, execution_mode, screenshot_mode, screenshot_policy=screenshot_policy, model_profile=model_profile
 		)
 		config = settings.system1_config()
+		jev_model = settings.jev.model if settings.jev else None
 		profile, text = settings.profile, settings.evaluation
 		text_endpoint = text.public()['base_url']
 		ids = [t['id'] for t in self.tasks] if task_ids is None else task_ids
@@ -334,13 +338,16 @@ class BaselineManager:
 					laya_calls=0,
 					deepseek_calls=0,
 					jev_calls=0,
+					vision_requests=0,
+					vision_disabled=None,
 					decision_calls=0,
 					decision_rounds=0,
 					system1_provider=config['provider'],
 					text_calls=0,
 					execution_mode=settings.execution_mode,
-					screenshot_mode=False,
-					screenshot_policy='off',
+					jev_model=jev_model,
+					screenshot_mode=settings.screenshot_policy == 'always',
+					screenshot_policy=settings.screenshot_policy,
 					model_profile=profile,
 					text_model=text.model,
 					text_model_base_url=text_endpoint,
@@ -371,8 +378,9 @@ class BaselineManager:
 				system1=config,
 				execution_mode=settings.execution_mode,
 				planner=settings.execution.public() if settings.jev is not None else None,
-				screenshot_mode=False,
-				screenshot_policy='off',
+				jev_model=jev_model,
+				screenshot_mode=settings.screenshot_policy == 'always',
+				screenshot_policy=settings.screenshot_policy,
 				model_profile=profile,
 				text_model=text.model,
 				text_model_base_url=text_endpoint,
@@ -403,8 +411,9 @@ class BaselineManager:
 					'seconds': self.timeout,
 				},
 				'execution_mode': settings.execution_mode,
-				'screenshot_mode': False,
-				'screenshot_policy': 'off',
+				'jev_model': jev_model,
+				'screenshot_mode': batch['screenshot_mode'],
+				'screenshot_policy': settings.screenshot_policy,
 				'model_profile': profile,
 				'system1': config,
 				'planner': settings.execution.public() if settings.jev is not None else None,
@@ -461,6 +470,7 @@ class BaselineManager:
 			'execution_elapsed_ms',
 			'execution_mode',
 			'system1_provider',
+			'jev_model',
 			'model_profile',
 			'text_model',
 			'screenshot_policy',
@@ -473,6 +483,8 @@ class BaselineManager:
 			'laya_calls',
 			'deepseek_calls',
 			'jev_calls',
+			'vision_requests',
+			'vision_disabled',
 			'text_calls',
 			'planner_calls',
 			'replans',
@@ -534,8 +546,8 @@ class BaselineManager:
 			'',
 			'| 任务 | 轮次 | 执行状态 / 评估状态 / 模型判决 | 动作 | '
 			'决策轮 / System1 / 文本 / Planner / 收集 / 总结 / 复核 '
-			'| 改计划 | 耗时(ms) |',
-			'|---|---:|---|---:|---:|---:|---:|',
+			'| 带图请求 | 拒图禁用（HTTP） | 改计划 | 耗时(ms) |',
+			'|---|---:|---|---:|---:|---:|---|---:|---:|',
 		]
 		for row in batch['attempts']:
 			final = (row.get('evaluation') or {}).get('final', {})
@@ -549,7 +561,8 @@ class BaselineManager:
 				f'{row.get("decision_rounds", row.get("decision_calls", row["laya_calls"]))} / '
 				f'{row.get("decision_calls", row["laya_calls"])} / {row["text_calls"]} / '
 				f'{row.get("planner_calls", 0)} / {row.get("collect_calls", 0)} / '
-				f'{row.get("summarize_calls", 0)} / {row.get("verify_calls", 0)} | {row.get("replans", 0)} | '
+				f'{row.get("summarize_calls", 0)} / {row.get("verify_calls", 0)} | '
+				f'{row.get("vision_requests", "—")} | {row.get("vision_disabled") or ""} | {row.get("replans", 0)} | '
 				f'{row["elapsed_ms"]} |'
 			)
 		report += [
@@ -773,6 +786,8 @@ class BaselineManager:
 						jev_usage_by_role=roles,
 						jev_trace_path=snapshot['jev_trace_path'],
 						jev_calls=roles['system1']['calls'],
+						vision_requests=roles['system1']['vision_requests'],
+						vision_disabled=snapshot.get('vision_disabled'),
 						decision_calls=roles['system1']['calls'],
 						planner_calls=roles['planner']['calls'],
 						text_calls=roles['text']['calls'],

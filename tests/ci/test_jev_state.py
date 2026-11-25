@@ -1,5 +1,9 @@
 import asyncio
+import base64
+import io
 
+import pytest
+from PIL import Image
 from pytest_httpserver import HTTPServer
 from werkzeug.wrappers import Request, Response
 
@@ -7,6 +11,7 @@ from browser_use import Agent
 from browser_use.agent.jev.rules import enter_effect
 from browser_use.agent.jev.state import observe, selected_option
 from browser_use.agent.jev.views import JevSettings
+from browser_use.agent.jev.vision import prepare_screenshot
 from browser_use.browser.session import BrowserSession
 from tests.ci.conftest import create_mock_llm
 from tests.ci.jev_support import (
@@ -105,6 +110,71 @@ async def test_viewport_and_scroll_targets(jev_browser: BrowserSession, httpserv
 	box = await observe_page(jev_browser)
 	for key in ['SCROLL_DOWN', 'SCROLL_UP']:
 		assert 'Results' in {c.name for c in box.candidates[key]}
+
+
+@pytest.mark.parametrize('dpr', [1, 1.5])
+async def test_screenshot_rects_after_scrolling_page_and_iframe(jev_browser: BrowserSession, httpserver: HTTPServer, dpr: float):
+	url = serve_page(
+		httpserver,
+		'/image-rects',
+		"""<style>
+		body {margin:0; height:2200px}
+		#page-button {position:absolute; left:-8px; top:690px; width:96px; height:60px; background:#fc4422; border:0}
+		iframe {position:absolute; left:330px; top:850px; width:240px; height:140px; border:6px solid purple}
+		</style>
+		<button id="page-button" aria-label="Page target"></button>
+		<iframe srcdoc="<style>body{margin:0;height:800px}
+		button{position:absolute;left:31px;top:200px;width:80px;height:36px;background:#0cb45a;border:0}
+		</style><button aria-label='Frame target'></button>"></iframe>""",
+	)
+	await jev_browser.navigate_to(url)
+	cdp = await jev_browser.get_or_create_cdp_session()
+	original = await browser_eval(jev_browser, '[innerWidth, innerHeight, devicePixelRatio]')
+
+	async def set_metrics(width: int, height: int, scale: float):
+		await cdp.cdp_client.send.Emulation.setDeviceMetricsOverride(
+			params={'width': width, 'height': height, 'deviceScaleFactor': scale, 'mobile': False}, session_id=cdp.session_id
+		)
+
+	try:
+		await set_metrics(1280, 720, dpr)
+		await browser_eval(
+			jev_browser,
+			'scrollTo(0,700); frames[0].scrollTo(0,164); new Promise(ok=>requestAnimationFrame(()=>requestAnimationFrame(()=>ok(true))))',
+		)
+		summary = await jev_browser.get_browser_state_summary(include_screenshot=True)
+		obs = await observe(jev_browser, summary, JevSettings(screenshot_policy='always'), 1)
+		assert (obs.viewport_width, obs.viewport_height) == (1280, 720)
+		image = prepare_screenshot(summary.screenshot, obs.viewport_width, obs.viewport_height, max_side=1600, quality=72)
+		assert image is not None and image.scale == dpr
+		# Independent DOM measurement includes the frame's content origin and both scroll offsets.
+		expected = await browser_eval(
+			jev_browser,
+			"""(() => {
+				const frame = document.querySelector('iframe'), fr = frame.getBoundingClientRect();
+				const page = document.querySelector('button').getBoundingClientRect();
+				const child = frames[0].document.querySelector('button').getBoundingClientRect();
+				return {'Page target': {x:0, y:0, w:page.right, h:page.bottom},
+					'Frame target': {x:fr.left+frame.clientLeft+child.left, y:fr.top+frame.clientTop+child.top,
+						w:child.width, h:child.height}};
+			})()""",
+		)
+		assert expected['Page target'] == {'x': 0, 'y': 0, 'w': 88, 'h': 50}
+		assert expected['Frame target'] == {'x': 367, 'y': 192, 'w': 80, 'h': 36}
+		colors = {'Page target': (252, 68, 34), 'Frame target': (12, 180, 90)}
+		candidates = {c.name: c for c in obs.candidates['CLICK']}
+		with Image.open(io.BytesIO(base64.b64decode(image.jpeg_b64))) as jpeg:
+			for name, color in colors.items():
+				rect = candidates[name].rect
+				assert rect == expected[name], (name, rect, expected[name])
+				assert rect is not None
+				x, y, w, h = (rect[key] for key in ('x', 'y', 'w', 'h'))
+				for point in ((x + 5, y + 5), (x + w - 6, y + h - 6)):
+					pixel = jpeg.getpixel(point)
+					assert isinstance(pixel, tuple)
+					assert max(abs(a - b) for a, b in zip(pixel, color, strict=True)) <= 8
+	finally:
+		await set_metrics(*original)
 
 
 async def test_visibility_and_password(jev_browser: BrowserSession, httpserver: HTTPServer):

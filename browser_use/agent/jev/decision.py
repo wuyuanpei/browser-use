@@ -22,6 +22,7 @@ from browser_use.agent.jev.views import (
 	SubgoalRun,
 	System1Reply,
 )
+from browser_use.agent.jev.vision import PreparedImage
 
 ENABLED_OPERATIONS: tuple[Operation, ...] = get_args(Operation)
 SYSTEM1_ACTIONS = ['click', 'input', 'select_dropdown', 'scroll', 'wait', 'go_back', 'send_keys', 'switch', 'collect_page']
@@ -119,12 +120,21 @@ def action_state(record: ActionRecord, *, include_run: bool = False) -> dict[str
 
 
 def build_state(
-	obs: Observation, run: SubgoalRun, task: str, task_actions: list[ActionRecord], research: dict[str, Any] | None = None
+	obs: Observation,
+	run: SubgoalRun,
+	task: str,
+	task_actions: list[ActionRecord],
+	research: dict[str, Any] | None = None,
+	*,
+	vision: tuple[str, PreparedImage] | None = None,
 ) -> dict[str, Any]:
 	state: dict[str, Any] = {}
 	if research and (research.get('collect_available') or research.get('collected_pages')):
 		state['research'] = research
 	state['page'] = {'url': obs.url, 'title': obs.title, 'scroll': obs.scroll, 'text': page_text(obs.visible_text)}
+	if vision is not None:
+		ref, image = vision
+		state['page'].update(screenshot=ref, viewport={'width': image.width, 'height': image.height})
 	state['original_goal'] = task
 	params = run.params
 	subgoal: dict[str, Any] = {'id': run.id, 'objective': params.objective, 'completion': params.completion}
@@ -155,6 +165,7 @@ def build_questions(
 	*,
 	research: dict[str, Any] | None = None,
 	registered_actions: Collection[str] | None = None,
+	vision: PreparedImage | bool | None = None,
 ) -> dict[str, dict[str, Any]]:
 	params = run.params
 	context = [f'Current objective: {params.objective}', f'Completion: {params.completion}']
@@ -181,6 +192,8 @@ def build_questions(
 		rules.append(wording.COLLECTION_RULES)
 	if 'CLICK' in offered and any(c.kind == 'tab' for c in _targets(obs, 'CLICK', registered_actions)):
 		rules.append(wording.TAB_RULE)
+	if vision:
+		rules.append(wording.VISION_RULES)
 	criteria: dict[str, Any] = {}
 	questions: dict[str, dict[str, Any]] = {
 		'operation': {'type': 'choice', 'criteria': criteria, 'instructions': '\n'.join(context + rules)}
@@ -198,21 +211,40 @@ def build_questions(
 			target_rules.append(wording.TYPE_TEXT_TARGET_RULE)
 		if op == 'CLICK' and research_active:
 			target_rules.append(wording.COLLECTION_BOUNDARY)
+		if vision:
+			target_rules.append(wording.VISION_TARGET_RULES)
+		include_rect = bool(vision) and op in ('CLICK', 'TYPE_TEXT', 'SELECT')
+		target_criteria = {c.key: c.criterion(include_rect=include_rect) for c in targets}
+		if include_rect and isinstance(vision, PreparedImage):
+			for item in target_criteria.values():
+				if 'rect' in item:
+					item['rect'] = vision.project_rect(item['rect'])
 		questions[f'{op.lower()}_target'] = {
 			'type': 'choice',
-			'criteria': {c.key: c.criterion() for c in targets},
+			'criteria': target_criteria,
 			'instructions': '\n'.join(context + target_rules),
 		}
 	return questions
 
 
-def request_size(state: dict[str, Any], questions: dict[str, dict[str, Any]], model: str | None = None) -> int:
+def request_body(
+	state: dict[str, Any], questions: dict[str, dict[str, Any]], model: str | None = None, *, with_image: bool = False
+) -> dict[str, Any]:
 	body = (
 		{'model': model, 'state': state, 'questions': questions}
 		if model is not None
 		else {'state': state, 'questions': questions}
 	)
-	return len(json.dumps(body, ensure_ascii=False, allow_nan=False))
+	page = state.get('page')
+	if with_image and isinstance(page, dict) and isinstance(ref := page.get('screenshot'), str) and ref:
+		body['assets'] = {ref: {'type': 'image', 'part': 'page-screenshot', 'format': 'jpg'}}
+	return body
+
+
+def request_size(
+	state: dict[str, Any], questions: dict[str, dict[str, Any]], model: str | None = None, *, with_image: bool = False
+) -> int:
+	return len(json.dumps(request_body(state, questions, model, with_image=with_image), ensure_ascii=False, allow_nan=False))
 
 
 def _is_probability(value: Any) -> bool:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 from collections.abc import Iterator
 from typing import Any
 from urllib.parse import urljoin
@@ -297,7 +298,26 @@ def _visible(node: EnhancedDOMTreeNode, width: int, height: int) -> bool:
 	)
 
 
-def _element(index: int, node: EnhancedDOMTreeNode, url: str, settings: JevSettings) -> Candidate:
+def _viewport_rect(node: EnhancedDOMTreeNode, width: int, height: int) -> dict[str, int] | None:
+	rect = node.absolute_position
+	if rect is None:
+		return None
+	x, y = rect.x, rect.y
+	# BU adds each iframe's border-box origin. Its document starts inside the border.
+	parent = node.parent
+	while parent is not None:
+		if parent.tag_name in {'iframe', 'frame'} and parent.snapshot_node and (client := parent.snapshot_node.clientRects):
+			x += client.x
+			y += client.y
+		parent = parent.parent
+	left, top = max(0, math.floor(x)), max(0, math.floor(y))
+	right, bottom = min(width, math.ceil(x + rect.width)), min(height, math.ceil(y + rect.height))
+	if left >= right or top >= bottom:
+		return None
+	return {'x': left, 'y': top, 'w': right - left, 'h': bottom - top}
+
+
+def _element(index: int, node: EnhancedDOMTreeNode, url: str, settings: JevSettings, width: int, height: int) -> Candidate:
 	attrs, tag, role, states = node.attributes, node.tag_name, _role(node), _states(node)
 	context, form_key, dialog_key = _context(node)
 	kind = attrs.get('type', 'text').lower() if tag == 'input' else None
@@ -329,6 +349,7 @@ def _element(index: int, node: EnhancedDOMTreeNode, url: str, settings: JevSetti
 		placeholder=_short(attrs.get('placeholder'), 80) or None,
 		href=href[:200] if href and rules.http_url(href) else None,
 		context=context,
+		rect=_viewport_rect(node, width, height),
 		editable=editable,
 		is_submit=rules.is_ordinary_submit(tag, kind, attrs.get('type'), bool(form_key or 'form' in attrs)),
 		risky_effect=rules.risky_effect(role, name, settings.risky_action_labels)
@@ -419,7 +440,7 @@ async def observe(browser_session: BrowserSession, summary: BrowserStateSummary,
 	for index, node in summary.dom_state.selector_map.items():
 		if not _visible(node, width, height):
 			continue
-		field = _element(index, node, page_url, settings)
+		field = _element(index, node, page_url, settings, width, height)
 		if not field.states.get('disabled') and field.tag not in {'select', 'option'}:
 			candidates['CLICK'].append(field)
 		if field.editable:
@@ -452,6 +473,9 @@ async def observe(browser_session: BrowserSession, summary: BrowserStateSummary,
 		step=step,
 		url=page_url,
 		title=summary.title or rendered['title'],
+		# A viewport screenshot includes classic scrollbars. PageInfo describes the content area.
+		viewport_width=viewport.get('width') or width,
+		viewport_height=viewport.get('height') or height,
 		scroll=scroll,
 		visible_text=rendered['text'],
 		links=rendered['links'],

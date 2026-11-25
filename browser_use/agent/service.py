@@ -1859,7 +1859,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 
 		if self.settings.save_conversation_path and self.state.last_model_output:
 			if self._jev is not None and self._jev.step_source() == 'system1':
-				self._jev.save_system1_step(self, self.settings.save_conversation_path)
+				# Jev records its own request at decision time, including turns handed back to the planner.
 				return
 			# Treat save_conversation_path as a directory (consistent with other recording paths)
 			conversation_dir = Path(self.settings.save_conversation_path)

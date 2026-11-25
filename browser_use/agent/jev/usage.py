@@ -46,6 +46,9 @@ class UsageLedger:
 		self.cost = token_cost
 		self.trace = trace
 		self.cursor = len(token_cost.usage_history)
+		self.vision_requests = 0
+		self.vision_rejections = 0
+		self.vision_disabled: dict[str, int] | None = None
 		self.roles = {name: RoleUsage() for name in ('planner', 'system1', 'text', 'summary', 'answer', 'risk', 'other')}
 
 	async def _price(self, model: str, usage: ChatInvokeUsage | None) -> float | None:
@@ -123,9 +126,11 @@ class UsageLedger:
 		await self._record_llm(role, llm.model, response.usage, step, start, True, None, attempt)
 		return response
 
-	def record_jev(self, reply: System1Reply | None, elapsed_ms: int, attempts: int = 1):
+	def record_jev(self, reply: System1Reply | None, elapsed_ms: int, attempts: int = 1, *, vision: bool = False):
 		# A transport retry is a separate HTTP request. Only the final reply reports usage.
 		attempts = max(1, len(reply.attempts)) if reply is not None else attempts
+		if vision or (reply is not None and reply.image_count):
+			self.vision_requests += attempts
 		for i in range(max(1, attempts)):
 			final = i == attempts - 1 and reply is not None
 			prompt = reply.input_tokens if final and reply else None
@@ -135,8 +140,19 @@ class UsageLedger:
 				prompt=prompt, completion=completion, cached=None, latency=elapsed_ms if i == 0 else 0, cost=cost
 			)
 
+	def record_vision_rejection(self, status: int, step: int) -> None:
+		self.vision_rejections += 1
+		if self.vision_disabled is None:
+			self.vision_disabled = {'status': status, 'step': step}
+
 	def summary(self) -> dict[str, dict]:
 		rows = {role: counters.model_dump() for role, counters in self.roles.items()}
+		rows['system1'].update(
+			vision_requests=self.vision_requests,
+			text_requests=self.roles['system1'].calls - self.vision_requests,
+			vision_rejections=self.vision_rejections,
+			vision_disabled=self.vision_disabled.copy() if self.vision_disabled else None,
+		)
 		# Native BU does not publish an entry or its latency when no usage is returned.
 		# Keep these observed totals usable without implying complete coverage for other.
 		rows['other'].update(call_coverage='reported_usage_only', latency_coverage='unavailable')

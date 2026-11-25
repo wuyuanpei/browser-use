@@ -268,6 +268,15 @@ class Handler(BaseHTTPRequestHandler):
 		if path == '/api/state':
 			with LOCK:
 				return self.send(200, json.dumps(response_state()))
+		if path == '/api/jev/frame':
+			try:
+				agent = AGENT
+				if agent is None:
+					raise ValueError('No active Jev run')
+				reference = parse_qs(urlparse(self.path).query).get('ref', [None])[0]
+				return self.send(200, agent.request_image(reference), 'image/jpeg')
+			except (ValueError, OSError) as error:
+				return self.send(404, json.dumps({'error': public_error(error)}))
 		if path == '/demo.mp4':
 			video = ROOT / 'docs' / 'demo.mp4'
 			if video.exists():

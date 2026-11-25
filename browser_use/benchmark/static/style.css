@@ -374,6 +374,7 @@ a:focus-visible {
   border: 1px solid #adc7ae;
 }
 .target.selected {
+  z-index: 1;
   border: 2px solid var(--orange);
   background: rgb(237 103 56 / 0.1);
 }

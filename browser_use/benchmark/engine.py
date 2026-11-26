@@ -463,13 +463,16 @@ class BrowserUseRun:
 			from browser_use.agent.jev import JevSettings
 
 			assert settings.execution_mode in ('isolated', 'collaborative')
-			jev_config['jev'] = JevSettings(
-				mode=settings.execution_mode,
-				jev_base_url=settings.jev.base_url,
-				jev_model=settings.jev.model,
-				jev_api_key=settings.jev.api_key,
-				trace_path=self._jev_dir / 'jev_trace.jsonl',
-				capture_dir=self._jev_dir / 'jev_captures',
+			jev_config['jev'] = JevSettings.model_validate(
+				{
+					'mode': settings.execution_mode,
+					'jev_base_url': settings.jev.base_url,
+					'jev_model': settings.jev.model,
+					'jev_api_key': settings.jev.api_key,
+					'trace_path': self._jev_dir / 'jev_trace.jsonl',
+					'capture_dir': self._jev_dir / 'jev_captures',
+					**settings.jev_probability_options(),
+				}
 			)
 		self._native = Agent(
 			task=self._state['goal'],

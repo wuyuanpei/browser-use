@@ -265,6 +265,35 @@ def test_modes_and_model_profiles_are_independent(monkeypatch, tmp_path: Path):
 	assert runtime_settings().system1_config()['provider'] == 'browser_use'
 
 
+def test_workbench_probability_floors_can_be_set_to_zero(monkeypatch):
+	monkeypatch.setenv('PLANNER_API_KEY', 'mock-plan-key')
+	monkeypatch.setenv('TEXT_MODEL_API_KEY', 'mock-text-key')
+	monkeypatch.setenv('TYPESAFE_API_KEY', 'mock-jev-key')
+	operation = 'BROWSER_USE_BENCHMARK_JEV_MIN_OPERATION_PROBABILITY'
+	target = 'BROWSER_USE_BENCHMARK_JEV_MIN_TARGET_PROBABILITY'
+	monkeypatch.delenv(operation, raising=False)
+	monkeypatch.delenv(target, raising=False)
+	assert runtime_settings('jev', 'isolated').jev_probability_options() == {
+		'min_operation_probability': 0.8,
+		'min_target_probability': 0.8,
+	}
+	monkeypatch.setenv(operation, '0')
+	monkeypatch.setenv(target, '0')
+	assert runtime_settings('jev', 'isolated').jev_probability_options() == {
+		'min_operation_probability': 0.0,
+		'min_target_probability': 0.0,
+	}
+	monkeypatch.setenv(operation, '0.8')
+	assert runtime_settings('jev', 'isolated').jev_probability_options() == {
+		'min_operation_probability': 0.8,
+		'min_target_probability': 0.0,
+	}
+	assert runtime_settings().jev_probability_options() == {}
+	monkeypatch.setenv(target, '1.1')
+	with pytest.raises(ValidationError, match='min_target_probability'):
+		runtime_settings('jev', 'isolated')
+
+
 def test_jev_retry_and_legacy_token_totals():
 	legacy = {'kind': 'jev', 'response': {'usage': {'input_tokens': 7}}}
 	new = {
@@ -287,7 +316,9 @@ def test_workbench_real_page_repredicts_and_keeps_per_role_evidence(
 	# Windows may supply a system proxy for localhost. The model server and page both run inside this test.
 	monkeypatch.setenv('NO_PROXY', 'localhost,127.0.0.1,::1')
 	httpserver.expect_request('/task').respond_with_data(
-		'<link rel="icon" href="data:,"><title>Save work</title><button id="save" onclick="document.querySelector(\'output\').textContent=\'Saved\'; fetch(\'/save\',{method:\'POST\'})">Save</button><output>Ready</output>',
+		'<link rel="icon" href="data:,"><title>Save work</title>'
+		"<button id=\"save\" onclick=\"document.querySelector('output').textContent='Saved'; "
+		"fetch('/save',{method:'POST'})\">Save</button><button>Cancel</button><output>Ready</output>",
 		content_type='text/html',
 	)
 	saved = []
@@ -370,7 +401,13 @@ def test_workbench_real_page_repredicts_and_keeps_per_role_evidence(
 			else:
 				choice = next(iter(criteria))
 			assert choice in criteria
-			answers[name] = {'choice': choice, 'confidence': 1.0, 'probabilities': {k: float(k == choice) for k in criteria}}
+			probabilities = {k: float(k == choice) for k in criteria}
+			if name == 'operation' and choice == 'CLICK':
+				probabilities.update(CLICK=0.75, UNABLE=0.25)
+			elif name == 'click_target':
+				other = next(k for k, v in criteria.items() if '"Cancel"' in v['element'])
+				probabilities.update({choice: 0.65, other: 0.35})
+			answers[name] = {'choice': choice, 'confidence': probabilities[choice], 'probabilities': probabilities}
 		return Response(
 			json.dumps({'model': 'local-jev', 'answers': answers, 'usage': {'input_tokens': 25, 'output_tokens': 2}}),
 			mimetype='application/json',
@@ -385,6 +422,8 @@ def test_workbench_real_page_repredicts_and_keeps_per_role_evidence(
 		execution=ExecutionModel(**endpoint, timeout=10, max_tokens=500),
 		evaluation=EvaluationModel(**endpoint, reasoning={}),
 		jev=ModelEndpoint(model='local-jev', base_url=httpserver_ipv4.url_for('/').rstrip('/'), api_key='dummy-jev-key'),
+		min_operation_probability=0,
+		min_target_probability=0,
 		headless=True,
 		user_data_dir=str(tmp_path / 'profile'),
 	)
@@ -417,6 +456,7 @@ def test_workbench_real_page_repredicts_and_keeps_per_role_evidence(
 		assert 'Save work' in partial['partial_result']['markdown'] or 'Ready' in partial['partial_result']['markdown']
 		discarded = run.command('predict')['decision']
 		assert discarded['decision_source'] == 'system1'
+		assert discarded['operation_probabilities']['CLICK'] == 0.75 and discarded['target_confidence'] == 0.65
 		run._browser.evaluate("history.replaceState(null,'','?after=stale')")
 		retry = run.command('act')
 		assert retry['stale_retries'] == 1 and not saved

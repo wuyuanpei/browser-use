@@ -407,6 +407,7 @@ class BaselineManager:
 				'screenshot_policy': 'off',
 				'model_profile': profile,
 				'system1': config,
+				**({'jev_probability_thresholds': settings.jev_probability_options()} if settings.jev is not None else {}),
 				'planner': settings.execution.public() if settings.jev is not None else None,
 				'viewport': VIEWPORT,
 				'browser_mode': self._browser_mode,

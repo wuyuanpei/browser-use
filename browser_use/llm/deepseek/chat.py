@@ -179,7 +179,8 @@ class ChatDeepSeek(BaseChatModel):
 				raise ModelProviderError(str(e), model=self.name) from e
 
 		# ② Function Calling path (with tools or output_format)
-		if tools or (output_format is not None and hasattr(output_format, 'model_json_schema')):
+		json_mode = not tools and output_format is not None and kwargs.get('response_format') == {'type': 'json_object'}
+		if not json_mode and (tools or (output_format is not None and hasattr(output_format, 'model_json_schema'))):
 			try:
 				call_tools = tools
 				tool_choice = None
@@ -215,7 +216,13 @@ class ChatDeepSeek(BaseChatModel):
 				except (json.JSONDecodeError, ValidationError) as e:
 					if output_format is None:
 						raise
-					raise ModelOutputFormatError(str(e), model=self.name) from e
+					raise ModelOutputFormatError(
+						str(e),
+						model=self.name,
+						raw_text=raw_args,
+						finish_reason=getattr(resp.choices[0], 'finish_reason', None),
+						usage=self._get_usage(resp),
+					) from e
 				return ChatInvokeCompletion(completion=completion, usage=self._get_usage(resp))
 			except ModelOutputFormatError:
 				raise
@@ -226,8 +233,8 @@ class ChatDeepSeek(BaseChatModel):
 			except Exception as e:
 				raise ModelProviderError(str(e), model=self.name) from e
 
-		# ③ JSON Output path (official response_format)
-		if output_format is not None and hasattr(output_format, 'model_json_schema'):
+		# ③ Explicit JSON Output path (official response_format)
+		if json_mode and output_format is not None:
 			try:
 				resp = await client.chat.completions.create(  # type: ignore
 					model=self.model,

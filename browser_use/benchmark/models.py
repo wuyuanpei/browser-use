@@ -7,7 +7,9 @@ from typing import Any, Literal
 from urllib.parse import urlsplit, urlunsplit
 
 from dotenv import dotenv_values
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, computed_field, field_validator
+
+from browser_use.agent.jev.views import CandidatePipeline, EffectiveCandidatePipeline, resolve_candidate_pipeline
 
 PROVIDER = 'browser_use'
 ExecutionMode = Literal['direct', 'isolated', 'collaborative']
@@ -60,6 +62,10 @@ class RunSettings(BaseModel):
 
 	profile: Literal['debug', 'final_report']
 	execution_mode: ExecutionMode = 'direct'
+	screenshot_policy: Literal['off', 'always', 'smart'] = 'off'
+	candidate_pipeline: CandidatePipeline | None = None
+	vision_escalation: bool | None = Field(default=None, validate_default=True)
+	min_read_operation_probability: float = Field(default=0.6, ge=0, le=1)
 	jev: ModelEndpoint | None = None
 	min_operation_probability: float | None = Field(default=None, ge=0, le=1)
 	min_target_probability: float | None = Field(default=None, ge=0, le=1)
@@ -70,6 +76,20 @@ class RunSettings(BaseModel):
 
 	def jev_probability_options(self) -> dict[str, float]:
 		return self.model_dump(include=set(JEV_PROBABILITY_ENV), exclude_none=True)
+
+	@field_validator('vision_escalation', mode='before')
+	@classmethod
+	def _smart_escalation(cls, value: Any, info: ValidationInfo) -> Any:
+		if info.data.get('screenshot_policy') != 'smart':
+			return None
+		return True if value is None else value
+
+	@computed_field
+	@property
+	def effective_candidate_pipeline(self) -> EffectiveCandidatePipeline | None:
+		if self.jev is None:
+			return None
+		return resolve_candidate_pipeline(self.candidate_pipeline, self.screenshot_policy)
 
 	def system1_config(self) -> dict[str, str]:
 		if self.jev is not None:
@@ -163,7 +183,14 @@ def model_profiles() -> list[dict[str, Any]]:
 
 
 def runtime_settings(
-	provider=None, mode=None, screenshot_mode=False, *, screenshot_policy=None, model_profile=None
+	provider=None,
+	mode=None,
+	screenshot_mode=False,
+	*,
+	screenshot_policy=None,
+	vision_escalation=None,
+	candidate_pipeline=None,
+	model_profile=None,
 ) -> RunSettings:
 	mode = 'direct' if mode is None else mode
 	if mode not in ('direct', 'isolated', 'collaborative'):
@@ -171,8 +198,10 @@ def runtime_settings(
 	if provider not in (None, '', PROVIDER) and not (provider == 'jev' and mode != 'direct'):
 		raise ValueError('测试台使用 Browser Use 执行。')
 	policy = screenshot_policy if screenshot_policy is not None else 'always' if screenshot_mode else 'off'
-	if policy != 'off':
-		raise ValueError('当前两套 DeepSeek 配置使用文本输入，实时预览仍会生成。')
+	if policy not in ('off', 'always', 'smart'):
+		raise ValueError('screenshot_policy must be off, always, or smart')
+	if mode == 'direct' and policy != 'off':
+		raise ValueError('BU 直接执行模式只支持关闭模型截图。')
 	jev = None
 	jev_probabilities = {}
 	if mode != 'direct':
@@ -211,6 +240,9 @@ def runtime_settings(
 	return RunSettings(
 		profile=profile,
 		execution_mode=mode,
+		screenshot_policy=policy,
+		candidate_pipeline=candidate_pipeline,
+		vision_escalation=vision_escalation,
 		jev=jev,
 		execution=ExecutionModel(
 			model=endpoint.model, base_url=endpoint.base_url, api_key=endpoint.api_key, timeout=timeout, max_tokens=max_tokens

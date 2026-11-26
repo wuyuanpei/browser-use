@@ -319,6 +319,8 @@ async def test_complete_autocomplete_by_typing_then_selecting_suggestion(httpser
 	url = serve_page(httpserver, '/autocomplete', AUTOCOMPLETE_PAGE)
 	steps = [
 		{'operation': 'TYPE_TEXT', 'target': 'Where from?'},
+		# The fixture reveals suggestions asynchronously after the input event.
+		{'operation': 'WAIT'},
 		{'operation': 'CLICK', 'target': 'Zurich (ZRH)'},
 		{'operation': 'STEP_DONE'},
 	]
@@ -332,7 +334,7 @@ async def test_complete_autocomplete_by_typing_then_selecting_suggestion(httpser
 		write='Zurich',
 	)
 	assert res.final_page == ['Zurich (ZRH)', True]
-	assert [e['operation'] for e in res.by_event('action_result')] == ['TYPE_TEXT', 'CLICK']
+	assert [e['operation'] for e in res.by_event('action_result')] == ['TYPE_TEXT', 'WAIT', 'CLICK']
 
 
 def workflow_site(server: HTTPServer) -> tuple[str, list[dict]]:

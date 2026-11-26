@@ -1,6 +1,7 @@
 """System1 backends for TypeSafe Jev and structured-output browser-use chat models."""
 
 import asyncio
+import base64
 import json
 import time
 from collections.abc import Awaitable, Callable
@@ -10,7 +11,7 @@ from urllib.parse import urlsplit
 import httpx
 from pydantic import BaseModel, ConfigDict, create_model
 
-from browser_use.agent.jev.decision import TARGET_OPERATIONS
+from browser_use.agent.jev.decision import TARGET_OPERATIONS, request_body
 from browser_use.agent.jev.questions import LLM_SYSTEM1_INSTRUCTION
 from browser_use.agent.jev.views import JEV_RETRY_DELAYS, MAX_CHOICE_OPTIONS, MAX_REQUEST_CHARS, JevSettings, System1Reply
 from browser_use.llm.base import BaseChatModel
@@ -26,11 +27,21 @@ class System1Error(RuntimeError):
 		self.attempts = attempts or []
 
 
+def image_rejection_status(attempts: list[dict[str, Any]]) -> int | None:
+	"""Exclude authentication failures, timeouts and rate limits from image rejections."""
+	status = attempts[-1].get('status') if attempts else None
+	if isinstance(status, int) and 400 <= status < 500 and status not in (401, 403, 408, 429):
+		return status
+	return None
+
+
 class System1Backend(Protocol):
 	@property
 	def name(self) -> Literal['jev', 'llm']: ...
 
-	async def ask(self, state: dict[str, Any], questions: dict[str, dict[str, Any]]) -> System1Reply: ...
+	async def ask(
+		self, state: dict[str, Any], questions: dict[str, dict[str, Any]], *, images: dict[str, str] | None = None
+	) -> System1Reply: ...
 
 	async def aclose(self) -> None: ...
 
@@ -58,7 +69,7 @@ class JevBackend:
 		self.last_attempts: list[dict[str, Any]] = []
 		self._url = f'{settings.jev_base_url}/v1/systemone'
 		self._client = httpx.AsyncClient(
-			headers={'Authorization': f'Bearer {api_key}', 'Content-Type': 'application/json'},
+			headers={'Authorization': f'Bearer {api_key}'},
 			follow_redirects=False,
 			timeout=settings.jev_timeout,
 			trust_env=urlsplit(self._url).hostname not in ('localhost', '127.0.0.1', '::1'),
@@ -67,14 +78,36 @@ class JevBackend:
 	async def aclose(self) -> None:
 		await self._client.aclose()
 
-	async def ask(self, state: dict[str, Any], questions: dict[str, dict[str, Any]]) -> System1Reply:
+	async def ask(
+		self, state: dict[str, Any], questions: dict[str, dict[str, Any]], *, images: dict[str, str] | None = None
+	) -> System1Reply:
 		attempts: list[dict[str, Any]] = []
 		self.last_attempts = attempts
 		_validate_questions(questions)
-		body = json.dumps({'model': self.model, 'state': state, 'questions': questions}, ensure_ascii=False, allow_nan=False)
+		envelope = request_body(state, questions, self.model, with_image=bool(images))
+		body = json.dumps(envelope, ensure_ascii=False, allow_nan=False)
 		if len(body) > MAX_REQUEST_CHARS:
 			raise ValueError('System1 request exceeds the character limit')
-		content = body.encode('utf-8')
+		image_bytes = 0
+		if images:
+			if images.keys() != {'page-screenshot'} or 'assets' not in envelope:
+				raise ValueError('A Jev image request requires a page.screenshot reference and a page-screenshot part')
+			jpeg = base64.b64decode(images['page-screenshot'], validate=True)
+			image_bytes = len(jpeg)
+			# Build once: both in-memory parts and the generated multipart boundary replay on a retry.
+			request = self._client.build_request(
+				'POST',
+				self._url,
+				files=[
+					('request', (None, body, 'application/json')),
+					('page-screenshot', ('page-screenshot.jpg', jpeg, 'image/jpeg')),
+				],
+				headers={'TypeSafe-Danger-Zone-Images': 'true'},
+			)
+		else:
+			request = self._client.build_request(
+				'POST', self._url, content=body.encode('utf-8'), headers={'Content-Type': 'application/json'}
+			)
 		start = time.monotonic()
 		for index in range(len(JEV_RETRY_DELAYS) + 1):
 			attempt_start = time.monotonic()
@@ -84,7 +117,7 @@ class JevBackend:
 			error_type = None
 			response = None
 			try:
-				response = await self._client.post(self._url, content=content)
+				response = await self._client.send(request)
 				status = response.status_code
 			except httpx.TransportError as error:
 				# Error strings and response bodies may contain headers or other private data.
@@ -109,6 +142,8 @@ class JevBackend:
 						model=payload.get('model'),
 						input_tokens=usage.get('input_tokens'),
 						output_tokens=usage.get('output_tokens'),
+						image_count=int(bool(images)),
+						image_bytes=image_bytes,
 						has_probabilities=True,
 						latency_ms=_elapsed(start),
 						attempts=attempts,
@@ -157,7 +192,11 @@ class LLMBackend:
 			choices = schema.model_validate(raw.model_dump() if isinstance(raw, BaseModel) else raw)
 		return {name: {'choice': choice} for name, choice in choices.model_dump().items()}
 
-	async def ask(self, state: dict[str, Any], questions: dict[str, dict[str, Any]]) -> System1Reply:
+	async def ask(
+		self, state: dict[str, Any], questions: dict[str, dict[str, Any]], *, images: dict[str, str] | None = None
+	) -> System1Reply:
+		if images:
+			raise ValueError('Screenshot inputs require the Jev backend')
 		_validate_questions(questions)
 		if 'operation' not in questions:
 			raise ValueError('System1 requires an operation question')

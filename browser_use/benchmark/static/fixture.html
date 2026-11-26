@@ -333,6 +333,102 @@
         color: #a4ad9b;
         margin-top: 24px;
       }
+      .landscape {
+        height: 184px;
+        background:
+          radial-gradient(circle at 70% 25%, #fff9 0 14px, transparent 15px),
+          linear-gradient(35deg, #0002 32%, transparent 32%),
+          linear-gradient(-32deg, #fff3 36%, transparent 36%), var(--sky);
+      }
+      canvas.landscape {
+        display: block;
+        width: 100%;
+      }
+      .scroll-layout {
+        display: grid;
+        grid-template-columns: min(26vw, 240px) minmax(0, 1fr);
+        gap: 24px;
+        height: min(470px, calc(100vh - 160px));
+      }
+      .scroll-region {
+        overflow-y: auto;
+        overscroll-behavior: contain;
+        background: white;
+        border: 1px solid #dce2d8;
+        border-radius: 7px;
+        padding: 16px;
+      }
+      #filter-panel label {
+        display: flex;
+        align-items: center;
+        min-height: 38px;
+        gap: 9px;
+      }
+      #main-list li {
+        list-style: none;
+        min-height: 58px;
+        padding: 14px 0;
+        border-bottom: 1px solid #eceee8;
+      }
+      #main-list ul {
+        padding: 0;
+      }
+      .dense-panes {
+        display: grid;
+        grid-template-columns: 1fr 1fr 2fr;
+        gap: 16px;
+        margin-top: 20px;
+      }
+      .dense-pane h2 {
+        font-size: 16px;
+        margin: 0 0 8px;
+      }
+      .dense-grid {
+        display: grid;
+        grid-template-columns: repeat(10, minmax(0, 1fr));
+        gap: 2px;
+      }
+      .dense-grid button {
+        padding: 0;
+        height: 22px;
+        min-width: 0;
+        font-size: 10px;
+      }
+      .dense-clip {
+        position: relative;
+        height: 22px;
+        overflow: hidden;
+      }
+      .dense-clip .dense-grid {
+        position: absolute;
+        inset: 32px 0 auto;
+      }
+      .dense-cover {
+        position: relative;
+      }
+      .dense-cover .dense-grid {
+        grid-template-columns: repeat(20, minmax(0, 1fr));
+      }
+      .dense-overlay {
+        position: absolute;
+        inset: 0;
+        z-index: 1;
+      }
+      .icon-row {
+        display: flex;
+        gap: 14px;
+      }
+      .icon-row button {
+        display: grid;
+        width: 60px;
+        height: 56px;
+        place-items: center;
+      }
+      .icon-row svg {
+        width: 26px;
+        height: 26px;
+        pointer-events: none;
+      }
       footer {
         font-size: 11px;
         color: #a5ae9b;
@@ -499,9 +595,120 @@
         travel();
       };
       document.getElementById("reading").onclick = research;
-      new URLSearchParams(location.search).get("scenario") === "research"
-        ? research()
-        : travel();
+      function visualCards(plain = false) {
+        const stays = [
+          ["#cf7739", ["Amber", "Cottage"], "orange"],
+          ["#417e4b", ["Sage", "House"], "green"],
+          ["#487fba", ["Harbor", "Loft"], "blue"],
+        ];
+        document.title = "Forma · Stays";
+        root.innerHTML = '<h1>Stays</h1><div class="grid"></div>';
+        for (const [color, words, description] of stays) {
+          const name = words.join(" ");
+          const card = document.createElement("article");
+          card.className = "card";
+          const illustration = plain
+            ? `<canvas class="landscape" style="--sky:${color}" width="600" height="368" aria-hidden="true"></canvas>`
+            : `<div class="landscape" style="--sky:${color}"></div>`;
+          card.innerHTML = `${illustration}
+            <div class="card-body"><button type="button">View stay</button></div>`;
+          if (plain) {
+            const drawing = card.querySelector("canvas").getContext("2d");
+            drawing.fillStyle = "#1b2922";
+            drawing.fillRect(28, 244, 544, 86);
+            drawing.fillStyle = "#fffdf4";
+            drawing.font = "bold 54px Georgia";
+            drawing.textAlign = "center";
+            drawing.textBaseline = "middle";
+            drawing.fillText(name, 300, 289, 520);
+          }
+          card.querySelector("button").onclick = () => {
+            const details = `<h1>${name}</h1><p>Illustration: ${description}.</p><button type="button">All stays</button>`;
+            root.innerHTML = plain ? `<section class="detail-copy">${details}</section>` : details;
+            root.querySelector("button").onclick = () => visualCards(plain);
+          };
+          root.querySelector(".grid").append(card);
+        }
+      }
+      function scrollPanel() {
+        document.title = "Forma · Filter stays";
+        const filters = ["Pool", "Gym", "Breakfast", "Kitchen", "Elevator", "Balcony", "Garden", "Sauna",
+          "Parking", "Air conditioning", "Pets welcome", "Workspace", "Bike storage", "Water view",
+          "Library", "Late checkout", "Rooftop terrace"];
+        root.innerHTML = `<h1>Filter stays</h1><div class="scroll-layout">
+          <section id="filter-panel" class="scroll-region" aria-label="Filters"><h2>Filters</h2></section>
+          <section id="main-list" class="scroll-region" aria-label="Main list"><h2>Main list</h2><ul></ul></section>
+          </div><p id="filter-status" role="status">No filters selected.</p>`;
+        const panel = document.getElementById("filter-panel");
+        for (const name of filters) {
+          const key = name.toLowerCase().replace(/ /g, "-");
+          panel.insertAdjacentHTML("beforeend", `<label><input type="checkbox" id="${key}" name="${key}"> ${name}</label>`);
+        }
+        root.querySelector("#main-list ul").innerHTML = Array.from({length: 20}, (_, i) =>
+          `<li>Stay ${i + 1} · Two guests</li>`).join("");
+        panel.addEventListener("change", () => {
+          const active = Array.from(panel.querySelectorAll("input:checked"), (input) => input.labels[0].innerText.trim());
+          document.getElementById("filter-status").textContent = active.length
+            ? `Active filters: ${active.join(", ")}` : "No filters selected.";
+        });
+      }
+      function denseDirectory() {
+        document.title = "Forma · Records desk";
+        root.innerHTML = `<h1>Records desk</h1><p>The staged document opens with Continue. Numbered buttons open reference cards.</p>
+          <button type="button" id="target">Continue</button><p id="record-status" role="status"></p>
+          <div class="dense-panes">
+            <section class="dense-pane"><h2>References</h2><div id="dense-references" class="dense-grid"></div></section>
+            <section class="dense-pane"><h2>Collapsed reference entries</h2>
+              <div class="dense-clip"><div id="dense-clipped" class="dense-grid"></div></div></section>
+            <section class="dense-pane"><h2>Read-only references</h2><div class="dense-cover">
+              <div id="dense-covered" class="dense-grid"></div><div class="dense-overlay" aria-hidden="true"></div>
+            </div></section>
+          </div>`;
+        let number = 1;
+        for (const [group, count] of [["dense-references", 60], ["dense-clipped", 100], ["dense-covered", 220]]) {
+          const grid = document.getElementById(group);
+          for (let i = 0; i < count; i++) {
+            const label = String(number++).padStart(3, "0");
+            const button = document.createElement("button");
+            button.type = "button";
+            button.textContent = label;
+            button.setAttribute("aria-label", `Archive ledger reference ${label}`);
+            button.onclick = () => { document.getElementById("record-status").textContent = `Reference card ${label} opened.`; };
+            grid.append(button);
+          }
+        }
+        document.getElementById("target").onclick = () => {
+          document.title = "Forma · Archive ledger";
+          root.innerHTML = '<section class="detail-copy"><h1>Archive ledger</h1><p>The complete archive ledger is open.</p></section>';
+        };
+      }
+      function visualIcons() {
+        const actions = [
+          ["M20.8 4.6a5.5 5.5 0 0 0-7.8 0L12 5.7l-1.1-1.1a5.5 5.5 0 0 0-7.8 7.8L12 21l8.8-8.6a5.5 5.5 0 0 0 0-7.8Z", "Liked"],
+          ["M12 2l3.1 6.4 7.1 1-5.1 5 1.2 7.1-6.3-3.3-6.3 3.3 1.2-7.1-5.1-5 7.1-1Z", "Starred"],
+          ["M14 3l7 7-7 6v-4c-5 0-8 2-11 6 1-8 5-11 11-11Z", "Shared"],
+          ["M3 6h18M9 6V3h6v3M6 6l1 15h10l1-15M10 10v7m4-7v7", "Deleted (undo available)"],
+        ];
+        document.title = "Forma · Item";
+        root.innerHTML = '<h1>Item</h1><div class="icon-row"></div><p role="status"></p>';
+        for (const [path, status] of actions) {
+          const button = document.createElement("button");
+          button.type = "button";
+          button.innerHTML = `<svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><path d="${path}"/></svg>`;
+          button.onclick = () => { root.querySelector('[role="status"]').textContent = status; };
+          root.querySelector(".icon-row").append(button);
+        }
+      }
+      const scenario = new URLSearchParams(location.search).get("scenario");
+      if (["visual-cards", "visual-cards-plain", "visual-icons", "scroll-panel", "dense"].includes(scenario)) {
+        document.querySelector("header").style.display = "none";
+        if (scenario === "visual-cards") visualCards();
+        else if (scenario === "visual-cards-plain") visualCards(true);
+        else if (scenario === "visual-icons") visualIcons();
+        else if (scenario === "scroll-panel") scrollPanel();
+        else denseDirectory();
+      } else if (scenario === "research") research();
+      else travel();
     </script>
   </body>
 </html>

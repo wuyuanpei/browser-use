@@ -1,3 +1,8 @@
+from typing import Any
+
+from browser_use.llm.views import ChatInvokeUsage
+
+
 class ModelError(Exception):
 	pass
 
@@ -19,6 +24,36 @@ class ModelProviderError(ModelError):
 
 class ModelOutputFormatError(ModelProviderError):
 	"""The provider responded, but its structured tool arguments could not be decoded or validated."""
+
+	def __init__(
+		self,
+		message: str,
+		status_code: int = 502,
+		model: str | None = None,
+		*,
+		raw_text: str = '',
+		finish_reason: str | None = None,
+		usage: ChatInvokeUsage | None = None,
+	):
+		super().__init__(message, status_code, model)
+		self.raw_text = raw_text
+		self.finish_reason = finish_reason
+		self.parse_error = message
+		self.usage = usage
+		# The workbench holds this record while the planner decides whether to send corrective feedback.
+		self._trace_record: dict[str, Any] = {
+			'raw_text': raw_text[:20_000],
+			'raw_chars': len(raw_text),
+			'raw_truncated': len(raw_text) > 20_000,
+			'finish_reason': finish_reason,
+			'parse_error': message,
+			'usage': usage.model_dump(mode='json') if usage is not None else None,
+			'planner_feedback_retry': False,
+		}
+
+	def trace_record(self, *, role: str, model: str, planner_feedback_retry: bool = False) -> dict[str, Any]:
+		self._trace_record.update(role=role, model=model, planner_feedback_retry=planner_feedback_retry)
+		return self._trace_record
 
 
 class ModelRateLimitError(ModelProviderError):

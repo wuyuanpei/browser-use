@@ -1,13 +1,30 @@
+import base64
 import json
 from datetime import datetime, timedelta
+from io import BytesIO
 from pathlib import Path
+from unittest.mock import AsyncMock
+from uuid import UUID
 
 import pytest
+from PIL import Image
 from pydantic import ValidationError
 
+from browser_use import Agent
 from browser_use.agent.jev import JevChecks, JevSettings
+from browser_use.agent.jev import state as jev_state
+from browser_use.agent.jev.questions import VISION_RULES, VISION_TARGET_RULES
 from browser_use.agent.jev.trace import JevTrace
-from browser_use.agent.jev.views import ActionRecord, DelegateSubgoalParams, SubgoalRun
+from browser_use.agent.jev.views import ActionRecord, Candidate, DelegateSubgoalParams, Observation, SubgoalRun
+from browser_use.browser.views import BrowserStateSummary
+from browser_use.dom.views import SerializedDOMState
+from tests.ci.conftest import create_mock_llm
+from tests.ci.jev_support import FakeJev
+
+FIXTURES = Path(__file__).with_name('fixtures')
+PR5_OFF_REQUEST = FIXTURES / 'jev_off_request_pr5.golden'
+SCREENSHOT_ID = '00000000-0000-4000-8000-000000000001'
+SCREENSHOT_REASON = 'Locate the save button from the screenshot.'
 
 
 def test_configuration():
@@ -22,6 +39,148 @@ def test_configuration():
 	]
 	assert JevSettings(jev_base_url='http://localhost:8080/base/').jev_base_url == 'http://localhost:8080/base'
 	assert JevSettings.model_validate({'mode': 'off', 'jev_base_url': 'ftp://disabled', 'max_candidates': -1}).mode == 'off'
+
+
+def test_screenshot_configuration():
+	settings = JevSettings()
+	assert settings.vision_escalation is True
+	assert (settings.screenshot_policy, settings.vision_max_side, settings.vision_jpeg_quality) == ('off', 1600, 72)
+	assert JevSettings(screenshot_policy='always').screenshot_policy == 'always'
+	assert JevSettings(screenshot_policy='smart').screenshot_policy == 'smart'
+	with pytest.raises(ValidationError, match='requires the Jev backend'):
+		JevSettings(system1='llm', system1_llm=create_mock_llm([]), screenshot_policy='always')
+	with pytest.raises(ValidationError, match='requires the Jev backend'):
+		JevSettings(system1='llm', system1_llm=create_mock_llm([]), screenshot_policy='smart')
+
+
+async def fixture_request(httpserver, policy, tmp_path, monkeypatch, *, planner_vision=False):
+	settings = JevSettings.model_validate(
+		{
+			'jev_api_key': 'test-only',
+			'jev_base_url': httpserver.url_for(''),
+			'trace_path': tmp_path / 'trace.jsonl',
+			**({'screenshot_policy': policy} if policy is not None else {}),
+		}
+	)
+	button = Candidate(key='7', kind='element', index=7, role='button', name='保存', rect={'x': 11, 'y': 25, 'w': 80, 'h': 30})
+	obs = Observation(
+		step=3,
+		url='https://example.org/edit',
+		title='草稿',
+		scroll={'y': 30, 'viewport_height': 70},
+		viewport_width=100,
+		viewport_height=70,
+		visible_text='草稿\n保存',
+		links=[],
+		candidates={'CLICK': [button]},
+		tabs=[],
+		can_go_back=False,
+		is_pdf=False,
+		state_error=None,
+		fingerprint='visible',
+	)
+	run = SubgoalRun(
+		id='sg1',
+		params=DelegateSubgoalParams(objective='保存草稿', completion='已保存', reason='完成编辑', requires_action=True),
+		identity='保存草稿\n已保存',
+		max_actions=3,
+		started_step=1,
+		start_url=obs.url,
+		start_site='example.org',
+		vision=planner_vision,
+		vision_at_start=planner_vision,
+		vision_source='planner' if planner_vision else None,
+		vision_reason=SCREENSHOT_REASON if planner_vision else None,
+	)
+	png = BytesIO()
+	Image.new('RGB', (100, 70), 'white').save(png, format='PNG')
+	summary = BrowserStateSummary(
+		url=obs.url,
+		title=obs.title,
+		tabs=[],
+		dom_state=SerializedDOMState(None, {}),
+		screenshot=base64.b64encode(png.getvalue()).decode('ascii'),
+	)
+	monkeypatch.setattr(jev_state, 'observe', AsyncMock(return_value=obs))
+	if policy == 'always' or planner_vision:
+		monkeypatch.setattr('browser_use.agent.jev.service.uuid4', lambda: UUID(SCREENSHOT_ID))
+		httpserver.expect_request('/v1/systemone', method='POST').respond_with_json(
+			{
+				'answers': {
+					'operation': {
+						'choice': 'CLICK',
+						'confidence': 1,
+						'probabilities': {'CLICK': 1, 'WAIT': 0, 'COLLECT': 0, 'UNABLE': 0},
+					},
+					'click_target': {'choice': '7', 'confidence': 1, 'probabilities': {'7': 1}},
+				}
+			}
+		)
+	else:
+		FakeJev(httpserver, [{'operation': 'CLICK', 'target': '保存'}])
+	agent = Agent(
+		task='Save the 草稿',
+		llm=create_mock_llm(),
+		jev=settings,
+		use_judge=False,
+		use_vision=False,
+		enable_signal_handler=False,
+		file_system_path=str(tmp_path / 'agent'),
+	)
+	executor = agent._jev
+	assert executor is not None
+	executor.runs.append(run)
+	try:
+		await executor.route(agent, summary)
+	finally:
+		await agent.eventbus.stop(clear=True, timeout=3)
+		await executor.aclose()
+	assert len(httpserver.log) == 1
+	return httpserver.log[0][0]
+
+
+@pytest.mark.parametrize('policy', [None, 'off', 'smart'])
+async def test_text_request_matches_pr5_http_body(httpserver, policy, tmp_path, monkeypatch):
+	request = await fixture_request(httpserver, policy, tmp_path, monkeypatch)
+	# Pure PR5, captured from the same executor route and observation.
+	assert request.get_data() == PR5_OFF_REQUEST.read_bytes()
+	assert request.content_type == 'application/json'
+	assert 'TypeSafe-Danger-Zone-Images' not in request.headers
+
+
+@pytest.mark.parametrize('policy', ['always', 'smart'])
+async def test_image_request_extends_pr5_http_body(httpserver, policy, tmp_path, monkeypatch):
+	request = await fixture_request(httpserver, policy, tmp_path, monkeypatch, planner_vision=policy == 'smart')
+	assert request.mimetype == 'multipart/form-data' and request.headers['TypeSafe-Danger-Zone-Images'] == 'true'
+	assert list(request.files) == ['page-screenshot']
+	with Image.open(request.files['page-screenshot']) as jpeg:
+		assert (jpeg.format, jpeg.size) == ('JPEG', (100, 70))
+	request_body = request.form['request'].encode()
+	if policy == 'always':
+		legacy_body = (FIXTURES / 'jev_always_request.json.golden').read_bytes()
+		assert request_body == legacy_body.replace(
+			b'"requires_action": true, "pending_apply": true',
+			b'"requires_action": true, "text_mode": "replace", "pending_apply": true',
+			1,
+		)
+	with_image = json.loads(request_body)
+	assert with_image.pop('assets') == {SCREENSHOT_ID: {'type': 'image', 'part': 'page-screenshot', 'format': 'jpg'}}
+	page = with_image['state']['page']
+	assert page.pop('screenshot') == SCREENSHOT_ID
+	assert page.pop('viewport') == {'width': 100, 'height': 70}
+	if policy == 'smart':
+		assert with_image['state']['current_subgoal'].pop('screenshot_guidance') == {
+			'required': True,
+			'reason': SCREENSHOT_REASON,
+			'source': 'planner',
+		}
+	assert with_image['questions']['click_target']['criteria']['7'].pop('rect') == {'x': 11, 'y': 25, 'w': 80, 'h': 30}
+	for name, vision_rules in (('operation', VISION_RULES), ('click_target', VISION_TARGET_RULES)):
+		question = with_image['questions'][name]
+		suffix = '\n' + vision_rules
+		assert question['instructions'].endswith(suffix)
+		question['instructions'] = question['instructions'].removesuffix(suffix)
+	assert json.dumps(with_image, ensure_ascii=False).encode() == PR5_OFF_REQUEST.read_bytes()
 
 
 @pytest.mark.parametrize(

@@ -9,7 +9,7 @@ from urllib.parse import urljoin, urlsplit
 
 from .observation import document_key, fingerprint
 
-VERSION = '2026-11-15.1'
+VERSION = '2026-11-26.1'
 XIAOYI_TASKS = json.loads(Path(__file__).with_name('xiaoyi_selected_20.json').read_text(encoding='utf-8'))
 XIAOYI_TASK_IDS = frozenset(task['id'] for task in XIAOYI_TASKS)
 ARTICLE_GOAL = 'Open the article about using finite choices to control browser agents.'
@@ -132,6 +132,45 @@ TASKS = [
 	},
 ]
 TASKS.extend(XIAOYI_TASKS)
+TASKS.extend(
+	[
+		{
+			'id': '112_visual_cards',
+			'name': '按插图选择房源',
+			'url': '/fixture.html?scenario=visual-cards',
+			'goal': 'Open the stay whose illustration is green.',
+			'capability': '按颜色区分同名卡片',
+		},
+		{
+			'id': '113_visual_icons',
+			'name': '按图标标记条目',
+			'url': '/fixture.html?scenario=visual-icons',
+			'goal': 'Mark this item with the star button.',
+			'capability': '按形状区分无文字按钮',
+		},
+		{
+			'id': '114_visual_cards_plain',
+			'name': '按房源名打开同名卡片详情',
+			'url': '/fixture.html?scenario=visual-cards-plain',
+			'goal': 'Open the Sage House stay.',
+			'capability': '从文本选择升级到视觉识别',
+		},
+		{
+			'id': '115_scroll_panel',
+			'name': '滚动侧栏后勾选筛选项',
+			'url': '/fixture.html?scenario=scroll-panel',
+			'goal': 'Check the Rooftop terrace option in Filters and leave it checked.',
+			'capability': '区分独立滚动区、按标签修改筛选状态',
+		},
+		{
+			'id': '116_dense',
+			'name': '从密集控件打开档案总账',
+			'url': '/fixture.html?scenario=dense',
+			'goal': 'Open the archive ledger and leave it open.',
+			'capability': '裁剪和遮挡过滤、保留低词重合按钮',
+		},
+	]
+)
 PROBE = Path(__file__).with_name('baseline_probe.js').read_text(encoding='utf-8')
 INSPECT_PAGE = (
 	'(() => { const page=window.__benchmarkObserver?.readState?.(); const facts=' + PROBE + '; return {page,facts}; })()'

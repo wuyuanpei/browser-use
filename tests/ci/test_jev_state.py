@@ -1,13 +1,19 @@
 import asyncio
+import base64
+import io
+from pathlib import Path
+from unittest.mock import AsyncMock, Mock
 
 import pytest
+from PIL import Image
 from pytest_httpserver import HTTPServer
 from werkzeug.wrappers import Request, Response
 
 from browser_use import Agent
 from browser_use.agent.jev.rules import enter_effect
-from browser_use.agent.jev.state import evidence_key, observe, selected_option
+from browser_use.agent.jev.state import evidence_key, observe, scroll_effect, selected_option
 from browser_use.agent.jev.views import JevSettings
+from browser_use.agent.jev.vision import prepare_screenshot
 from browser_use.browser.session import BrowserSession
 from tests.ci.conftest import create_mock_llm
 from tests.ci.jev_support import (
@@ -31,6 +37,80 @@ from tests.ci.jev_support import jev_httpserver as _threaded_server  # noqa: F40
 async def observe_page(jev_browser: BrowserSession, settings: JevSettings | None = None):
 	summary = await jev_browser.get_browser_state_summary(include_screenshot=False)
 	return await observe(jev_browser, summary, settings or JevSettings(), 1)
+
+
+@pytest.mark.parametrize('mode', ['unsupported_parameter', 'ignored_parameter', 'connection_error'])
+async def test_viewport_uses_legacy_result_only_for_unsupported_deep_serialization(mode):
+	from browser_use.agent.jev import state
+
+	legacy = {'text': 'Evidence', 'centerScroll': [0, 90], 'url': 'https://example.org/', 'links': []}
+	first = {
+		'unsupported_parameter': RuntimeError('Invalid serializationOptions: unknown parameter'),
+		'ignored_parameter': {'result': {'objectId': 'legacy-array', 'type': 'object'}},
+		'connection_error': ConnectionError('lost transport'),
+	}[mode]
+	session = Mock()
+	session.target_id = 'target'
+	runtime = session.cdp_client.send.Runtime
+	runtime.evaluate = AsyncMock(side_effect=[first, {'result': {'value': legacy}}])
+	runtime.releaseObject = AsyncMock()
+	browser = Mock()
+	browser.get_or_create_cdp_session = AsyncMock(return_value=session)
+	value = await state.read_visible_text(browser)
+	if mode == 'connection_error':
+		assert runtime.evaluate.await_count == 1 and value['text'] == ''
+	else:
+		assert value == {**legacy, 'target_id': 'target'} and runtime.evaluate.await_count == 2
+		assert runtime.evaluate.call_args.kwargs['params'] == {'expression': state.VISIBLE_TEXT_SCRIPT, 'returnByValue': True}
+	assert runtime.releaseObject.await_count == int(mode == 'ignored_parameter')
+
+
+@pytest.mark.parametrize(('scenario', 'count', 'result'), [('visual-cards', 3, 'Sage House'), ('visual-icons', 4, 'Starred')])
+async def test_visual_fixture_has_indistinguishable_text_candidates(jev_browser, httpserver, scenario, count, result):
+	fixture_path = Path(__file__).resolve().parents[2] / 'browser_use/benchmark/static/fixture.html'
+	httpserver.expect_request('/fixture.html').respond_with_data(
+		fixture_path.read_bytes(), content_type='text/html; charset=utf-8'
+	)
+	await jev_browser.navigate_to(httpserver.url_for('/fixture.html') + '?scenario=' + scenario)
+	obs = await observe_page(jev_browser)
+	buttons = obs.candidates['CLICK']
+	assert len(buttons) == count
+	assert buttons[0].role == 'button'
+	assert all((b.name, b.context, b.role) == (buttons[0].name, buttons[0].context, buttons[0].role) for b in buttons)
+	before = await browser_eval(jev_browser, 'document.body.innerText')
+	assert result not in before
+	await browser_eval(jev_browser, 'document.querySelectorAll("main button")[1].click()')
+	assert result in await browser_eval(jev_browser, 'document.body.innerText')
+
+
+async def test_noncentral_scroll_panel_has_directional_candidate_and_region_fingerprint(jev_browser, httpserver):
+	from browser_use.agent.jev import state
+
+	fixture = Path(__file__).resolve().parents[2] / 'browser_use/benchmark/static/fixture.html'
+	httpserver.expect_request('/scroll-fixture').respond_with_data(fixture.read_bytes(), content_type='text/html; charset=utf-8')
+	await jev_browser.navigate_to(httpserver.url_for('/scroll-fixture') + '?scenario=scroll-panel')
+	summary = await state.capture_aligned_state(jev_browser, include_recent_events=False)
+	assert not summary.state_error and summary.jev_viewport is not None and summary.jev_viewport['centerScroll']
+	first = await observe(jev_browser, summary, JevSettings(), 1)
+	# An already-enriched summary must also honor the pipeline selected for this observation.
+	legacy = await observe(jev_browser, summary, JevSettings(screenshot_policy='always', candidate_pipeline='pr5'), 1)
+	assert not legacy.scroll_regions
+	assert all(not c.key.startswith('region:') for c in legacy.candidates['SCROLL_DOWN'])
+	assert any(c.name == 'Main list' and c.index is not None for c in legacy.candidates['SCROLL_DOWN'])
+	extended = await observe(jev_browser, summary, JevSettings(screenshot_policy='off', candidate_pipeline='extended'), 1)
+	assert [r.key for r in extended.scroll_regions] == [r.key for r in first.scroll_regions]
+	panel = next(c for c in first.candidates['SCROLL_DOWN'] if c.name == 'Filters')
+	assert panel.key.startswith('region:') and panel.role == 'region' and panel.kind == 'scroll' and panel.rect
+	assert sum(c.name == 'Filters' for c in first.candidates['SCROLL_DOWN']) == 1
+	assert not any(c.name == 'Main list' for c in first.candidates['SCROLL_DOWN'])
+	assert not any(c.key == panel.key for c in first.candidates['SCROLL_UP'])
+	await browser_eval(jev_browser, "const p=document.querySelector('#filter-panel'); p.scrollTop=p.scrollHeight")
+	last = await observe_page(jev_browser)
+	assert any(c.key == panel.key for c in last.candidates['SCROLL_UP'])
+	assert not any(c.key == panel.key for c in last.candidates['SCROLL_DOWN'])
+	assert last.fingerprint != first.fingerprint
+	# Holding other inputs fixed isolates the region's own contribution to no_effect.
+	assert state.fingerprint(first.model_copy(update={'scroll_regions': last.scroll_regions})) != first.fingerprint
 
 
 async def test_form_input_and_fingerprint(jev_browser: BrowserSession, httpserver: HTTPServer):
@@ -251,10 +331,56 @@ async def test_jev_exposes_scroll_for_viewport_center_pane(jev_browser, httpserv
 		)
 	)
 	obs = await observe_page(jev_browser)
-	assert any(choice.key == 'page' for choice in obs.candidates['SCROLL_DOWN'])
+	page = next(choice for choice in obs.candidates['SCROLL_DOWN'] if choice.key == 'page')
 	scroll = await Tools().scroll(down=True, pages=0.8, browser_session=jev_browser)
 	assert not scroll.error
-	assert await browser_eval(jev_browser, 'pane.scrollTop') > 0
+	actual = await browser_eval(jev_browser, 'pane.scrollTop')
+	assert actual > 0
+	effect = scroll_effect(obs, await observe_page(jev_browser), page)
+	assert effect.page_changed is True and effect.measurable and effect.root_delta_y == 0 and effect.center_delta_y == actual
+
+
+async def test_native_scroll_inside_center_iframe_has_unknown_effect(jev_browser, httpserver):
+	from browser_use import Tools
+
+	await jev_browser.navigate_to(
+		serve_page(
+			httpserver,
+			'/scroll-frame',
+			'<main style="height:220vh"><iframe id="pane" style="width:85vw;height:75vh" '
+			'srcdoc="<main style=height:200vh>Inner scroll document</main>"></iframe></main>',
+		)
+	)
+	before = await observe_page(jev_browser)
+	page = next(choice for choice in before.candidates['SCROLL_DOWN'] if choice.key == 'page')
+	scroll = await Tools().scroll(down=True, pages=0.8, browser_session=jev_browser)
+	assert not scroll.error
+	assert await browser_eval(jev_browser, 'pane.contentWindow.scrollY > 0 && scrollY === 0')
+	effect = scroll_effect(before, await observe_page(jev_browser), page)
+	assert effect.root_delta_y == 0 and effect.center_delta_y is None
+	assert effect.page_changed is None and not effect.measurable
+
+
+async def test_off_preserves_indexed_center_when_page_has_no_new_region(jev_browser, httpserver):
+	from browser_use.agent.jev import state
+
+	url = serve_page(
+		httpserver,
+		'/indexed-center',
+		'<style>body{margin:0;overflow:hidden}</style>'
+		'<main tabindex="0" aria-label="Central items" style="height:100vh;overflow:auto"><div style="height:200vh">Item</div></main>',
+	)
+	await jev_browser.navigate_to(url)
+	summary = await state.capture_aligned_state(jev_browser, include_recent_events=False)
+	assert summary.jev_viewport
+	center = summary.jev_viewport['centerBackendNodeId']
+	index = next(i for i, n in summary.dom_state.selector_map.items() if n.backend_node_id == center)
+	off = await observe(jev_browser, summary, JevSettings(), 1)
+	assert not off.scroll_regions
+	assert [c.key for c in off.candidates['SCROLL_DOWN']] == ['page', str(index)]
+	assert [c.key for c in off.candidates['SCROLL_UP']] == [str(index)]
+	smart = await observe(jev_browser, summary, JevSettings(screenshot_policy='smart'), 1)
+	assert [c.key for c in smart.candidates['SCROLL_DOWN']] == ['page']
 
 
 async def test_core_scroll_reports_failure_when_no_scroll_was_executed(jev_browser, monkeypatch):
@@ -273,6 +399,71 @@ async def test_core_scroll_reports_failure_when_no_scroll_was_executed(jev_brows
 	scroll = await Tools().scroll(down=True, pages=1.0, browser_session=jev_browser)
 	assert scroll.error == 'Failed to execute scroll action.'
 	assert not scroll.long_term_memory
+
+
+@pytest.mark.parametrize('dpr', [1, 1.5])
+async def test_screenshot_rects_after_scrolling_page_and_iframe(jev_browser: BrowserSession, httpserver: HTTPServer, dpr: float):
+	url = serve_page(
+		httpserver,
+		'/image-rects',
+		"""<style>
+		body {margin:0; height:2200px}
+		#page-button {position:absolute; left:-8px; top:690px; width:96px; height:60px; background:#fc4422; border:0}
+		iframe {position:absolute; left:330px; top:850px; width:240px; height:140px; border:6px solid purple}
+		</style>
+		<button id="page-button" aria-label="Page target"></button>
+		<iframe srcdoc="<style>body{margin:0;height:800px}
+		button{position:absolute;left:31px;top:200px;width:80px;height:36px;background:#0cb45a;border:0}
+		</style><button aria-label='Frame target'></button>"></iframe>""",
+	)
+	await jev_browser.navigate_to(url)
+	cdp = await jev_browser.get_or_create_cdp_session()
+	original = await browser_eval(jev_browser, '[innerWidth, innerHeight, devicePixelRatio]')
+
+	async def set_metrics(width: int, height: int, scale: float):
+		await cdp.cdp_client.send.Emulation.setDeviceMetricsOverride(
+			params={'width': width, 'height': height, 'deviceScaleFactor': scale, 'mobile': False}, session_id=cdp.session_id
+		)
+
+	try:
+		await set_metrics(1280, 720, dpr)
+		await browser_eval(
+			jev_browser,
+			'scrollTo(0,700); frames[0].scrollTo(0,164); new Promise(ok=>requestAnimationFrame(()=>requestAnimationFrame(()=>ok(true))))',
+		)
+		summary = await jev_browser.get_browser_state_summary(include_screenshot=True)
+		obs = await observe(jev_browser, summary, JevSettings(screenshot_policy='always'), 1)
+		assert (obs.viewport_width, obs.viewport_height) == (1280, 720)
+		image = prepare_screenshot(summary.screenshot, obs.viewport_width, obs.viewport_height, max_side=1600, quality=72)
+		assert image is not None and image.scale == dpr
+		# Independent DOM measurement includes the frame's content origin and both scroll offsets.
+		expected = await browser_eval(
+			jev_browser,
+			"""(() => {
+				const frame = document.querySelector('iframe'), fr = frame.getBoundingClientRect();
+				const page = document.querySelector('button').getBoundingClientRect();
+				const child = frames[0].document.querySelector('button').getBoundingClientRect();
+				return {'Page target': {x:0, y:0, w:page.right, h:page.bottom},
+					'Frame target': {x:fr.left+frame.clientLeft+child.left, y:fr.top+frame.clientTop+child.top,
+						w:child.width, h:child.height}};
+			})()""",
+		)
+		assert expected['Page target'] == {'x': 0, 'y': 0, 'w': 88, 'h': 50}
+		assert expected['Frame target'] == {'x': 367, 'y': 192, 'w': 80, 'h': 36}
+		colors = {'Page target': (252, 68, 34), 'Frame target': (12, 180, 90)}
+		candidates = {c.name: c for c in obs.candidates['CLICK']}
+		with Image.open(io.BytesIO(base64.b64decode(image.jpeg_b64))) as jpeg:
+			for name, color in colors.items():
+				rect = candidates[name].rect
+				assert rect == expected[name], (name, rect, expected[name])
+				assert rect is not None
+				x, y, w, h = (rect[key] for key in ('x', 'y', 'w', 'h'))
+				for point in ((x + 5, y + 5), (x + w - 6, y + h - 6)):
+					pixel = jpeg.getpixel(point)
+					assert isinstance(pixel, tuple)
+					assert max(abs(a - b) for a, b in zip(pixel, color, strict=True)) <= 8
+	finally:
+		await set_metrics(*original)
 
 
 async def test_visibility_and_password(jev_browser: BrowserSession, httpserver: HTTPServer):

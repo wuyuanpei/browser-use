@@ -5,7 +5,9 @@ import pytest
 from browser_use.agent.jev import JevChecks
 from browser_use.agent.jev import decision as d
 from browser_use.agent.jev import questions as prompts
+from browser_use.agent.jev.state import fingerprint
 from browser_use.agent.jev.views import ActionRecord, Candidate, DelegateSubgoalParams, Observation, SubgoalRun, System1Reply
+from browser_use.agent.jev.vision import PreparedImage
 from browser_use.tools.service import Tools
 from browser_use.tools.views import NoParamsAction
 
@@ -195,6 +197,37 @@ def test_operation_questions_distinguish_focus_from_editing(obs, run):
 			f'{field.element()} (editable and already focused)'
 		)
 		assert questions[f'{operation.lower()}_target']['criteria'][field.key]['states']['focused'] is True
+
+
+def test_vision_criteria_project_to_the_transmitted_image_without_changing_observation(obs, run):
+	old = fingerprint(obs)
+	for op in ('CLICK', 'TYPE_TEXT'):
+		obs.candidates[op][0].rect = {'x': 60, 'y': 40, 'w': 80, 'h': 50}
+	assert fingerprint(obs) == old
+	offered = d.offered_operations(obs, run, d.SYSTEM1_ACTIONS, JevChecks())
+	text = d.build_questions(obs, run, offered, vision=False)
+	assert all('rect' not in item for name, q in text.items() if name != 'operation' for item in q['criteria'].values())
+	assert prompts.VISION_RULES not in text['operation']['instructions']
+	text_state = d.build_state(obs, run, 'goal', [])
+	assert 'screenshot' not in text_state['page'] and 'viewport' not in text_state['page']
+	assert 'assets' not in d.request_body(text_state, text, 'jev-latest')
+
+	image = PreparedImage('jpeg', 640, 360, 1.5, 3, (0.5, 0.5))
+	state = d.build_state(obs, run, 'goal', [], vision=('image-ref', image))
+	assert state['page']['screenshot'] == 'image-ref' and state['page']['viewport'] == {'width': 640, 'height': 360}
+	questions = d.build_questions(obs, run, offered, vision=image)
+	for name, key in (('click_target', '1'), ('type_text_target', '2')):
+		assert questions[name]['criteria'][key]['rect'] == {'x': 30, 'y': 20, 'w': 40, 'h': 25}
+	assert 'rect' not in questions['select_target']['criteria']['3:2']
+	assert 'rect' not in questions['click_target']['criteria']['tab:1']
+	assert 'rect' not in questions['scroll_down_target']['criteria']['page']
+	assert prompts.VISION_RULES in questions['operation']['instructions']
+	assert all(prompts.VISION_TARGET_RULES in q['instructions'] for name, q in questions.items() if name != 'operation')
+	body = d.request_body(state, questions, 'jev-latest', with_image=True)
+	assert body['assets'] == {'image-ref': {'type': 'image', 'part': 'page-screenshot', 'format': 'jpg'}}
+	assert d.request_size(state, questions, 'jev-latest', with_image=True) == len(json.dumps(body, ensure_ascii=False))
+	assert obs.candidates['CLICK'][0].rect == {'x': 60, 'y': 40, 'w': 80, 'h': 50}
+	assert fingerprint(obs) == old
 
 
 @pytest.mark.parametrize(

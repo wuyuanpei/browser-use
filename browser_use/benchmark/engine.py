@@ -289,6 +289,7 @@ class BrowserUseRun:
 			self._jev_dir = jev_artifact_dir or Path.cwd() / 'artifacts' / 'jev-runs' / uuid4().hex
 			self._jev_dir.mkdir(parents=True, exist_ok=True)
 		self._model_role: ContextVar[str | None] = ContextVar('benchmark_jev_model_role', default=None)
+		self._prediction_text_call: dict[str, Any] | None = None
 		config = settings.system1_config()
 		self._state: dict[str, Any] = dict(
 			goal=goal,
@@ -296,8 +297,11 @@ class BrowserUseRun:
 			system1_model=config['model'],
 			system1_base_url=config['base_url'],
 			execution_mode=settings.execution_mode,
-			screenshot_mode=False,
-			screenshot_policy='off',
+			screenshot_mode=settings.screenshot_policy == 'always',
+			screenshot_policy=settings.screenshot_policy,
+			vision_escalation=settings.vision_escalation,
+			candidate_pipeline=settings.effective_candidate_pipeline,
+			min_read_operation_probability=settings.min_read_operation_probability if settings.jev is not None else None,
 			model_profile=settings.profile,
 			browser_mode='attached_chrome' if chrome is not None else 'isolated',
 			text_model=settings.evaluation.model,
@@ -365,12 +369,17 @@ class BrowserUseRun:
 	def snapshot(self) -> dict[str, Any]:
 		executor = getattr(self._native, '_jev', None)
 		final_observation = executor.final_browser_observation if executor is not None else None
+		roles = executor.usage_by_role() if executor is not None else {}
+		system1_usage = roles.get('system1', {})
+		disabled = system1_usage.get('vision_disabled')
+		runs = executor.runs if executor is not None else []
+		reviews = [run for run in runs if run.review_delegation]
 		return redact_secrets(
 			{
 				**self._state,
 				**(
 					{
-						'jev_usage_by_role': executor.usage_by_role(),
+						'jev_usage_by_role': roles,
 						'replans': executor.redelegations,
 						'research': {'pages': [record.model_dump() for record in executor.captures.records]},
 					}
@@ -378,6 +387,15 @@ class BrowserUseRun:
 					else {}
 				),
 				**({'final_browser_observation': final_observation.model_dump()} if final_observation is not None else {}),
+				'vision_disabled': disabled['status'] if disabled else None,
+				'escalations': system1_usage.get('escalations', 0),
+				'escalations_executed': system1_usage.get('escalations_executed', 0),
+				'escalations_by_reason': system1_usage.get('escalations_by_reason', {}),
+				'planner_screenshot_requests': sum(run.screenshot_declared is True for run in runs),
+				'review_delegations': len(reviews),
+				'screenshot_decisions_missing': (
+					sum(run.screenshot_declared is None for run in reviews) if self._state['screenshot_policy'] == 'smart' else 0
+				),
 				'token_usage': token_usage(self._state['model_calls']),
 				'elements': indexed_elements(self._state['page'].get('actions', [])),
 			},
@@ -412,6 +430,7 @@ class BrowserUseRun:
 	async def _start(self, url: str, settings: RunSettings):
 		self._check_cancelled()
 		from browser_use import Agent, BrowserSession, ChatDeepSeek
+		from browser_use.llm.exceptions import ModelOutputFormatError
 
 		self._check_cancelled()
 		if self._chrome is not None:
@@ -449,7 +468,13 @@ class BrowserUseRun:
 			role = self._model_role.get()
 			kind = role or PROVIDER
 			with self.model_call(kind, model=execution.model, request=request, **({'role': role} if role else {})) as record:
-				reply = await original(messages, output_format=output_format, **kwargs)
+				try:
+					reply = await original(messages, output_format=output_format, **kwargs)
+				except ModelOutputFormatError as error:
+					record['parse_failures'] = [error.trace_record(role=role or 'planner', model=execution.model)]
+					if error.usage is not None:
+						record['response'] = {'usage': error.usage.model_dump(mode='json', exclude_none=True)}
+					raise
 				record['response'] = reply.model_dump(mode='json', exclude_none=True)
 				return reply
 
@@ -466,6 +491,10 @@ class BrowserUseRun:
 			jev_config['jev'] = JevSettings.model_validate(
 				{
 					'mode': settings.execution_mode,
+					'screenshot_policy': settings.screenshot_policy,
+					'vision_escalation': settings.vision_escalation is not False,
+					'candidate_pipeline': settings.candidate_pipeline,
+					'min_read_operation_probability': settings.min_read_operation_probability,
 					'jev_base_url': settings.jev.base_url,
 					'jev_model': settings.jev.model,
 					'jev_api_key': settings.jev.api_key,
@@ -502,6 +531,9 @@ class BrowserUseRun:
 
 	def _trace_jev_calls(self, executor):
 		"""Capture actual requests on this run's native clients; the executor owns costs and roles."""
+		from browser_use.agent.jev.backends import System1Error, image_rejection_status
+		from browser_use.agent.jev.decision import request_body
+
 		invoke = executor.usage.invoke
 
 		async def with_role(step, role, llm, messages, **kwargs):
@@ -515,13 +547,42 @@ class BrowserUseRun:
 		ask = executor.backend.ask
 		model = self._state['system1_model']
 
-		async def capture_jev(state, questions):
-			request = {'model': model, 'state': state, 'questions': questions}
-			with self.model_call('jev', role='system1', model=model, request=request, bu_step=executor.step) as record:
+		async def capture_jev(state, questions, *, images=None):
+			request = request_body(state, questions, model, with_image=bool(images))
+			image_files = {}
+			if images:
+				assert self._jev_dir is not None
+				name = f'system1_images/{executor.step}-{len(self._state["model_calls"]) + 1}.jpg'
+				path = self._jev_dir / name
+				path.parent.mkdir(exist_ok=True)
+				path.write_bytes(base64.b64decode(images['page-screenshot'], validate=True))
+				image_files['page-screenshot'] = name
+			trigger = executor.current_vision_trigger if images else None
+			escalated_from = None
+			if trigger and trigger.startswith('escalation:') and self._prediction_text_call is not None:
+				first = self._prediction_text_call
+				first.update(outcome='escalated', escalation_from=trigger.removeprefix('escalation:'))
+				escalated_from = first['id']
+			with self.model_call(
+				'jev',
+				role='system1',
+				model=model,
+				request=request,
+				bu_step=executor.step,
+				request_images=image_files,
+				request_format='multipart/form-data' if images else 'application/json',
+				vision=bool(images),
+				vision_trigger=trigger,
+				**({'escalated_from_call_id': escalated_from} if escalated_from is not None else {}),
+			) as record:
+				if not images:
+					self._prediction_text_call = record
 				try:
-					reply = await ask(state, questions)
+					reply = await ask(state, questions, images=images)
 				except BaseException as error:
 					record['attempts'] = getattr(error, 'attempts', getattr(executor.backend, 'last_attempts', []))
+					if images and isinstance(error, System1Error) and image_rejection_status(error.attempts) is not None:
+						record['vision_rejected'] = True
 					raise
 				record['attempts'] = reply.attempts
 				record['response'] = {
@@ -532,6 +593,15 @@ class BrowserUseRun:
 				return reply
 
 		executor.backend.ask = capture_jev
+
+	def request_image(self, reference: str | None) -> bytes:
+		"""Read the JPEG bound to this live run's exact model request."""
+		if reference and self._jev_dir is not None:
+			for call in self._state['model_calls']:
+				name = call.get('request_images', {}).get('page-screenshot')
+				if name and call['request']['state']['page'].get('screenshot') == reference:
+					return (self._jev_dir / name).read_bytes()
+		raise ValueError('Unknown Jev screenshot')
 
 	def observe(self, phase: str = 'step', reason: str | None = None):
 		cancel = self._should_cancel if phase != 'final' and self._state['status'] == 'ready' else None
@@ -587,6 +657,8 @@ class BrowserUseRun:
 		document['url'] = summary.url
 		self._summary = summary
 		agent.state.last_model_output = agent.state.last_result = None
+		# Only a text call from this prediction can be the first half of an image retry.
+		self._prediction_text_call = None
 		try:
 			await agent._get_next_action(summary)
 		except TimeoutError:

@@ -38,6 +38,8 @@ from pydantic import BaseModel, ValidationError
 from uuid_extensions import uuid7str
 
 from browser_use import Browser, BrowserProfile, BrowserSession
+from browser_use.agent.jev.decision import SYSTEM1_INTERNAL_ACTIONS
+from browser_use.agent.jev.usage import planner_feedback_scope
 from browser_use.agent.jev.views import CheckName, JevSettings
 from browser_use.agent.judge import construct_judge_messages
 
@@ -332,7 +334,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			owned = {
 				name
 				for name, action in actions.items()
-				if name in {'delegate_subgoal', 'finish', 'collect_page'}
+				if name in {'delegate_subgoal', 'finish', *SYSTEM1_INTERNAL_ACTIONS}
 				and action.param_model.__module__ == 'browser_use.agent.jev.views'
 			}
 			if owned or (jev is not None and jev.mode != 'off'):
@@ -561,6 +563,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 				is_browser_use_model=is_browser_use_model,
 				model_name=self.llm.model,
 				jev_mode=active_jev.mode if active_jev is not None and active_jev.mode != 'off' else None,
+				jev_screenshot_policy=active_jev.screenshot_policy if active_jev is not None else 'off',
 			).get_system_message(),
 			file_system=self.file_system,
 			state=self.state.message_manager_state,
@@ -851,7 +854,9 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 				create_model(include_actions=['finish'], page_url=page_url)
 			)
 		else:
-			planner_actions = [name for name in self.tools.registry.registry.actions if name not in {'finish', 'collect_page'}]
+			planner_actions = [
+				name for name in self.tools.registry.registry.actions if name not in {'finish', *SYSTEM1_INTERNAL_ACTIONS}
+			]
 			self.PlannerDoneAgentOutput = self.DoneAgentOutput
 		self.PlannerAgentOutput = self._output_model_for_actions(create_model(include_actions=planner_actions, page_url=page_url))
 
@@ -1810,12 +1815,24 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		"""Give the planner one chance to correct an unusable response before dispatch."""
 		messages = input_messages
 		reason = ''
-		for _ in range(2):
+		for attempt in (1, 2):
 			model_output = None
+			start = time.monotonic()
 			try:
-				model_output = await self.get_model_output(messages)
+				with planner_feedback_scope():
+					model_output = await self.get_model_output(messages)
 			except (ValidationError, ModelProviderError) as error:
 				problem = self._planner_format_error(error) if self._jev is not None else None
+				if self._jev is not None and isinstance(error, ModelOutputFormatError):
+					await self._jev.usage.record_format_error(
+						self._jev.step,
+						'planner',
+						self.llm.model,
+						error,
+						start=start,
+						attempt=attempt,
+						planner_feedback_retry=problem is not None and attempt == 1,
+					)
 				if problem is None:
 					raise
 				reason = f'Planner response did not match the action schema: {problem}'
@@ -1858,7 +1875,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 
 		if self.settings.save_conversation_path and self.state.last_model_output:
 			if self._jev is not None and self._jev.step_source() == 'system1':
-				self._jev.save_system1_step(self, self.settings.save_conversation_path)
+				# Jev records its own request at decision time, including turns handed back to the planner.
 				return
 			# Treat save_conversation_path as a directory (consistent with other recording paths)
 			conversation_dir = Path(self.settings.save_conversation_path)

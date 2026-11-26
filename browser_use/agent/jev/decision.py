@@ -10,6 +10,7 @@ from typing import Any, Protocol, cast, get_args
 from browser_use.agent.jev import questions as wording
 from browser_use.agent.jev.rules import http_url
 from browser_use.agent.jev.views import (
+	DEFAULT_SCREENSHOT_REASON,
 	MAX_CHOICE_OPTIONS,
 	PAGE_TEXT_LIMIT,
 	SCROLL_PAGES,
@@ -26,9 +27,22 @@ from browser_use.agent.jev.views import (
 	SubgoalRun,
 	System1Reply,
 )
+from browser_use.agent.jev.vision import PreparedImage
 
 ENABLED_OPERATIONS: tuple[Operation, ...] = get_args(Operation)
-SYSTEM1_ACTIONS = ['click', 'input', 'select_dropdown', 'scroll', 'wait', 'go_back', 'send_keys', 'switch', 'collect_page']
+SYSTEM1_INTERNAL_ACTIONS = frozenset({'collect_page', 'scroll_region'})
+SYSTEM1_ACTIONS = [
+	'click',
+	'input',
+	'select_dropdown',
+	'scroll',
+	'wait',
+	'go_back',
+	'send_keys',
+	'switch',
+	'collect_page',
+	'scroll_region',
+]
 TARGET_OPERATIONS = frozenset({'CLICK', 'TYPE_TEXT', 'SELECT', 'SCROLL_UP', 'SCROLL_DOWN'})
 _READ_OPERATIONS = frozenset({'COLLECT', 'SCROLL_UP', 'SCROLL_DOWN'})
 NO_GROUNDED_TARGET = '__no_grounded_target__'
@@ -133,15 +147,30 @@ def action_state(record: ActionRecord, *, include_run: bool = False) -> dict[str
 
 
 def build_state(
-	obs: Observation, run: SubgoalRun, task: str, task_actions: list[ActionRecord], research: dict[str, Any] | None = None
+	obs: Observation,
+	run: SubgoalRun,
+	task: str,
+	task_actions: list[ActionRecord],
+	research: dict[str, Any] | None = None,
+	*,
+	vision: tuple[str, PreparedImage] | None = None,
 ) -> dict[str, Any]:
 	state: dict[str, Any] = {}
 	if research and (research.get('collect_available') or research.get('collected_pages')):
 		state['research'] = research
 	state['page'] = {'url': obs.url, 'title': obs.title, 'scroll': obs.scroll, 'text': page_text(obs.visible_text)}
+	if vision is not None:
+		ref, image = vision
+		state['page'].update(screenshot=ref, viewport={'width': image.width, 'height': image.height})
 	state['original_goal'] = task
 	params = run.params
 	subgoal: dict[str, Any] = {'id': run.id, 'objective': params.objective, 'completion': params.completion}
+	if vision is not None and run.vision_source in ('planner', 'escalation'):
+		subgoal['screenshot_guidance'] = {
+			'required': True,
+			'reason': (run.vision_reason or '').strip() or DEFAULT_SCREENSHOT_REASON,
+			'source': run.vision_source,
+		}
 	if params.inputs:
 		subgoal['inputs'] = params.inputs
 	subgoal.update(may_submit=params.may_submit, requires_action=params.requires_action, text_mode=params.text_mode)
@@ -170,9 +199,8 @@ def _candidate_terms(text: str) -> set[str]:
 	return terms
 
 
-def _limit_targets(targets: list[Candidate], maximum: int, goal_terms: set[str]) -> list[Candidate]:
-	if len(targets) <= maximum:
-		return targets
+def ranked_target_indices(targets: list[Candidate], goal_terms: set[str]) -> list[int]:
+	"""Prioritize by PR #5 relevance, preserving input order on ties."""
 
 	def priority(index: int) -> tuple[bool, int, bool]:
 		candidate = targets[index]
@@ -184,7 +212,13 @@ def _limit_targets(targets: list[Candidate], maximum: int, goal_terms: set[str])
 			candidate.editable or candidate.kind == 'tab',
 		)
 
-	selected = sorted(range(len(targets)), key=priority, reverse=True)[:maximum]
+	return sorted(range(len(targets)), key=priority, reverse=True)
+
+
+def _limit_targets(targets: list[Candidate], maximum: int, goal_terms: set[str]) -> list[Candidate]:
+	if len(targets) <= maximum:
+		return targets
+	selected = ranked_target_indices(targets, goal_terms)[:maximum]
 	return [targets[index] for index in sorted(selected)]
 
 
@@ -193,6 +227,21 @@ def _operation_target(candidate: Candidate) -> str:
 	if candidate.editable and candidate.states.get('focused'):
 		label += ' (editable and already focused)'
 	return label
+
+
+def subgoal_terms(run: SubgoalRun) -> set[str]:
+	return _candidate_terms(f'{run.params.objective} {run.params.completion}')
+
+
+def select_targets(
+	obs: Observation, run: SubgoalRun, offered: list[Operation], registered_actions: Collection[str] | None, maximum: int
+) -> dict[str, list[Candidate]]:
+	goal_terms = subgoal_terms(run)
+	return {
+		op: _limit_targets(_targets(obs, op, registered_actions), maximum, goal_terms)
+		for op in offered
+		if op in TARGET_OPERATIONS
+	}
 
 
 def build_questions(
@@ -204,9 +253,12 @@ def build_questions(
 	registered_actions: Collection[str] | None = None,
 	max_candidates: int = MAX_CHOICE_OPTIONS,
 	enter_field: Candidate | None = None,
+	vision: PreparedImage | bool | None = None,
+	selected_targets: dict[str, list[Candidate]] | None = None,
 ) -> dict[str, dict[str, Any]]:
 	params = run.params
-	goal_terms = _candidate_terms(f'{params.objective} {params.completion}')
+	if selected_targets is None:
+		selected_targets = select_targets(obs, run, offered, registered_actions, max_candidates)
 	context = [f'Current objective: {params.objective}', f'Completion: {params.completion}']
 	if params.text_mode == 'append':
 		context.append('Append only the requested new text to the current field.')
@@ -233,6 +285,8 @@ def build_questions(
 		rules.append(wording.COLLECTION_RULES)
 	if 'CLICK' in offered and any(c.kind == 'tab' for c in _targets(obs, 'CLICK', registered_actions)):
 		rules.append(wording.TAB_RULE)
+	if vision:
+		rules.append(wording.VISION_RULES)
 	criteria: dict[str, Any] = {}
 	questions: dict[str, dict[str, Any]] = {
 		'operation': {'type': 'choice', 'criteria': criteria, 'instructions': '\n'.join(context + rules)}
@@ -244,7 +298,7 @@ def build_questions(
 			criteria[op] = {'description': description, 'focused_field': enter_field.criterion()}
 		if op not in TARGET_OPERATIONS:
 			continue
-		targets = _limit_targets(_targets(obs, op, registered_actions), max_candidates, goal_terms)
+		targets = selected_targets[op]
 		if op in ('CLICK', 'TYPE_TEXT', 'SELECT'):
 			criteria[op] = {'description': description, 'current_targets': [_operation_target(c) for c in targets]}
 		target_rules = [f'Operation: {op}', wording.TARGET_RULES]
@@ -252,21 +306,44 @@ def build_questions(
 			target_rules.append(wording.TYPE_TEXT_TARGET_RULE)
 		if op == 'CLICK' and research_active:
 			target_rules.append(wording.COLLECTION_BOUNDARY)
+		if vision:
+			target_rules.append(wording.VISION_TARGET_RULES)
+		target_criteria = {
+			c.key: c.criterion(
+				include_rect=bool(vision) and (op in ('CLICK', 'TYPE_TEXT', 'SELECT') or c.key.startswith('region:'))
+			)
+			for c in targets
+		}
+		if isinstance(vision, PreparedImage):
+			for item in target_criteria.values():
+				if 'rect' in item:
+					item['rect'] = vision.project_rect(item['rect'])
 		questions[f'{op.lower()}_target'] = {
 			'type': 'choice',
-			'criteria': {c.key: c.criterion() for c in targets},
+			'criteria': target_criteria,
 			'instructions': '\n'.join(context + target_rules),
 		}
 	return questions
 
 
-def request_size(state: dict[str, Any], questions: dict[str, dict[str, Any]], model: str | None = None) -> int:
+def request_body(
+	state: dict[str, Any], questions: dict[str, dict[str, Any]], model: str | None = None, *, with_image: bool = False
+) -> dict[str, Any]:
 	body = (
 		{'model': model, 'state': state, 'questions': questions}
 		if model is not None
 		else {'state': state, 'questions': questions}
 	)
-	return len(json.dumps(body, ensure_ascii=False, allow_nan=False))
+	page = state.get('page')
+	if with_image and isinstance(page, dict) and isinstance(ref := page.get('screenshot'), str) and ref:
+		body['assets'] = {ref: {'type': 'image', 'part': 'page-screenshot', 'format': 'jpg'}}
+	return body
+
+
+def request_size(
+	state: dict[str, Any], questions: dict[str, dict[str, Any]], model: str | None = None, *, with_image: bool = False
+) -> int:
+	return len(json.dumps(request_body(state, questions, model, with_image=with_image), ensure_ascii=False, allow_nan=False))
 
 
 def _is_probability(value: Any) -> bool:
@@ -437,6 +514,8 @@ def to_bu_action(
 	if op == 'SELECT' and candidate is not None and candidate.index is not None and candidate.match_text is not None:
 		return {'select_dropdown': {'index': candidate.index, 'text': candidate.match_text}}
 	if op in ('SCROLL_UP', 'SCROLL_DOWN') and candidate is not None:
+		if candidate.kind == 'scroll' and candidate.key.startswith('region:'):
+			return {'scroll_region': {'key': candidate.key, 'down': op == 'SCROLL_DOWN'}}
 		params = {'down': op == 'SCROLL_DOWN', 'pages': SCROLL_PAGES}
 		if candidate.index is not None:
 			params['index'] = candidate.index

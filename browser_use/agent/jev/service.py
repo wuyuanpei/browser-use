@@ -1,6 +1,7 @@
 """Run bounded System1 subgoals inside Browser Use's native Agent step loop."""
 
 import asyncio
+import base64
 import json
 import logging
 import os
@@ -9,9 +10,10 @@ from pathlib import Path
 from time import monotonic
 from typing import TYPE_CHECKING, Any, Literal
 from urllib.parse import urlsplit
+from uuid import uuid4
 
-from browser_use.agent.jev import decision, rules, state
-from browser_use.agent.jev.backends import JevBackend, System1Error, make_backend
+from browser_use.agent.jev import decision, pruning, rules, scroll_regions, state
+from browser_use.agent.jev.backends import JevBackend, System1Error, image_rejection_status, make_backend
 from browser_use.agent.jev.checks import CheckGate
 from browser_use.agent.jev.helpers import ModelHelpers
 from browser_use.agent.jev.prompts import render_handback
@@ -31,15 +33,20 @@ from browser_use.agent.jev.views import (
 	Candidate,
 	CollectPageParams,
 	DelegateSubgoalParams,
+	DelegateSubgoalParamsSmart,
 	FinalBrowserObservation,
 	FinishParams,
 	Handback,
 	HandbackReason,
 	JevSettings,
 	Observation,
+	Operation,
+	ScrollEffect,
+	ScrollRegionParams,
 	SubgoalRun,
 	System1Reply,
 )
+from browser_use.agent.jev.vision import PreparedImage, prepare_screenshot
 from browser_use.agent.views import ActionResult, AgentOutput
 from browser_use.browser.session import BrowserSession
 from browser_use.browser.views import BrowserStateSummary
@@ -79,9 +86,58 @@ class _ReviewedClick:
 	planner_target_key: str | None = None
 
 
-def _is_repeated_empty(runs: list[SubgoalRun], identity: str) -> bool:
+@dataclass
+class _System1Request:
+	state: dict[str, Any]
+	questions: dict[str, dict[str, Any]]
+	model: str | None
+	image: PreparedImage | None
+	stats: dict[str, Any]
+
+
+def _escalation_reason(stop: Stop | None, choice: decision.Decision | None) -> str | None:
+	if stop is None:
+		return None
+	reason = stop[0]
+	if reason in ('low_confidence', 'unable_probability', 'unable', 'no_effect'):
+		return reason
+	if reason == 'repeated_action' and choice is not None and choice.operation != 'TYPE_TEXT':
+		return reason
+	return None
+
+
+def _escalation_guidance(reason: str, choice: decision.Decision | None) -> str:
+	if reason == 'no_effect':
+		return 'Recent actions did not change the page; use the image to locate a different listed target that advances the objective.'
+	if reason == 'repeated_action':
+		return 'The same action was about to repeat on an unchanged page; use the image to find a different listed target.'
+	if reason == 'low_confidence' and choice is not None:
+		probabilities = ', '.join(
+			f'{name} p={p:.2f}'
+			for name, p in (('operation', choice.operation_probability), ('target', choice.target_probability))
+			if p is not None
+		)
+		return f'Text-only choice was low confidence ({probabilities}); use the image to decide which listed target matches.'
+	if reason == 'unable_probability' and choice is not None and choice.unable_probability is not None:
+		return f'Text-only UNABLE probability was {choice.unable_probability:.2f}; use the image to check whether a listed target can advance the completion condition.'
+	return 'Text-only choice was UNABLE; use the image to check whether a listed target can advance the completion condition.'
+
+
+def _vision_trigger(run: SubgoalRun) -> str | None:
+	if run.vision_source == 'escalation':
+		return f'escalation:{run.escalations[-1]["reason"]}'
+	return run.vision_source
+
+
+def _is_review_delegation(previous: SubgoalRun | None, rejected: bool) -> bool:
+	return previous is not None and (rejected or (previous.handback is not None and previous.handback.reason != 'step_done'))
+
+
+def _is_repeated_empty(runs: list[SubgoalRun], identity: str, vision: bool = False) -> bool:
 	recent = runs[-NO_ACTION_HANDBACK_LIMIT:]
-	return len(recent) == NO_ACTION_HANDBACK_LIMIT and all(r.identity == identity and not r.executed_actions for r in recent)
+	return len(recent) == NO_ACTION_HANDBACK_LIMIT and all(
+		(r.identity, r.vision_at_start) == (identity, vision) and not r.executed_actions for r in recent
+	)
 
 
 class JevExecutor:
@@ -109,7 +165,9 @@ class JevExecutor:
 		self._source: _SOURCE = 'llm'
 		self._planner_attempt = 0
 		self._planner_page_action = False
-		self._saved_decision: dict | None = None
+		self._vision_disabled: dict[str, Any] | None = None
+		self.current_vision_trigger: str | None = None
+		self._pending_escalation: tuple[SubgoalRun, dict[str, Any]] | None = None
 		self._closed = False
 		self.finish_only = False
 		self.defer_final_answer = False
@@ -125,6 +183,8 @@ class JevExecutor:
 		self.captures = CaptureStore(Path(settings.capture_dir or agent.agent_directory / 'jev_captures'), agent.id)
 		self.trace.write(
 			'run_config',
+			candidate_pipeline=settings.effective_candidate_pipeline,
+			candidate_pipeline_requested=settings.candidate_pipeline,
 			mode=settings.mode,
 			system1=settings.system1,
 			jev_model=settings.jev_model,
@@ -136,12 +196,18 @@ class JevExecutor:
 			**settings.model_dump(
 				include={
 					'min_operation_probability',
+					'min_read_operation_probability',
 					'min_target_probability',
 					'unable_probability_handback',
 					'default_max_actions',
 					'max_candidates',
+					'pruning_budget_ms',
 					'answer_timeout',
 					'jev_timeout',
+					'screenshot_policy',
+					'vision_escalation',
+					'vision_max_side',
+					'vision_jpeg_quality',
 				}
 			),
 		)
@@ -169,12 +235,12 @@ class JevExecutor:
 		)
 
 	def on_new_task(self):
-		"""Resume a closed Agent only when the user explicitly adds a follow-up."""
+		"""Start a new delegation history, reopening the backend after a completed run."""
+		self._first_run = len(self.runs)
 		if not self._closed:
 			return
 		if self.active_run:
 			self.active_run.status = 'handed_back'
-		self._first_run = len(self.runs)
 		self._handback_message = None
 		self.last_observation = None
 		self._routed_observation = None
@@ -184,7 +250,6 @@ class JevExecutor:
 		self._confidence_rechecked.clear()
 		self._evidence_key = None
 		self._planner_page_action = False
-		self._saved_decision = None
 		self.finish_only = False
 		self.backend = self._make_backend()
 		self._closed = False
@@ -211,7 +276,13 @@ class JevExecutor:
 
 	def register_actions(self):
 		registry = self.agent.tools.registry
-		models = {'delegate_subgoal': DelegateSubgoalParams, 'finish': FinishParams, 'collect_page': CollectPageParams}
+		delegate_model = DelegateSubgoalParamsSmart if self.settings.screenshot_policy == 'smart' else DelegateSubgoalParams
+		models = {
+			'delegate_subgoal': delegate_model,
+			'finish': FinishParams,
+			'collect_page': CollectPageParams,
+			'scroll_region': ScrollRegionParams,
+		}
 		for name, model in models.items():
 			existing = registry.registry.actions.get(name)
 			if name in registry.exclude_actions or (existing and existing.param_model is not model):
@@ -219,7 +290,7 @@ class JevExecutor:
 
 		@registry.action(
 			'Hand one stage of the task to System1, which performs all page actions of that stage.',
-			param_model=DelegateSubgoalParams,
+			param_model=delegate_model,
 			terminates_sequence=True,
 		)
 		async def delegate_subgoal(params: DelegateSubgoalParams, browser_session: BrowserSession):
@@ -242,6 +313,18 @@ class JevExecutor:
 		async def collect_page(params: CollectPageParams, browser_session: BrowserSession):
 			return await self.collect(browser_session)
 
+		@registry.action('Internal action used only by System1: scroll a visible region.', param_model=ScrollRegionParams)
+		async def scroll_region(params: ScrollRegionParams, browser_session: BrowserSession):
+			obs = self.last_observation
+			region = next((r for r in obs.scroll_regions if r.key == params.key), None) if obs else None
+			if region is not None:
+				try:
+					if await scroll_regions.scroll(browser_session, region, params.down):
+						return ActionResult(long_term_memory=f'Scrolled {params.key}.')
+				except Exception as error:
+					logger.debug('Region scroll failed: %s', error)
+			return ActionResult(error=f'Could not scroll {params.key}: the region is gone, blocked, or at its limit.')
+
 	def _refuse(self, reason: str, detail: str, identity: str) -> ActionResult:
 		self.trace.write('delegate_refused', self.step, reason=reason, identity=identity)
 		return ActionResult(error=detail)
@@ -250,13 +333,13 @@ class JevExecutor:
 		data = params.model_dump()
 		truncated = []
 		for name, limit in SUBGOAL_FIELD_LIMITS.items():
-			if data[name] and len(data[name]) > limit:
+			if data.get(name) and len(data[name]) > limit:
 				data[name] = data[name][:limit]
 				truncated.append(name)
 		data['max_actions'] = (
 			self.settings.default_max_actions if params.max_actions is None else min(30, max(1, params.max_actions))
 		)
-		params = DelegateSubgoalParams.model_validate(data)
+		params = type(params).model_validate(data)
 		identity = '\n'.join(' '.join(s.split()) for s in (params.objective, params.completion))
 		previous = self.runs[-1] if len(self.runs) > self._first_run else None
 		rejected = bool(
@@ -268,7 +351,16 @@ class JevExecutor:
 				'review_note is required when you re-delegate the same subgoal after rejecting STEP_DONE.',
 				identity,
 			)
-		if _is_repeated_empty(self.runs[self._first_run :], identity):
+		policy = self.settings.screenshot_policy
+		smart = params if policy == 'smart' and isinstance(params, DelegateSubgoalParamsSmart) else None
+		declared = smart.screenshot_required if smart else None
+		reason = smart.screenshot_reason if smart else None
+		source: Literal['policy', 'planner'] | None = None
+		if policy == 'always':
+			source = 'policy'
+		elif declared is True:
+			source = 'planner'
+		if _is_repeated_empty(self.runs[self._first_run :], identity, source is not None):
 			return self._refuse(
 				'no_action_twice',
 				'This subgoal was handed back twice in a row without any executed action. Rewrite it, delegate something else first, or call finish.',
@@ -315,18 +407,37 @@ class JevExecutor:
 			started_step=self.step,
 			start_url=url,
 			start_site=rules.site_of(url),
+			vision=source is not None,
+			vision_at_start=source is not None,
+			vision_source=source,
+			vision_reason=reason,
+			review_delegation=_is_review_delegation(previous, rejected),
+			screenshot_declared=declared,
 			rejected_fingerprint=previous.handback.fingerprint if rejected and previous and previous.handback else None,
 		)
 		self.runs.append(run)
+		previous_reason = previous.handback.reason if previous and previous.handback else None
+		if policy == 'smart':
+			if run.review_delegation and declared is None:
+				self.trace.write(
+					'screenshot_decision_missing', self.step, run_id=run.id, previous_handback_reason=previous_reason
+				)
+			if declared is not None and not (reason or '').strip():
+				self.trace.write('screenshot_reason_missing', self.step, run_id=run.id, screenshot_required=declared)
 		self.trace.write(
 			'subgoal_start',
 			self.step,
 			run_id=run.id,
-			**params.model_dump(exclude={'start_url'}),
+			**params.model_dump(exclude={'start_url', 'screenshot_required', 'screenshot_reason'}),
 			truncated_fields=truncated,
 			start_url=url,
 			start_site=run.start_site,
 			is_rejection_retry=rejected,
+			screenshot_required=declared,
+			screenshot_reason=reason,
+			vision=run.vision,
+			review_delegation=run.review_delegation,
+			previous_handback_reason=previous_reason,
 		)
 		return ActionResult(long_term_memory=f'Delegated {run.id} to System1: {params.objective}')
 
@@ -335,7 +446,7 @@ class JevExecutor:
 		if obs is not None and obs.step == self.step:
 			page = {'url': obs.url, 'title': obs.title, 'text': obs.visible_text, 'links': obs.links}
 		else:
-			page = await state.read_visible_text(session)
+			page = await self._read_viewport_text(session)
 		if not rules.content_lines(page['text']):
 			return ActionResult(error='No visible page text to collect.')
 		if self.captures.is_saved(page['url'], page['text']):
@@ -363,7 +474,27 @@ class JevExecutor:
 		return ActionResult(long_term_memory=f'Saved capture {record.id}: {record.url} | {record.title}')
 
 	async def capture_browser_state(self, *, include_recent_events: bool) -> BrowserStateSummary:
-		return await state.capture_aligned_state(self.agent.browser_session, include_recent_events=include_recent_events)
+		summary = await state.capture_aligned_state(
+			self.agent.browser_session,
+			include_recent_events=include_recent_events,
+			include_regions=self.settings.effective_candidate_pipeline != 'pr5',
+		)
+		if isinstance(summary, state.UnalignedState):
+			self.trace.write(
+				'check',
+				self.step,
+				name='snapshot_alignment',
+				mode='enforce',
+				outcome='blocked',
+				detail=summary.state_error,
+				alignment_attempts=summary.alignment_attempts,
+			)
+		return summary
+
+	async def _read_viewport_text(self, browser: BrowserSession) -> dict[str, Any]:
+		if self.settings.effective_candidate_pipeline == 'pr5':
+			return await state.read_visible_text(browser, include_regions=False)
+		return await state.read_visible_text(browser)
 
 	def _planner(self, page: tuple[str, str] | None = None) -> RouteResult:
 		self._source = 'llm'
@@ -396,8 +527,10 @@ class JevExecutor:
 		choice: decision.Decision | None = None,
 		*,
 		navigation: list[dict[str, Any]] | None = None,
+		alignment_attempts: list[dict[str, Any]] | None = None,
 	) -> RouteResult:
 		reason, detail = stop
+		self._finish_escalation('handed_back')
 		result = Handback(
 			reason=reason,
 			detail=detail,
@@ -419,6 +552,7 @@ class JevExecutor:
 			**({'observed_navigation': navigation} if navigation else {}),
 			actions_used=len(run.executed_actions),
 			actions_discarded=sum(r.status == 'discarded' for r in run.actions),
+			**({'alignment_attempts': alignment_attempts} if alignment_attempts is not None else {}),
 		)
 		runs = self.runs[self._first_run :]
 		previous = runs[-2] if len(runs) >= 2 else None
@@ -432,7 +566,13 @@ class JevExecutor:
 			and previous.handback.reason == reason
 			and previous.handback.fingerprint == result.fingerprint
 		)
-		self._handback_message = render_handback(run, _is_repeated_empty(runs, run.identity), stalled_page=stalled_page)
+		self._handback_message = render_handback(
+			run,
+			_is_repeated_empty(runs, run.identity, run.vision_at_start),
+			stalled_page=stalled_page,
+			screenshot_policy=self.settings.screenshot_policy,
+			vision_disabled_status=self._vision_disabled['status'] if self._vision_disabled else None,
+		)
 		if navigation:
 			links = json.dumps(navigation, ensure_ascii=False)
 			self._handback_message += (
@@ -484,31 +624,60 @@ class JevExecutor:
 			return 'action_budget', f'The action budget of this subgoal ({run.max_actions}) is used up. Review the result.'
 		return None
 
-	def _choice_check(self, run: SubgoalRun, obs: Observation, choice: decision.Decision) -> Stop | None:
+	def _choice_check(self, run: SubgoalRun, obs: Observation, choice: decision.Decision, *, request_vision: bool) -> Stop | None:
 		op, op_p, target_p = choice.operation, choice.operation_probability, choice.target_probability
 		limit = self.settings.unable_probability_handback
 		unable_p = choice.unable_probability
 		if self.gate.evaluate(
-			'confidence', unable_p is not None and unable_p > limit, f'UNABLE p={unable_p}, limit={limit}', self.step
+			'confidence',
+			unable_p is not None and unable_p > limit,
+			f'UNABLE p={unable_p}, limit={limit}',
+			self.step,
+			request_vision=request_vision,
 		):
 			return 'unable_probability', f'System1 gave UNABLE a probability of {unable_p}, above the limit {limit}.'
 		if op == 'UNABLE':
 			return 'unable', 'System1 reports that no offered operation can advance the completion condition.'
 		if op == 'STEP_DONE':
 			self.gate.evaluate(
-				'completion', decision.completion_blocked(obs, run), 'STEP_DONE without the required page action.', self.step
+				'completion',
+				decision.completion_blocked(obs, run),
+				'STEP_DONE without the required page action.',
+				self.step,
+				request_vision=request_vision,
 			)
 			return 'step_done', 'System1 requests review: it reports that the completion condition is visible.'
 		if choice.target_abstained:
 			return 'low_confidence', 'System1 could not identify a supported target in the reviewed choices.'
 		operation_score = choice.operation_score
-		low = (operation_score is not None and operation_score < self.settings.min_operation_probability) or (
+		operation_limit = self.settings.min_operation_probability
+		if choice.read_operation_probability is not None and operation_limit > 0:
+			operation_limit = self.settings.min_read_operation_probability
+		low = (operation_score is not None and operation_score < operation_limit) or (
 			target_p is not None and target_p < self.settings.min_target_probability
 		)
 		if self.gate.evaluate(
-			'confidence', low, f'operation p={op_p}, scoring p={operation_score}, target p={target_p}', self.step
+			'confidence',
+			low,
+			f'operation p={op_p}, scoring p={operation_score}, target p={target_p}',
+			self.step,
+			request_vision=request_vision,
 		):
 			return 'low_confidence', f'System1 was not confident: operation p={op_p}, target p={target_p}.'
+		return None
+
+	def _stop_for_repeated_verification(
+		self, verification_stalled: bool, stop: Stop | None, choice: decision.Decision | None
+	) -> Stop | None:
+		no_new_probe = verification_stalled and (
+			stop[0] in _NO_PROGRESS_STOPS if stop is not None else choice is not None and choice.operation == 'WAIT'
+		)
+		if self.gate.evaluate('completion', no_new_probe, 'Repeated verification reviewed unchanged evidence.', self.step):
+			self.finish_only = True
+			return (
+				'verification_stalled',
+				'Repeated verification returned the same evidence. Finish with the supported result and state what remains unknown.',
+			)
 		return None
 
 	def _repeat(self, run: SubgoalRun, obs: Observation, choice: decision.Decision, text: str | None) -> bool:
@@ -615,72 +784,239 @@ class JevExecutor:
 			return 'risk_denied', f'You did not authorize {detail} ({reason}).'
 		return None
 
-	async def _ask_system1(
-		self, run: SubgoalRun, obs: Observation, system_state: dict, questions: dict, stats: dict
-	) -> tuple[System1Reply | None, decision.Decision | None, Stop | None]:
-		start = monotonic()
-		choice = None
-		reply: System1Reply | None = None
+	def _vision_wanted(self, run: SubgoalRun) -> bool:
+		policy = self.settings.screenshot_policy
+		return self._vision_disabled is None and (policy == 'always' or (policy == 'smart' and run.vision))
+
+	def _can_escalate(self, run: SubgoalRun) -> bool:
+		return (
+			self.settings.screenshot_policy == 'smart'
+			and self.settings.vision_escalation
+			and not run.vision
+			and self._vision_disabled is None
+		)
+
+	def _start_escalation(self, run: SubgoalRun, reason: str) -> None:
+		entry = {'step': self.step, 'reason': reason, 'outcome': None}
+		run.escalations.append(entry)
+		self._pending_escalation = (run, entry)
+		self.usage.record_escalation(reason)
+
+	def _finish_escalation(self, outcome: str, *, detail: str | None = None) -> None:
+		if self._pending_escalation is None:
+			return
+		run, entry = self._pending_escalation
+		self._pending_escalation = None
+		entry['outcome'] = outcome
+		if outcome == 'executed':
+			self.usage.escalations_executed += 1
+		self.trace.write(
+			'vision_escalation',
+			run_id=run.id,
+			planner_declared=run.screenshot_declared,
+			**entry,
+			detail=detail,
+		)
+
+	async def _prepare_image(
+		self, summary: BrowserStateSummary, obs: Observation, run: SubgoalRun, trigger: str | None
+	) -> PreparedImage | None:
 		try:
-			reply = await self.backend.ask(system_state, questions)
+			image = await asyncio.to_thread(
+				prepare_screenshot,
+				summary.screenshot,
+				obs.viewport_width,
+				obs.viewport_height,
+				max_side=self.settings.vision_max_side,
+				quality=self.settings.vision_jpeg_quality,
+			)
 		except asyncio.CancelledError:
+			self._finish_escalation('retry_failed', detail='CancelledError')
+			raise
+		if image is None:
+			self.trace.write('vision_unavailable', self.step, run_id=run.id, vision_trigger=trigger)
+			self._finish_escalation('vision_unavailable')
+		return image
+
+	def _system1_request(
+		self,
+		run: SubgoalRun,
+		obs: Observation,
+		task: str,
+		registered: set[str],
+		offered: list[Operation],
+		research: dict | None,
+		image: PreparedImage | None,
+		selected_targets: dict[str, list[Candidate]],
+		pruning_stats: dict[str, Any],
+		enter_field: Candidate | None,
+	) -> _System1Request:
+		system_state = decision.build_state(
+			obs, run, task, self.task_actions, research, vision=(str(uuid4()), image) if image else None
+		)
+		questions = decision.build_questions(
+			obs,
+			run,
+			offered,
+			research=research,
+			registered_actions=registered,
+			enter_field=enter_field,
+			vision=image,
+			selected_targets=selected_targets,
+		)
+		counts = {name: len(q['criteria']) for name, q in questions.items() if name != 'operation'}
+		observed_counts = {op.lower() + '_target': len(obs.candidates[op]) for op in selected_targets}
+		if pruning_stats['before']:
+			observed_counts['click_target'] = pruning_stats['before']
+		model = self.settings.jev_model if self.backend.name == 'jev' else None
+		stats: dict[str, Any] = {
+			'run_id': run.id,
+			'backend': self.backend.name,
+			'questions': list(questions),
+			'request_chars': decision.request_size(system_state, questions, model, with_image=image is not None),
+			'offered_operations': offered,
+			'candidate_counts': counts,
+			'candidate_pruning': {**pruning_stats, 'after_limit': counts.get('click_target', 0)},
+			'observation_fingerprint': obs.fingerprint,
+			'observed_candidate_counts': observed_counts,
+			'vision': image is not None,
+			'vision_trigger': _vision_trigger(run) if image else None,
+			'image_bytes': image.bytes if image else 0,
+			'image_size': [image.width, image.height] if image else None,
+			'dpr': image.scale if image else None,
+			'rect_count': len(
+				{key for name in counts for key, criterion in questions[name]['criteria'].items() if 'rect' in criterion}
+			),
+			'unselectable_options': obs.unselectable_options,
+			'outcome': 'handback',
+			'decision_attempt': 1,
+			'operation': None,
+			'operation_probability': None,
+			'target_label': None,
+			'target_key': None,
+			'target_probability': None,
+			'returned_model': None,
+			'unable_probability': None,
+			'choice_is_argmax': None,
+			'answers': {},
+			'attempts': [],
+			'bu_action': None,
+			'input_tokens': None,
+			'output_tokens': None,
+			'cost_usd': None,
+		}
+		if self._vision_disabled is not None:
+			stats['vision_disabled'] = True
+		if image is not None and run.vision_source == 'escalation' and self._pending_escalation is not None:
+			stats.update(escalation_from=run.escalations[-1]['reason'], planner_declared=run.screenshot_declared)
+		return _System1Request(system_state, questions, model, image, stats)
+
+	async def _ask_once(self, request: _System1Request) -> System1Reply | None:
+		"""Send this request, attributing every transport attempt to its text or image payload."""
+		stats = request.stats
+		start = monotonic()
+		self.current_vision_trigger = stats['vision_trigger']
+		try:
+			if request.image is None:
+				reply = await self.backend.ask(request.state, request.questions)
+			else:
+				reply = await self.backend.ask(
+					request.state, request.questions, images={'page-screenshot': request.image.jpeg_b64}
+				)
+		except asyncio.CancelledError:
+			self._finish_escalation('retry_failed', detail='CancelledError')
 			elapsed_ms = round((monotonic() - start) * 1000)
 			attempts = self.backend.last_attempts if isinstance(self.backend, JevBackend) else []
 			if attempts:
-				self.usage.record_jev(None, elapsed_ms, len(attempts))
-			self.trace.write(
-				'system1_decision',
-				self.step,
-				**{**stats, 'outcome': 'interrupted', 'error': 'CancelledError', 'latency_ms': elapsed_ms, 'attempts': attempts},
-			)
+				self.usage.record_jev(None, elapsed_ms, len(attempts), vision=request.image is not None)
+			stats.update(outcome='interrupted', error='CancelledError', latency_ms=elapsed_ms, attempts=attempts)
+			self._record_decision(request, None)
 			raise
 		except System1Error as exc:
-			attempts = exc.attempts
-			stats.update(attempts=attempts, latency_ms=round((monotonic() - start) * 1000))
+			elapsed_ms = round((monotonic() - start) * 1000)
+			stats.update(error=str(exc), attempts=exc.attempts, latency_ms=elapsed_ms)
 			if self.backend.name == 'jev':
-				self.usage.record_jev(None, stats['latency_ms'], max(1, len(attempts)))
-			stop = ('system1_error', f'The System1 request failed: {exc}')
-		else:
-			stats.update(
-				returned_model=reply.model,
-				input_tokens=reply.input_tokens,
-				output_tokens=reply.output_tokens,
-				latency_ms=reply.latency_ms,
-				attempts=reply.attempts,
-				answers=reply.answers,
+				self.usage.record_jev(None, elapsed_ms, max(1, len(exc.attempts)), vision=request.image is not None)
+			return None
+		finally:
+			self.current_vision_trigger = None
+
+		stats.update(
+			returned_model=reply.model,
+			input_tokens=reply.input_tokens,
+			output_tokens=reply.output_tokens,
+			latency_ms=reply.latency_ms,
+			attempts=reply.attempts,
+			answers=reply.answers,
+		)
+		if self.backend.name == 'jev':
+			self.usage.record_jev(reply, reply.latency_ms, vision=request.image is not None)
+			stats['cost_usd'] = (
+				reply.input_tokens * JEV_INPUT_USD_PER_MTOK / 1_000_000 if reply.input_tokens is not None else None
 			)
-			if self.backend.name == 'jev':
-				self.usage.record_jev(reply, reply.latency_ms)
-				stats['cost_usd'] = (
-					reply.input_tokens * JEV_INPUT_USD_PER_MTOK / 1_000_000 if reply.input_tokens is not None else None
-				)
-			try:
-				threshold = (
-					self.settings.unable_probability_handback if self.settings.checks.mode('confidence') == 'enforce' else None
-				)
-				inputs = run.params.inputs or ''
-				focus_threshold = (
-					self.settings.min_target_probability if inputs.strip() and '\n' not in inputs and '\r' not in inputs else None
-				)
-				choice = decision.combine(reply, questions, obs, unable_threshold=threshold, focus_threshold=focus_threshold)
-			except decision.InvalidAnswer as exc:
-				stop = ('invalid_answer', f'System1 returned an invalid answer: {exc}')
-				stats['choice_is_argmax'] = decision.argmax_flags(reply)
-			else:
-				target = choice.target
-				stats.update(
-					operation=choice.operation,
-					operation_probability=choice.operation_probability,
-					read_operation_probability=choice.read_operation_probability,
-					operation_score=choice.operation_score,
-					target_key=target.key if target else None,
-					target_label=target.element()[:120] if target else None,
-					target_probability=choice.target_probability,
-					unable_probability=choice.unable_probability,
-					choice_is_argmax=choice.choice_is_argmax,
-				)
-				stop = self._choice_check(run, obs, choice)
-		return reply, choice, stop
+		return reply
+
+	async def _assess_reply(
+		self,
+		run: SubgoalRun,
+		obs: Observation,
+		request: _System1Request,
+		reply: System1Reply,
+		enter_field: Candidate | None,
+		*,
+		check_action: bool = True,
+	) -> tuple[decision.Decision | None, str | None, Stop | None]:
+		if request.image is not None:
+			run.vision_decisions += 1
+		try:
+			threshold = (
+				self.settings.unable_probability_handback if self.settings.checks.mode('confidence') == 'enforce' else None
+			)
+			inputs = run.params.inputs or ''
+			focus_threshold = (
+				self.settings.min_target_probability if inputs.strip() and '\n' not in inputs and '\r' not in inputs else None
+			)
+			choice = decision.combine(reply, request.questions, obs, unable_threshold=threshold, focus_threshold=focus_threshold)
+		except decision.InvalidAnswer as exc:
+			request.stats['choice_is_argmax'] = decision.argmax_flags(reply)
+			return None, None, ('invalid_answer', f'System1 returned an invalid answer: {exc}')
+		if choice.operation == 'PRESS_ENTER':
+			choice.target = enter_field
+		target = choice.target
+		request.stats.update(
+			operation=choice.operation,
+			operation_probability=choice.operation_probability,
+			read_operation_probability=choice.read_operation_probability,
+			operation_score=choice.operation_score,
+			target_key=target.key if target else None,
+			target_label=target.element()[:120] if target else None,
+			target_probability=choice.target_probability,
+			unable_probability=choice.unable_probability,
+			choice_is_argmax=choice.choice_is_argmax,
+		)
+		stop = self._choice_check(run, obs, choice, request_vision=request.image is not None)
+		text = None
+		if stop is None and check_action:
+			stop, text = await self._check_before_dispatch(run, obs, request, reply, choice)
+		return choice, text, stop
+
+	async def _check_before_dispatch(
+		self, run: SubgoalRun, obs: Observation, request: _System1Request, reply: System1Reply, choice: decision.Decision
+	) -> tuple[Stop | None, str | None]:
+		try:
+			return await self._action_check(run, obs, choice)
+		except asyncio.CancelledError:
+			self._finish_escalation('retry_failed', detail='cancelled before dispatch')
+			request.stats.update(outcome='interrupted', error='CancelledError')
+			self._record_decision(request, reply)
+			raise
+
+	def _disable_vision(self, run: SubgoalRun, status: int) -> None:
+		self.trace.write('vision_rejected', self.step, run_id=run.id, status=status)
+		self.usage.record_vision_rejection(status, self.step)
+		if self._vision_disabled is None:
+			self._vision_disabled = {'status': status, 'step': self.step, 'run_id': run.id}
+			self.trace.write('vision_disabled', **self._vision_disabled)
 
 	def _enter_field(self, summary: BrowserStateSummary, obs: Observation) -> Candidate | None:
 		typed = self._typed_field
@@ -783,12 +1119,125 @@ class JevExecutor:
 		)
 		return target
 
+	async def _recheck_confidence(
+		self,
+		run: SubgoalRun,
+		obs: Observation,
+		summary: BrowserStateSummary,
+		request: _System1Request,
+		reply: System1Reply,
+		choice: decision.Decision,
+		enter_field: Candidate | None,
+		initial_stats: dict[str, Any],
+	) -> tuple[_System1Request, System1Reply, decision.Decision, Observation, Stop | None] | None:
+		retry_questions = {
+			name: {
+				**question,
+				'instructions': (
+					question['instructions']
+					+ '\nReconsider this decision independently. Compare the requested outcome with the observed state and '
+					'with the offered alternatives. Distinguish the exact control and effect needed. Choose UNABLE if '
+					'the page lacks enough evidence to select an action.'
+				),
+			}
+			for name, question in request.questions.items()
+		}
+		reviewed_clicks, aliases = {}, {}
+		if (
+			reply.has_probabilities
+			and choice.operation == 'CLICK'
+			and choice.target
+			and not (choice.target.risky_effect or choice.target.is_submit or choice.target.editable)
+			and choice.operation_score is not None
+			and choice.operation_score >= self.settings.min_operation_probability
+			and choice.target_probability is not None
+			and choice.target_probability < self.settings.min_target_probability
+		):
+			reviewed_clicks, aliases = await self._focus_click_review(summary, obs, reply, retry_questions)
+		size = decision.request_size(request.state, retry_questions, request.model)
+		if size > MAX_REQUEST_CHARS:
+			return None
+		self._confidence_rechecked.add(state.evidence_key(obs))
+		retry_stats = {
+			**initial_stats,
+			'decision_attempt': initial_stats['decision_attempt'] + 1,
+			'request_chars': size,
+			'candidate_counts': {name: len(q['criteria']) for name, q in retry_questions.items() if name != 'operation'},
+			**({'click_review_aliases': aliases} if reviewed_clicks else {}),
+		}
+		retry = replace(request, questions=retry_questions, stats=retry_stats)
+		request.stats['outcome'] = 'recheck'
+		self._record_decision(request, reply)
+		retry_reply = await self._ask_once(retry)
+		if retry_reply is None:
+			retry_stats['outcome'] = 'recheck_unresolved'
+			self._record_decision(retry, None)
+			return None
+		retry_choice, _, retry_stop = await self._assess_reply(run, obs, retry, retry_reply, enter_field, check_action=False)
+		if (
+			reviewed_clicks
+			and retry_stop is not None
+			and retry_stop[0] == 'low_confidence'
+			and retry_choice
+			and retry_choice.operation == 'CLICK'
+			and not retry_choice.target_abstained
+			and retry_choice.operation_score is not None
+			and retry_choice.operation_score >= self.settings.min_operation_probability
+		):
+			target = await self._review_persisting_click_split(
+				run, obs, reviewed_clicks, retry_questions['click_target']['criteria']
+			)
+			if target is not None:
+				retry_stats['target_reviewed_by_planner'] = True
+				retry_stats['target_review_previous_probability'] = retry_choice.target_probability
+				retry_stats.update(target_key=target.key, target_label=target.element()[:120], target_probability=None)
+				retry_choice = retry_choice.model_copy(update={'target': target, 'target_probability': None})
+				retry_stop = None
+		reviewed = reviewed_clicks.get(retry_choice.target.key) if retry_choice and retry_choice.target else None
+		if (
+			retry_choice is None
+			or (retry_stop is not None and retry_stop[0] != 'step_done')
+			or (reviewed_clicks and (retry_choice.operation != 'CLICK' or reviewed is None))
+		):
+			retry_stats['outcome'] = 'recheck_unresolved'
+			self._record_decision(retry, retry_reply)
+			return None
+
+		try:
+			fresh = await self.capture_browser_state(include_recent_events=False)
+			current = await state.observe(self.agent.browser_session, fresh, self.settings, self.step)
+		except Exception as exc:
+			retry_stop = (
+				'observation_changed',
+				f'Could not confirm the page after the confidence recheck: {type(exc).__name__}.',
+			)
+			return retry, retry_reply, retry_choice, obs, retry_stop
+		if fresh.jev_viewport != summary.jev_viewport or current.fingerprint != obs.fingerprint:
+			self.last_observation = self.observations[-1] = current
+			self._evidence_key = state.evidence_key(current)
+			retry_stop = (
+				'observation_changed',
+				'The page changed during the confidence recheck. Observe it again before acting.',
+			)
+			return retry, retry_reply, retry_choice, current, retry_stop
+		if reviewed is not None:
+			index = retry_choice.target.index if retry_choice.target else None
+			node = fresh.dom_state.selector_map.get(index) if index is not None else None
+			if node is None or node.backend_node_id != reviewed.node.backend_node_id:
+				retry_stop = ('observation_changed', 'The reviewed click target was replaced. Observe again before clicking.')
+			else:
+				self._reviewed_click = (
+					replace(reviewed, planner_target_key=retry_stats['target_key'])
+					if retry_stats.get('target_reviewed_by_planner')
+					else reviewed
+				)
+		return retry, retry_reply, retry_choice, obs, retry_stop
+
 	async def route(self, agent: 'Agent', browser_state_summary: BrowserStateSummary) -> RouteResult:
 		self._source = 'llm'
 		self._reviewed_click = None
 		self._routed_target = (self.step, agent.browser_session.agent_focus_target_id)
 		self._routed_observation = browser_state_summary
-		self._saved_decision = None
 		await self.usage.sync_other(self.step)
 		run = self.active_run
 		if not run:
@@ -805,215 +1254,191 @@ class JevExecutor:
 		except Exception as exc:
 			self._emit_result()
 			return self._handback(run, ('unsupported_page', f'Could not observe the current page: {type(exc).__name__}'), None)
+		previous = self.last_observation
 		self.last_observation = obs
 		self.observations = [*self.observations[-11:], obs]
 		key = self._evidence_key = state.evidence_key(obs)
 		if not obs.state_error and key not in self._seen_evidence:
 			self._seen_evidence.add(key)
 			run.new_evidence = True
-		await self._complete_record(run, obs, browser_state_summary)
+		await self._complete_record(run, obs, browser_state_summary, previous)
+		if (scroll := obs.scroll_observation) and scroll.page_suppressed:
+			self.trace.write(
+				'scroll_page_suppressed',
+				self.step,
+				run_id=run.id,
+				reason='root_locked_without_center_scroll',
+				overflow_y=scroll.root_overflow_y,
+				root_y=scroll.root_y,
+			)
 		stop = self._precheck(run, obs)
+		if stop and stop[0] == 'no_effect' and self._can_escalate(run) and not run.no_effect_escalated:
+			self._start_escalation(run, 'no_effect')
+			run.vision = True
+			run.vision_source = 'escalation'
+			run.vision_reason = _escalation_guidance('no_effect', None)
+			run.no_effect_streak = 0
+			run.no_effect_escalated = True
+			stop = self._precheck(run, obs)
 		if stop:
-			return self._handback(run, stop, obs)
+			if stop[0] == 'unsupported_page' and browser_state_summary.screenshot is None and self._vision_wanted(run):
+				self.trace.write('vision_unavailable', self.step, run_id=run.id, vision_trigger=_vision_trigger(run))
+			attempts = (
+				browser_state_summary.alignment_attempts
+				if stop[0] == 'unsupported_page' and isinstance(browser_state_summary, state.UnalignedState)
+				else None
+			)
+			return self._handback(run, stop, obs, alignment_attempts=attempts)
 		verification_stalled = self._verification_stalled(run, key)
 
 		registered = set(agent.tools.registry.registry.actions)
 		research = self.captures.research_state(obs)
 		enter_field = self._enter_field(browser_state_summary, obs)
-		offered = decision.offered_operations(
+		clicks, pruning_stats = await pruning.prune_click_targets(
+			agent.browser_session,
+			browser_state_summary,
 			obs,
+			self.settings.max_candidates,
+			enabled=self.settings.effective_candidate_pipeline == 'extended',
+			budget_ms=self.settings.pruning_budget_ms,
+			goal_terms=decision.subgoal_terms(run),
+		)
+		# Pruning narrows offered choices. Scope and action-risk checks still need the whole observed form.
+		candidate_obs = obs.model_copy(update={'candidates': {**obs.candidates, 'CLICK': clicks}})
+		offered = decision.offered_operations(
+			candidate_obs,
 			run,
 			registered,
 			self.settings.checks,
 			collect_available=bool(research and research['collect_available']),
 			enter_field=enter_field,
 		)
-		system_state = decision.build_state(obs, run, agent.task, self.task_actions, research)
-		model = self.settings.jev_model if self.backend.name == 'jev' else None
+		image = None
+		if self._vision_wanted(run):
+			image = await self._prepare_image(browser_state_summary, obs, run, _vision_trigger(run))
+		size_error: Stop = ('state_too_large', 'The page is too large for one System1 request.')
 		maximum = self.settings.max_candidates
 		while True:
-			questions = decision.build_questions(
-				obs,
-				run,
-				offered,
-				research=research,
-				registered_actions=registered,
-				max_candidates=maximum,
-				enter_field=enter_field,
+			selected_targets = decision.select_targets(candidate_obs, run, offered, registered, maximum)
+			request = self._system1_request(
+				run, obs, agent.task, registered, offered, research, image, selected_targets, pruning_stats, enter_field
 			)
-			size = decision.request_size(system_state, questions, model)
-			if size <= MAX_REQUEST_CHARS:
+			if request.stats['request_chars'] <= MAX_REQUEST_CHARS:
 				break
 			if maximum == 1:
-				return self._handback(run, ('state_too_large', 'The page is too large for one System1 request.'), obs)
+				return self._handback(run, size_error, obs)
 			maximum = max(1, maximum // 2)
-		counts = {name: len(q['criteria']) for name, q in questions.items() if name != 'operation'}
+
 		self.usage.roles['system1'].decisions += 1
-		stats: dict[str, Any] = {
-			'run_id': run.id,
-			'backend': self.backend.name,
-			'questions': list(questions),
-			'request_chars': size,
-			'observation_fingerprint': obs.fingerprint,
-			'offered_operations': offered,
-			'candidate_counts': counts,
-			'observed_candidate_counts': {
-				op.lower() + '_target': len(obs.candidates[op]) for op in offered if op in decision.TARGET_OPERATIONS
-			},
-			'unselectable_options': obs.unselectable_options,
-			'outcome': 'handback',
-			'decision_attempt': 1,
-			'operation': None,
-			'operation_probability': None,
-			'target_label': None,
-			'target_key': None,
-			'target_probability': None,
-			'returned_model': None,
-			'unable_probability': None,
-			'choice_is_argmax': None,
-			'answers': {},
-			'attempts': [],
-			'bu_action': None,
-			'input_tokens': None,
-			'output_tokens': None,
-			'cost_usd': None,
-		}
-		initial_stats = dict(stats)
-		reply, choice, stop = await self._ask_system1(run, obs, system_state, questions, stats)
-		if (
+		run.decisions += 1
+		initial_stats = request.stats.copy()
+		reply = await self._ask_once(request)
+		rejected = image_rejection_status(request.stats['attempts']) if reply is None and image is not None else None
+		if rejected is not None:
+			self._disable_vision(run, rejected)
+			self._finish_escalation('vision_rejected')
+			request.stats['outcome'] = 'vision_rejected'
+			self._record_decision(request, None)
+			request = self._system1_request(
+				run, obs, agent.task, registered, offered, research, None, selected_targets, pruning_stats, enter_field
+			)
+			request.stats['fallback_from'] = 'vision_rejected'
+			request.stats['decision_attempt'] += 1
+			if request.stats['request_chars'] > MAX_REQUEST_CHARS:
+				return self._handback(run, size_error, obs)
+			initial_stats = request.stats.copy()
+			reply = await self._ask_once(request)
+
+		stats = request.stats
+		if reply is None:
+			detail = f'The System1 request failed: {stats["error"]}'
+			if rejected is not None:
+				detail += f' Screenshots were disabled after Jev rejected an image (HTTP {rejected}).'
+			self._record_decision(request, None)
+			return self._handback(run, ('system1_error', detail), obs)
+		choice, text, stop = await self._assess_reply(run, obs, request, reply, enter_field)
+		reason = _escalation_reason(stop, choice) if request.image is None and self._can_escalate(run) else None
+		if stop and reason:
+			self._start_escalation(run, reason)
+			guidance = _escalation_guidance(reason, choice)
+			try:
+				await agent._check_stop_or_pause()
+				image = await self._prepare_image(browser_state_summary, obs, run, f'escalation:{reason}')
+			except (asyncio.CancelledError, Exception) as error:
+				self._finish_escalation('retry_failed', detail=type(error).__name__)
+				stats.update(outcome='interrupted', error=type(error).__name__)
+				self._record_decision(request, reply)
+				raise
+			if image is None:
+				self._record_decision(request, reply)
+				stop = self._stop_for_repeated_verification(verification_stalled, stop, choice) or stop
+				return self._handback(run, stop, obs, choice)
+			# Add the trial guidance without committing the run to images until the choice passes all checks.
+			trial = run.model_copy(update={'vision_source': 'escalation', 'vision_reason': guidance})
+			retry = self._system1_request(
+				trial, obs, agent.task, registered, offered, research, image, selected_targets, pruning_stats, enter_field
+			)
+			if retry.stats['request_chars'] > MAX_REQUEST_CHARS:
+				self._finish_escalation('retry_failed', detail=size_error[1])
+				self._record_decision(request, reply)
+				stop = (stop[0], f'{stop[1]} Retrying with the image failed: {size_error[1]}')
+				stop = self._stop_for_repeated_verification(verification_stalled, stop, choice) or stop
+				return self._handback(run, stop, obs, choice)
+			stats.update(outcome='escalated', escalation_from=reason, planner_declared=run.screenshot_declared)
+			self._record_decision(request, reply)
+			retry.stats['decision_attempt'] = stats['decision_attempt'] + 1
+			request = retry
+			stats = request.stats
+			reply = await self._ask_once(request)
+			if reply is None:
+				rejected = image_rejection_status(stats['attempts'])
+				if rejected is not None:
+					self._disable_vision(run, rejected)
+					stats['outcome'] = 'vision_rejected'
+					self._finish_escalation('vision_rejected')
+				else:
+					self._finish_escalation('retry_failed', detail=stats['error'])
+					stop = (stop[0], f'{stop[1]} Retrying with the image failed: {stats["error"]}.')
+				self._record_decision(request, None)
+				stop = self._stop_for_repeated_verification(verification_stalled, stop, choice) or stop
+				return self._handback(run, stop, obs, choice)
+			choice, text, stop = await self._assess_reply(run, obs, request, reply, enter_field)
+			if stop is None:
+				run.vision = True
+				run.vision_source = 'escalation'
+				run.vision_reason = guidance
+		elif (
 			stop is not None
 			and stop[0] == 'low_confidence'
+			and choice is not None
+			and request.image is None
 			and key not in self._confidence_rechecked
 			and browser_state_summary.jev_viewport is not None
 		):
-			retry_questions = {
-				name: {
-					**question,
-					'instructions': (
-						question['instructions']
-						+ '\nReconsider this decision independently. Compare the requested outcome with the observed state and '
-						'with the offered alternatives. Distinguish the exact control and effect needed. Choose UNABLE if '
-						'the page lacks enough evidence to select an action.'
-					),
-				}
-				for name, question in questions.items()
-			}
-			reviewed_clicks, aliases = {}, {}
-			if (
-				reply
-				and reply.has_probabilities
-				and choice
-				and choice.operation == 'CLICK'
-				and choice.target
-				and not (choice.target.risky_effect or choice.target.is_submit or choice.target.editable)
-				and choice.operation_score is not None
-				and choice.operation_score >= self.settings.min_operation_probability
-				and choice.target_probability is not None
-				and choice.target_probability < self.settings.min_target_probability
-			):
-				reviewed_clicks, aliases = await self._focus_click_review(browser_state_summary, obs, reply, retry_questions)
-			retry_stats = {
-				**initial_stats,
-				'decision_attempt': 2,
-				'request_chars': decision.request_size(system_state, retry_questions, model),
-				'candidate_counts': {name: len(q['criteria']) for name, q in retry_questions.items() if name != 'operation'},
-				**({'click_review_aliases': aliases} if reviewed_clicks else {}),
-			}
-			if retry_stats['request_chars'] <= MAX_REQUEST_CHARS:
-				self._confidence_rechecked.add(key)
-				self.trace.write('system1_decision', self.step, **{**stats, 'outcome': 'recheck'})
-				retry_reply, retry_choice, retry_stop = await self._ask_system1(
-					run, obs, system_state, retry_questions, retry_stats
-				)
-				if (
-					reviewed_clicks
-					and retry_stop is not None
-					and retry_stop[0] == 'low_confidence'
-					and retry_choice
-					and retry_choice.operation == 'CLICK'
-					and not retry_choice.target_abstained
-					and choice
-					and retry_choice.operation_score is not None
-					and retry_choice.operation_score >= self.settings.min_operation_probability
-				):
-					target = await self._review_persisting_click_split(
-						run, obs, reviewed_clicks, retry_questions['click_target']['criteria']
-					)
-					if target is not None:
-						retry_stats['target_reviewed_by_planner'] = True
-						retry_stats['target_review_previous_probability'] = retry_choice.target_probability
-						retry_stats.update(target_key=target.key, target_label=target.element()[:120], target_probability=None)
-						retry_choice = choice.model_copy(update={'target': target, 'target_probability': None})
-						retry_stop = None
-				reviewed = reviewed_clicks.get(retry_choice.target.key) if retry_choice and retry_choice.target else None
-				if (retry_stop is None or retry_stop[0] == 'step_done') and (
-					not reviewed_clicks or (retry_choice and retry_choice.operation == 'CLICK' and reviewed is not None)
-				):
-					reply, choice, stop, questions, stats = retry_reply, retry_choice, retry_stop, retry_questions, retry_stats
-					try:
-						fresh = await self.capture_browser_state(include_recent_events=False)
-						current = await state.observe(agent.browser_session, fresh, self.settings, self.step)
-					except Exception as exc:
-						stop = (
-							'observation_changed',
-							f'Could not confirm the page after the confidence recheck: {type(exc).__name__}.',
-						)
-						self.trace.write('system1_decision', self.step, **stats)
-						return self._handback(run, stop, None, choice)
-					if fresh.jev_viewport != browser_state_summary.jev_viewport or current.fingerprint != obs.fingerprint:
-						stop = (
-							'observation_changed',
-							'The page changed during the confidence recheck. Observe it again before acting.',
-						)
-						obs = current
-						self.last_observation = current
-						self.observations[-1] = current
-						self._evidence_key = state.evidence_key(current)
-					elif reviewed is not None:
-						index = choice.target.index if choice and choice.target else None
-						node = fresh.dom_state.selector_map.get(index) if index is not None else None
-						if node is None or node.backend_node_id != reviewed.node.backend_node_id:
-							stop = (
-								'observation_changed',
-								'The reviewed click target was replaced. Observe again before clicking.',
-							)
-						else:
-							self._reviewed_click = (
-								replace(reviewed, planner_target_key=stats['target_key'])
-								if stats.get('target_reviewed_by_planner')
-								else reviewed
-							)
-				else:
-					self.trace.write('system1_decision', self.step, **{**retry_stats, 'outcome': 'recheck_unresolved'})
-		no_new_probe = verification_stalled and (
-			(stop is not None and stop[0] in _NO_PROGRESS_STOPS) or (stop is None and choice and choice.operation == 'WAIT')
-		)
-		if self.gate.evaluate('completion', bool(no_new_probe), 'Repeated verification reviewed unchanged evidence.', self.step):
-			self.finish_only = True
-			stop = (
-				'verification_stalled',
-				'Repeated verification returned the same evidence. Finish with the supported result and state what remains unknown.',
+			reviewed = await self._recheck_confidence(
+				run, obs, browser_state_summary, request, reply, choice, enter_field, initial_stats
 			)
-		if not stop and choice is not None:
-			if choice.operation == 'PRESS_ENTER':
-				choice.target = enter_field
-			stop, text = await self._action_check(run, obs, choice)
-		else:
-			text = None
+			if reviewed is not None:
+				request, reply, choice, obs, stop = reviewed
+				stats = request.stats
+				if stop is None:
+					stop, text = await self._check_before_dispatch(run, obs, request, reply, choice)
+
+		stop = self._stop_for_repeated_verification(verification_stalled, stop, choice) or stop
 		if stop:
 			self._reviewed_click = None
-			self.trace.write('system1_decision', self.step, **stats)
+			if request.stats['outcome'] != 'recheck':
+				self._record_decision(request, reply)
 			navigation = (
-				decision.navigation_options(reply, questions, obs)
+				decision.navigation_options(reply, request.questions, obs)
 				if stop[0] in {'low_confidence', 'verification_stalled'}
 				and choice
 				and choice.operation == 'CLICK'
-				and reply
 				and reply.has_probabilities
 				else None
 			)
 			return self._handback(run, stop, obs, choice, navigation=navigation)
-		assert choice is not None and reply is not None
+		assert choice is not None
 		target = choice.target
 		bu_action = decision.to_bu_action(choice.operation, target, text, append=run.params.text_mode == 'append')
 		action = agent.ActionModel.model_validate(bu_action)
@@ -1044,22 +1469,35 @@ class JevExecutor:
 		self._record_target = target
 		self._source = 'system1'
 		stats.update(outcome='execute', bu_action=bu_action)
-		self.trace.write('system1_decision', self.step, **stats)
-		if agent.settings.save_conversation_path:
-			request = {'model': model, 'state': system_state, 'questions': questions}
-			self._saved_decision = {
-				'request': request,
-				'reply': reply.model_dump(),
-				'decision': {k: v for k, v in stats.items() if k != 'answers'},
-			}
+		self._record_decision(request, reply)
 		logger.info('System1 %s selected %s', run.id, output.memory)
 		return RouteResult(model_output=output)
 
-	def save_system1_step(self, agent: 'Agent', save_conversation_path: str | Path):
-		if self._saved_decision is not None:
-			path = Path(save_conversation_path) / f'system1_{agent.id}_{self.step}.json'
-			path.parent.mkdir(parents=True, exist_ok=True)
-			path.write_text(json.dumps(self._saved_decision, ensure_ascii=False, allow_nan=False, default=str), encoding='utf-8')
+	def _record_decision(self, request: _System1Request, reply: System1Reply | None) -> None:
+		stats = request.stats
+		self.trace.write('system1_decision', self.step, **stats)
+		directory = self.agent.settings.save_conversation_path
+		if not directory:
+			return
+		suffix = (
+			f'_{stats["outcome"]}'
+			if stats['outcome'] in ('escalated', 'vision_rejected', 'recheck', 'recheck_unresolved')
+			else ''
+		)
+		path = Path(directory) / f'system1_{self.agent.id}_{self.step}{suffix}.json'
+		path.parent.mkdir(parents=True, exist_ok=True)
+		record = {
+			'request': decision.request_body(
+				request.state, request.questions, request.model, with_image=request.image is not None
+			),
+			'reply': reply.model_dump() if reply else None,
+			'decision': {k: v for k, v in stats.items() if k != 'answers'},
+		}
+		if request.image is not None:
+			jpeg = path.with_suffix('.jpg')
+			jpeg.write_bytes(base64.b64decode(request.image.jpeg_b64, validate=True))
+			record['request_images'] = {'page-screenshot': jpeg.name}
+		path.write_text(json.dumps(record, ensure_ascii=False, allow_nan=False, default=str), encoding='utf-8')
 
 	async def on_dispatch(self, agent: 'Agent') -> ActionResult | None:
 		record = self.pending_record
@@ -1082,6 +1520,7 @@ class JevExecutor:
 					return ActionResult(error=record.error)
 			self._typed_field = None
 			record.status = 'dispatched'
+			self._finish_escalation('executed')
 		return None
 
 	def on_dispatch_error(self, agent: 'Agent', error: BaseException):
@@ -1105,7 +1544,7 @@ class JevExecutor:
 					self._handback_message = None
 					if output and i < len(output.action):
 						name = next(iter(output.action[i].model_dump(exclude_unset=True)), '')
-						if name not in {'delegate_subgoal', 'finish', 'done', 'collect_page'}:
+						if name not in {'delegate_subgoal', 'finish', 'done', *decision.SYSTEM1_INTERNAL_ACTIONS}:
 							self._planner_page_action = True
 							self._typed_field = None
 			return
@@ -1141,13 +1580,20 @@ class JevExecutor:
 			if document is not None and node is not None:
 				self._typed_field = _TypedField(document, node)
 
-	async def _complete_record(self, run: SubgoalRun, obs: Observation, summary: BrowserStateSummary):
+	async def _complete_record(
+		self, run: SubgoalRun, obs: Observation, summary: BrowserStateSummary, previous: Observation | None
+	):
 		record = self.pending_record
 		if not record:
 			return
 		target = self._record_target
 		record.url_after = obs.url
-		record.page_changed = obs.fingerprint != record.fingerprint_before
+		if record.operation in ('SCROLL_UP', 'SCROLL_DOWN'):
+			effect = state.scroll_effect(previous, obs, target)
+			record.scroll_effect = effect
+			record.page_changed = effect.page_changed
+		else:
+			record.page_changed = obs.fingerprint != record.fingerprint_before
 		if record.operation == 'SELECT' and target and target.index is not None and record.status == 'executed_ok':
 			node = summary.dom_state.selector_map.get(target.index)
 			# A different document may legally reuse a backend node id.
@@ -1165,12 +1611,14 @@ class JevExecutor:
 		record.applied = record.status == 'executed_ok' and bool(changes)
 		run.applied = run.applied or record.applied
 		if record.executed and record.operation not in ('WAIT', 'COLLECT'):
-			run.no_effect_streak = 0 if record.page_changed else run.no_effect_streak + 1
+			run.no_effect_streak = run.no_effect_streak + 1 if record.page_changed is False else 0
 		self._emit_result()
 
 	def _emit_result(self):
 		record = self.pending_record
 		if record:
+			if record.status == 'discarded':
+				self._finish_escalation('retry_failed', detail='prediction discarded before dispatch')
 			fields = record.model_dump(
 				include={
 					'run_id',
@@ -1185,6 +1633,8 @@ class JevExecutor:
 					'applied',
 				}
 			)
+			if record.executed and record.operation in ('SCROLL_UP', 'SCROLL_DOWN'):
+				fields['scroll_effect'] = (record.scroll_effect or ScrollEffect(target_key=record.target_key)).model_dump()
 			self.trace.write('action_result', self.step, record_step=record.step, **fields)
 		self.pending_record = None
 		self._record_target = None
@@ -1216,7 +1666,7 @@ class JevExecutor:
 			return
 		last_page = {'url': item.state.url, 'title': item.state.title, 'text': ''}
 		try:
-			page = await state.read_visible_text(agent.browser_session)
+			page = await self._read_viewport_text(agent.browser_session)
 			focus = agent.browser_session.agent_focus_target_id
 			target_matches = not self._routed_target or self._routed_target == (item.metadata.step_number, focus)
 			if not last_page['url'] and focus and self._routed_target == (item.metadata.step_number, focus):
@@ -1312,6 +1762,7 @@ class JevExecutor:
 				elif self.pending_record.status == 'dispatched':
 					self.pending_record.status = 'unknown'
 				self._emit_result()
+			self._finish_escalation('retry_failed', detail='executor closed before dispatch')
 			await self.usage.sync_other(self.step)
 			roles = self.usage_by_role()
 			costs = [r['cost_usd'] for r in roles.values()]

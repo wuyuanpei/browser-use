@@ -19,6 +19,7 @@ from .chrome_attachment import ChromeAttachment
 from .engine import MAX_STEPS, BrowserUnavailable, BrowserUseRun, RunCancelled
 from .models import (
 	DEBUG_PROFILE,
+	JEV_PROBABILITY_ENV,
 	PROVIDER,
 	load_environment,
 	load_profile_environment,
@@ -332,12 +333,25 @@ def main():
 	parser.add_argument('--port', type=int, default=PORT, help='Loopback port. Use 0 for an available port.')
 	parser.add_argument('--artifacts', type=Path, default=ARTIFACTS, help='Directory for benchmark batches.')
 	parser.add_argument('--profile-env', type=Path, action='append', default=[], help='Reuse a Jev model configuration file.')
+	for field in JEV_PROBABILITY_ENV:
+		parser.add_argument(
+			'--jev-' + field.replace('_', '-'),
+			dest=field,
+			type=float,
+			metavar='0..1',
+			help=f'Jev {field.replace("_", " ")} (0 disables this floor).',
+		)
 	parser.add_argument(
 		'--chrome-active-port-file',
 		type=Path,
 		help='Use DevToolsActivePort from an already running local Chrome instead of launching a browser.',
 	)
 	args = parser.parse_args()
+	for field, env in JEV_PROBABILITY_ENV.items():
+		if (value := getattr(args, field)) is not None:
+			if not 0 <= value <= 1:
+				parser.error(f'--jev-{field.replace("_", "-")} must be between 0 and 1')
+			os.environ[env] = str(value)
 	load_environment()
 	default_profile = os.getenv('BROWSER_USE_BENCHMARK_PROFILE_ENV')
 	profile_paths = args.profile_env or ([Path(default_profile)] if default_profile else [])

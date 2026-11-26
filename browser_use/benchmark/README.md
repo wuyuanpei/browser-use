@@ -14,6 +14,12 @@ uv pip install -r pyproject.toml --extra benchmark
 
 默认使用调试配置。Browser Use 从原来的 `PLANNER_*` 读取执行模型，独立终验从 `TEXT_MODEL_*` 读取模型。最终报告沿用原来的模型、服务和专用凭据，仅显式选择时用于当次运行。可用 `--profile-env` 读取已有的本机 Jev 配置，也可以在仓库的 `.env` 配置相同变量。若真实用例需要登录，可用 `BROWSER_USE_BENCHMARK_USER_DATA_DIR` 指定专用 Chrome 配置目录。
 
+Jev 的操作和目标置信门限默认都是 `0.8`。把对应参数设置为 `0` 即可关闭该门限。重新启动时传入 `0.8` 可恢复原值。模型弃权与提交检查仍参与执行判断。基线批次的 `manifest.json` 会记录实际门限。
+
+```powershell
+.venv\Scripts\python.exe -m browser_use.benchmark --jev-min-operation-probability 0 --jev-min-target-probability 0
+```
+
 ## 复用正在运行的 Chrome
 
 在 Chrome 打开 `chrome://inspect/#remote-debugging` 并开启远程调试。`DevToolsActivePort` 位于 Chrome 用户数据目录，可在 `chrome://version` 查看 `Profile Path` 并取其上一级目录。启动测试台时用 `--chrome-active-port-file` 传入该文件，或配置 `BROWSER_USE_BENCHMARK_CHROME_ACTIVE_PORT_FILE`。

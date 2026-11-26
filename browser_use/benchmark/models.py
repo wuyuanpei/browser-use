@@ -15,6 +15,10 @@ DEBUG_PROFILE = 'debug'
 FINAL_REPORT_PROFILE = 'final_report'
 DEEPSEEK_URL = 'https://api.deepseek.com/v1'
 REPORT_MODEL = {'model': 'deepseek-flash', 'base_url': DEEPSEEK_URL}
+JEV_PROBABILITY_ENV = {
+	'min_operation_probability': 'BROWSER_USE_BENCHMARK_JEV_MIN_OPERATION_PROBABILITY',
+	'min_target_probability': 'BROWSER_USE_BENCHMARK_JEV_MIN_TARGET_PROBABILITY',
+}
 _SECRET_NAMES = (
 	'PLANNER_API_KEY',
 	'TEXT_MODEL_API_KEY',
@@ -57,10 +61,15 @@ class RunSettings(BaseModel):
 	profile: Literal['debug', 'final_report']
 	execution_mode: ExecutionMode = 'direct'
 	jev: ModelEndpoint | None = None
+	min_operation_probability: float | None = Field(default=None, ge=0, le=1)
+	min_target_probability: float | None = Field(default=None, ge=0, le=1)
 	execution: ExecutionModel
 	evaluation: EvaluationModel
 	headless: bool
 	user_data_dir: str | None
+
+	def jev_probability_options(self) -> dict[str, float]:
+		return self.model_dump(include=set(JEV_PROBABILITY_ENV), exclude_none=True)
 
 	def system1_config(self) -> dict[str, str]:
 		if self.jev is not None:
@@ -165,14 +174,17 @@ def runtime_settings(
 	if policy != 'off':
 		raise ValueError('当前两套 DeepSeek 配置使用文本输入，实时预览仍会生成。')
 	jev = None
+	jev_probabilities = {}
 	if mode != 'direct':
 		from browser_use.agent.jev import JevSettings
 
 		key = os.getenv('TYPESAFE_API_KEY', '').strip()
 		if not key:
 			raise ValueError('Jev 执行需要服务器配置 TYPESAFE_API_KEY。')
-		defaults = JevSettings()
-		jev = ModelEndpoint(model=defaults.jev_model, base_url=defaults.jev_base_url, api_key=key)
+		configured = {field: value for field, env in JEV_PROBABILITY_ENV.items() if (value := os.getenv(env)) is not None}
+		jev_settings = JevSettings.model_validate(configured)
+		jev = ModelEndpoint(model=jev_settings.jev_model, base_url=jev_settings.jev_base_url, api_key=key)
+		jev_probabilities = jev_settings.model_dump(include=set(JEV_PROBABILITY_ENV))
 	profile = DEBUG_PROFILE if model_profile is None else model_profile
 	if profile not in (DEBUG_PROFILE, FINAL_REPORT_PROFILE):
 		raise ValueError('model_profile must be debug or final_report')
@@ -206,6 +218,7 @@ def runtime_settings(
 		evaluation=evaluation,
 		headless=os.getenv('BROWSER_USE_BENCHMARK_HEADLESS', 'true').lower() not in {'0', 'false'},
 		user_data_dir=os.getenv('BROWSER_USE_BENCHMARK_USER_DATA_DIR'),
+		**jev_probabilities,
 	)
 
 

@@ -17,6 +17,10 @@ class ModelProviderError(ModelError):
 		self.model = model
 
 
+class ModelOutputFormatError(ModelProviderError):
+	"""The provider responded, but its structured tool arguments could not be decoded or validated."""
+
+
 class ModelRateLimitError(ModelProviderError):
 	"""Exception raised when a model provider returns a rate limit error."""
 

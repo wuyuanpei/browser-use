@@ -307,6 +307,9 @@ async def test_collect_on_a_collaborative_finish_on_b(httpserver: HTTPServer, tm
 		assert len(res.answer_payloads) == 1
 		payload = res.answer_payloads[0]
 		assert payload['last_page']['url'] == b and 'BETA-42' in payload['last_page']['text']
+		browser_observation = payload['final_browser_observation']
+		assert browser_observation['url'] == b and 'BETA-42' in browser_observation['dom_text']
+		assert 'ALPHA-83' not in browser_observation['dom_text']
 		assert len(payload['collected_pages']) == 1 and 'ALPHA-83' in payload['collected_pages'][0]['text']
 		assert res.by_event('final_answer')[0]['trigger'] == 'done_rewrite'
 		assert res.history.final_result() == 'The final page was reviewed.'
@@ -416,7 +419,7 @@ async def run_native_workflow(url: str) -> tuple[str, list[str]]:
 				idx = next(
 					i
 					for i, n in snapshot.dom_state.selector_map.items()
-					if n.tag_name in tag_types and n.ax_node and n.ax_node.name == target
+					if n.tag_name in tag_types and n.ax_node and (n.ax_node.name or '').strip() == target
 				)
 				raw = action('input', index=idx, text='Zurich', clear=True) if op == 'TYPE_TEXT' else action('click', index=idx)
 		return ChatInvokeCompletion(completion=output_format.model_validate_json(raw), usage=None)

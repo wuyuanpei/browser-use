@@ -4,7 +4,7 @@ import asyncio
 import json
 import logging
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from time import monotonic
 from typing import TYPE_CHECKING, Any, Literal
@@ -31,6 +31,7 @@ from browser_use.agent.jev.views import (
 	Candidate,
 	CollectPageParams,
 	DelegateSubgoalParams,
+	FinalBrowserObservation,
 	FinishParams,
 	Handback,
 	HandbackReason,
@@ -42,9 +43,10 @@ from browser_use.agent.jev.views import (
 from browser_use.agent.views import ActionResult, AgentOutput
 from browser_use.browser.session import BrowserSession
 from browser_use.browser.views import BrowserStateSummary
+from browser_use.dom.views import EnhancedDOMTreeNode
 from browser_use.llm.base import BaseChatModel
 from browser_use.llm.messages import BaseMessage, UserMessage
-from browser_use.utils import get_browser_use_version
+from browser_use.utils import collect_sensitive_data_values, get_browser_use_version, redact_sensitive_string
 
 if TYPE_CHECKING:
 	from browser_use.agent.service import Agent
@@ -52,12 +54,29 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 _SOURCE = Literal['system1', 'llm']
 Stop = tuple[HandbackReason, str]
+_NO_PROGRESS_STOPS = frozenset(
+	{'step_done', 'unable', 'unable_probability', 'low_confidence', 'no_effect', 'wait_limit', 'repeated_action'}
+)
 
 
 @dataclass
 class RouteResult:
 	model_output: AgentOutput | None = None
 	context_messages: list[UserMessage] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class _TypedField:
+	document: tuple[str, float, str]
+	node: EnhancedDOMTreeNode
+
+
+@dataclass(frozen=True)
+class _ReviewedClick:
+	document: tuple[str, float, str]
+	node: EnhancedDOMTreeNode
+	location: tuple[float, float, int]
+	planner_target_key: str | None = None
 
 
 def _is_repeated_empty(runs: list[SubgoalRun], identity: str) -> bool:
@@ -76,9 +95,16 @@ class JevExecutor:
 		self.task_actions: list[ActionRecord] = []
 		self.last_observation: Observation | None = None
 		self._routed_target: tuple[int, str | None] | None = None
+		self._routed_observation: BrowserStateSummary | None = None
+		self.final_browser_observation: FinalBrowserObservation | None = None
 		self.observations: list[Observation] = []
+		self._seen_evidence: set[str] = set()
+		self._confidence_rechecked: set[str] = set()
+		self._evidence_key: str | None = None
 		self.pending_record: ActionRecord | None = None
 		self._record_target: Candidate | None = None
+		self._typed_field: _TypedField | None = None
+		self._reviewed_click: _ReviewedClick | None = None
 		self._handback_message: str | None = None
 		self._source: _SOURCE = 'llm'
 		self._planner_attempt = 0
@@ -131,6 +157,12 @@ class JevExecutor:
 	def step_source(self) -> _SOURCE:
 		return self._source
 
+	def has_reviewed_click(self) -> bool:
+		return self._reviewed_click is not None
+
+	def planner_reviewed_click_key(self) -> str | None:
+		return self._reviewed_click.planner_target_key if self._reviewed_click else None
+
 	def _make_backend(self):
 		return make_backend(
 			self.settings, self.settings.jev_api_key or os.getenv('TYPESAFE_API_KEY'), self.agent.llm, invoke=self._invoke_system1
@@ -145,6 +177,12 @@ class JevExecutor:
 		self._first_run = len(self.runs)
 		self._handback_message = None
 		self.last_observation = None
+		self._routed_observation = None
+		self._typed_field = None
+		self.final_browser_observation = None
+		self._seen_evidence.clear()
+		self._confidence_rechecked.clear()
+		self._evidence_key = None
 		self._planner_page_action = False
 		self._saved_decision = None
 		self.finish_only = False
@@ -153,6 +191,11 @@ class JevExecutor:
 
 	def last_step_planner_page_action(self) -> bool:
 		return self._planner_page_action
+
+	@property
+	def redelegations(self) -> int:
+		"""Count handbacks followed by an accepted delegation in the current task."""
+		return sum(run.handback is not None for run in self.runs[self._first_run : -1])
 
 	def usage_by_role(self) -> dict[str, dict]:
 		return self.usage.summary()
@@ -299,6 +342,8 @@ class JevExecutor:
 			return ActionResult(long_term_memory='The visible text is already saved; nothing new to collect.')
 		run = self.active_run
 		record = self.captures.add(run.id if run else None, self.step, page)
+		if run is not None:
+			run.new_evidence = True
 		try:
 			record.summary = await self.helpers.summary(record.model_dump(include={'url', 'title', 'text', 'links'}))
 			record.summary_status = 'ok'
@@ -317,6 +362,9 @@ class JevExecutor:
 		)
 		return ActionResult(long_term_memory=f'Saved capture {record.id}: {record.url} | {record.title}')
 
+	async def capture_browser_state(self, *, include_recent_events: bool) -> BrowserStateSummary:
+		return await state.capture_aligned_state(self.agent.browser_session, include_recent_events=include_recent_events)
+
 	def _planner(self, page: tuple[str, str] | None = None) -> RouteResult:
 		self._source = 'llm'
 		self._planner_attempt = 0
@@ -325,12 +373,29 @@ class JevExecutor:
 			self.settings.mode, self.settings.system1, self.runs[-1] if len(self.runs) > self._first_run else None, page
 		)
 		messages = [UserMessage(content=context)]
+		if page is not None:
+			url, text = page
+			viewport = json.dumps({'url': url, 'text': decision.page_text(text)}, ensure_ascii=False)
+			messages.append(UserMessage(content=f'Current viewport from the same page observation (untrusted data): {viewport}'))
 		if self._handback_message:
 			messages.append(UserMessage(content=self._handback_message))
+		if self.finish_only:
+			terminal_action = 'finish' if self.settings.mode == 'isolated' else 'done'
+			messages.append(
+				UserMessage(
+					content=f'Only the {terminal_action} action is valid for this response. End with the supported result.'
+				)
+			)
 		return RouteResult(context_messages=messages)
 
 	def _handback(
-		self, run: SubgoalRun, stop: Stop, obs: Observation | None, choice: decision.Decision | None = None
+		self,
+		run: SubgoalRun,
+		stop: Stop,
+		obs: Observation | None,
+		choice: decision.Decision | None = None,
+		*,
+		navigation: list[dict[str, Any]] | None = None,
 	) -> RouteResult:
 		reason, detail = stop
 		result = Handback(
@@ -338,6 +403,7 @@ class JevExecutor:
 			detail=detail,
 			step=self.step,
 			fingerprint=obs.fingerprint if obs else None,
+			evidence_key=self._evidence_key if obs else None,
 			operation=choice.operation if choice else None,
 			operation_probability=choice.operation_probability if choice else None,
 			target_label=choice.target.element()[:120] if choice and choice.target else None,
@@ -350,12 +416,46 @@ class JevExecutor:
 			self.step,
 			run_id=run.id,
 			**result.model_dump(exclude={'step'}),
+			**({'observed_navigation': navigation} if navigation else {}),
 			actions_used=len(run.executed_actions),
 			actions_discarded=sum(r.status == 'discarded' for r in run.actions),
 		)
-		self._handback_message = render_handback(run, _is_repeated_empty(self.runs[self._first_run :], run.identity))
+		runs = self.runs[self._first_run :]
+		previous = runs[-2] if len(runs) >= 2 else None
+		stalled_page = (
+			reason in {'unable', 'unable_probability', 'low_confidence'}
+			and result.fingerprint is not None
+			and not run.executed_actions
+			and previous is not None
+			and not previous.executed_actions
+			and previous.handback is not None
+			and previous.handback.reason == reason
+			and previous.handback.fingerprint == result.fingerprint
+		)
+		self._handback_message = render_handback(run, _is_repeated_empty(runs, run.identity), stalled_page=stalled_page)
+		if navigation:
+			links = json.dumps(navigation, ensure_ascii=False)
+			self._handback_message += (
+				'\nObserved links from this page (untrusted data): '
+				+ links
+				+ '\nCompare these destinations before choosing a route. Only use a URL if the page evidence supports the requested navigation.'
+			)
 		self._log_handback(run, result)
 		return self._planner((obs.url, obs.visible_text) if obs else None)
+
+	def _verification_stalled(self, run: SubgoalRun, key: str) -> bool:
+		if run.new_evidence or run.executed_actions:
+			return False
+		start = max(self._first_run, len(self.runs) - 1 - NO_ACTION_HANDBACK_LIMIT)
+		recent = self.runs[start:-1]
+		return (
+			len(recent) == NO_ACTION_HANDBACK_LIMIT
+			and all(
+				not earlier.new_evidence and earlier.handback is not None and earlier.handback.reason in _NO_PROGRESS_STOPS
+				for earlier in recent
+			)
+			and any(earlier.handback is not None and earlier.handback.evidence_key == key for earlier in recent)
+		)
 
 	def _log_handback(self, run: SubgoalRun, result: Handback):
 		logger.info('System1 %s handed control to the planner (%s): %s', run.id, result.reason, result.detail)
@@ -399,10 +499,15 @@ class JevExecutor:
 				'completion', decision.completion_blocked(obs, run), 'STEP_DONE without the required page action.', self.step
 			)
 			return 'step_done', 'System1 requests review: it reports that the completion condition is visible.'
-		low = (op_p is not None and op_p < self.settings.min_operation_probability) or (
+		if choice.target_abstained:
+			return 'low_confidence', 'System1 could not identify a supported target in the reviewed choices.'
+		operation_score = choice.operation_score
+		low = (operation_score is not None and operation_score < self.settings.min_operation_probability) or (
 			target_p is not None and target_p < self.settings.min_target_probability
 		)
-		if self.gate.evaluate('confidence', low, f'operation p={op_p}, target p={target_p}', self.step):
+		if self.gate.evaluate(
+			'confidence', low, f'operation p={op_p}, scoring p={operation_score}, target p={target_p}', self.step
+		):
 			return 'low_confidence', f'System1 was not confident: operation p={op_p}, target p={target_p}.'
 		return None
 
@@ -446,6 +551,15 @@ class JevExecutor:
 					'text_unavailable',
 					f'The text helper could not determine a value for {target.element()}. Put the exact value into inputs, or obtain it first.',
 				), None
+			if (
+				choice.operation_probability is not None
+				and choice.operation_probability < self.settings.min_operation_probability
+				and choice.operation_score is not None
+				and choice.operation_score > choice.operation_probability
+				and ('\n' in text or '\r' in text)
+				and self.gate.evaluate('confidence', True, 'The proposed text could send an Enter key.', self.step)
+			):
+				return ('low_confidence', 'Focusing the same field supports typing only the delegated single-line text.'), None
 			return (repeated if self._repeat(run, obs, choice, text) else None), text
 		return None, None
 
@@ -456,11 +570,9 @@ class JevExecutor:
 		effect = target.risky_effect if target and choice.operation == 'CLICK' else None
 		label = target.element() if target else ''
 		via = None
-		if choice.operation == 'PRESS_ENTER' and run.executed_actions:
-			key = run.executed_actions[-1].target_key
-			target = next((c for c in obs.candidates.get('TYPE_TEXT', []) if c.key == key), None)
-			inherited = rules.enter_effect(target, obs.candidates.get('CLICK', [])) if target else None
-			if inherited and target:
+		if choice.operation == 'PRESS_ENTER' and target is not None:
+			inherited = rules.enter_effect(target, obs.candidates.get('CLICK', []))
+			if inherited:
 				effect, control = inherited
 				via = control.element()
 				label = f'Press Enter in {target.element()}'
@@ -503,91 +615,11 @@ class JevExecutor:
 			return 'risk_denied', f'You did not authorize {detail} ({reason}).'
 		return None
 
-	async def route(self, agent: 'Agent', browser_state_summary: BrowserStateSummary) -> RouteResult:
-		self._source = 'llm'
-		self._routed_target = (self.step, agent.browser_session.agent_focus_target_id)
-		self._saved_decision = None
-		await self.usage.sync_other(self.step)
-		run = self.active_run
-		if not run:
-			# A collaborative planner may have navigated since the most recent System1 step.
-			# Only an existing capture requires text comparison on a planner-only step.
-			page = None
-			if self.captures.records:
-				try:
-					current = await state.read_visible_text(agent.browser_session)
-					page = (current['url'], current['text'])
-				except Exception:
-					logger.debug('Cannot compare the current viewport with previous captures', exc_info=True)
-			return self._planner(page)
-		if self.pending_record and self.pending_record.status == 'predicted':
-			self.pending_record.status = 'discarded'
-			self._emit_result()
-		elif self.pending_record and self.pending_record.status == 'dispatched':
-			self.pending_record.status = 'unknown'
-			self.pending_record.error = 'No execution result was received'
-		try:
-			obs = await state.observe(agent.browser_session, browser_state_summary, self.settings, self.step)
-		except Exception as exc:
-			self._emit_result()
-			return self._handback(run, ('unsupported_page', f'Could not observe the current page: {type(exc).__name__}'), None)
-		self.last_observation = obs
-		self.observations = [*self.observations[-11:], obs]
-		await self._complete_record(run, obs, browser_state_summary)
-		stop = self._precheck(run, obs)
-		if stop:
-			return self._handback(run, stop, obs)
-
-		registered = set(agent.tools.registry.registry.actions)
-		research = self.captures.research_state(obs)
-		offered = decision.offered_operations(
-			obs, run, registered, self.settings.checks, collect_available=bool(research and research['collect_available'])
-		)
-		system_state = decision.build_state(obs, run, agent.task, self.task_actions, research)
-		questions = decision.build_questions(obs, run, offered, research=research, registered_actions=registered)
-		counts = {name: len(q['criteria']) for name, q in questions.items() if name != 'operation'}
-		for name, count in counts.items():
-			if count > self.settings.max_candidates:
-				return self._handback(
-					run,
-					(
-						'too_many_candidates',
-						f'The page offers {count} targets for {name}, more than {self.settings.max_candidates}. Narrow this stage.',
-					),
-					obs,
-				)
-		model = self.settings.jev_model if self.backend.name == 'jev' else None
-		size = decision.request_size(system_state, questions, model)
-		if size > MAX_REQUEST_CHARS:
-			return self._handback(run, ('state_too_large', 'The page is too large for one System1 request.'), obs)
-		self.usage.roles['system1'].decisions += 1
+	async def _ask_system1(
+		self, run: SubgoalRun, obs: Observation, system_state: dict, questions: dict, stats: dict
+	) -> tuple[System1Reply | None, decision.Decision | None, Stop | None]:
 		start = monotonic()
-		stats: dict[str, Any] = {
-			'run_id': run.id,
-			'backend': self.backend.name,
-			'questions': list(questions),
-			'request_chars': size,
-			'offered_operations': offered,
-			'candidate_counts': counts,
-			'unselectable_options': obs.unselectable_options,
-			'outcome': 'handback',
-			'operation': None,
-			'operation_probability': None,
-			'target_label': None,
-			'target_key': None,
-			'target_probability': None,
-			'returned_model': None,
-			'unable_probability': None,
-			'choice_is_argmax': None,
-			'answers': {},
-			'attempts': [],
-			'bu_action': None,
-			'input_tokens': None,
-			'output_tokens': None,
-			'cost_usd': None,
-		}
 		choice = None
-		text = None
 		reply: System1Reply | None = None
 		try:
 			reply = await self.backend.ask(system_state, questions)
@@ -626,7 +658,11 @@ class JevExecutor:
 				threshold = (
 					self.settings.unable_probability_handback if self.settings.checks.mode('confidence') == 'enforce' else None
 				)
-				choice = decision.combine(reply, questions, obs, unable_threshold=threshold)
+				inputs = run.params.inputs or ''
+				focus_threshold = (
+					self.settings.min_target_probability if inputs.strip() and '\n' not in inputs and '\r' not in inputs else None
+				)
+				choice = decision.combine(reply, questions, obs, unable_threshold=threshold, focus_threshold=focus_threshold)
 			except decision.InvalidAnswer as exc:
 				stop = ('invalid_answer', f'System1 returned an invalid answer: {exc}')
 				stats['choice_is_argmax'] = decision.argmax_flags(reply)
@@ -635,6 +671,8 @@ class JevExecutor:
 				stats.update(
 					operation=choice.operation,
 					operation_probability=choice.operation_probability,
+					read_operation_probability=choice.read_operation_probability,
+					operation_score=choice.operation_score,
 					target_key=target.key if target else None,
 					target_label=target.element()[:120] if target else None,
 					target_probability=choice.target_probability,
@@ -642,14 +680,342 @@ class JevExecutor:
 					choice_is_argmax=choice.choice_is_argmax,
 				)
 				stop = self._choice_check(run, obs, choice)
-				if not stop:
-					stop, text = await self._action_check(run, obs, choice)
+		return reply, choice, stop
+
+	def _enter_field(self, summary: BrowserStateSummary, obs: Observation) -> Candidate | None:
+		typed = self._typed_field
+		if typed is None or typed.document != state.captured_document(summary):
+			return None
+		for candidate in obs.candidates['TYPE_TEXT']:
+			if candidate.index is None or not candidate.states.get('focused'):
+				continue
+			node = summary.dom_state.selector_map[candidate.index]
+			if (node.target_id, node.frame_id, node.backend_node_id) == (
+				typed.node.target_id,
+				typed.node.frame_id,
+				typed.node.backend_node_id,
+			):
+				return candidate
+		return None
+
+	async def _focus_click_review(
+		self,
+		summary: BrowserStateSummary,
+		obs: Observation,
+		reply: System1Reply,
+		questions: dict,
+	) -> tuple[dict[str, _ReviewedClick], dict[str, str]]:
+		document = state.captured_document(summary)
+		if document is None:
+			return {}, {}
+		original = questions['click_target']['criteria']
+		candidates = {c.key: c for c in obs.candidates['CLICK']}
+		criteria: dict[str, Any] = {}
+		proofs: dict[str, _ReviewedClick] = {}
+		aliases: dict[str, str] = {}
+		for key in decision.review_click_keys(reply):
+			criteria[key] = original[key]
+			candidate = candidates[key]
+			if candidate.index is None or candidate.risky_effect or candidate.is_submit or candidate.editable:
+				continue
+			node = summary.dom_state.selector_map.get(candidate.index)
+			if node is None:
+				continue
+			location = await state.click_location(self.agent.browser_session, node, document)
+			if location is None:
+				continue
+			alias = next(
+				(
+					other
+					for other, proof in proofs.items()
+					if candidates[other].name == candidate.name
+					and proof.location == location
+					and state.same_click_surface(proof.node, node)
+				),
+				None,
+			)
+			if alias is not None:
+				aliases[key] = alias
+				criteria.pop(key)
+				continue
+			proofs[key] = _ReviewedClick(document, node, location)
+			dom = {'tag': node.tag_name}
+			for name in ('role', 'class', 'aria-label', 'title', 'type'):
+				if value := node.attributes.get(name):
+					dom[name] = value[:120]
+			criteria[key] = {
+				**criteria[key],
+				'dom': dom,
+				'other_attribute_names': sorted(name for name in node.attributes if name.startswith('data-'))[:8],
+				'pointer_hit': 'control itself' if location[2] == node.backend_node_id else 'inside this control',
+				'direct_listener_observed': node.has_js_click_listener,
+			}
+		if proofs:
+			decision.focus_click_review(questions, criteria)
+		return proofs, aliases
+
+	async def _review_persisting_click_split(
+		self, run: SubgoalRun, obs: Observation, proofs: dict[str, _ReviewedClick], criteria: dict[str, Any]
+	) -> Candidate | None:
+		candidates = {c.key: c for c in obs.candidates['CLICK'] if c.key in proofs}
+		pairs = [
+			(outer.key, inner.key)
+			for outer in candidates.values()
+			if outer.context.get('contains_same_label')
+			for inner in candidates.values()
+			if inner.context.get('inside_same_label')
+			and outer.name == inner.name
+			and outer.key != inner.key
+			and state.same_click_surface(proofs[outer.key].node, proofs[inner.key].node)
+		]
+		contenders = {key for pair in pairs for key in pair}
+		if not contenders:
+			return None
+		try:
+			selected = {key: criteria[key] for key in proofs if key in contenders}
+			result = await self.helpers.review_click_target(self.agent.task, run, obs, selected)
+		except Exception as error:
+			self.trace.write('click_target_review', self.step, run_id=run.id, accepted=False, error=type(error).__name__)
+			return None
+		target = candidates.get(result.key) if result.key in contenders and result.reason.strip() else None
+		self.trace.write(
+			'click_target_review', self.step, run_id=run.id, accepted=target is not None, key=result.key, reason=result.reason
+		)
+		return target
+
+	async def route(self, agent: 'Agent', browser_state_summary: BrowserStateSummary) -> RouteResult:
+		self._source = 'llm'
+		self._reviewed_click = None
+		self._routed_target = (self.step, agent.browser_session.agent_focus_target_id)
+		self._routed_observation = browser_state_summary
+		self._saved_decision = None
+		await self.usage.sync_other(self.step)
+		run = self.active_run
+		if not run:
+			viewport = browser_state_summary.jev_viewport
+			return self._planner((viewport['url'], viewport['text']) if viewport else None)
+		if self.pending_record and self.pending_record.status == 'predicted':
+			self.pending_record.status = 'discarded'
+			self._emit_result()
+		elif self.pending_record and self.pending_record.status == 'dispatched':
+			self.pending_record.status = 'unknown'
+			self.pending_record.error = 'No execution result was received'
+		try:
+			obs = await state.observe(agent.browser_session, browser_state_summary, self.settings, self.step)
+		except Exception as exc:
+			self._emit_result()
+			return self._handback(run, ('unsupported_page', f'Could not observe the current page: {type(exc).__name__}'), None)
+		self.last_observation = obs
+		self.observations = [*self.observations[-11:], obs]
+		key = self._evidence_key = state.evidence_key(obs)
+		if not obs.state_error and key not in self._seen_evidence:
+			self._seen_evidence.add(key)
+			run.new_evidence = True
+		await self._complete_record(run, obs, browser_state_summary)
+		stop = self._precheck(run, obs)
 		if stop:
+			return self._handback(run, stop, obs)
+		verification_stalled = self._verification_stalled(run, key)
+
+		registered = set(agent.tools.registry.registry.actions)
+		research = self.captures.research_state(obs)
+		enter_field = self._enter_field(browser_state_summary, obs)
+		offered = decision.offered_operations(
+			obs,
+			run,
+			registered,
+			self.settings.checks,
+			collect_available=bool(research and research['collect_available']),
+			enter_field=enter_field,
+		)
+		system_state = decision.build_state(obs, run, agent.task, self.task_actions, research)
+		model = self.settings.jev_model if self.backend.name == 'jev' else None
+		maximum = self.settings.max_candidates
+		while True:
+			questions = decision.build_questions(
+				obs,
+				run,
+				offered,
+				research=research,
+				registered_actions=registered,
+				max_candidates=maximum,
+				enter_field=enter_field,
+			)
+			size = decision.request_size(system_state, questions, model)
+			if size <= MAX_REQUEST_CHARS:
+				break
+			if maximum == 1:
+				return self._handback(run, ('state_too_large', 'The page is too large for one System1 request.'), obs)
+			maximum = max(1, maximum // 2)
+		counts = {name: len(q['criteria']) for name, q in questions.items() if name != 'operation'}
+		self.usage.roles['system1'].decisions += 1
+		stats: dict[str, Any] = {
+			'run_id': run.id,
+			'backend': self.backend.name,
+			'questions': list(questions),
+			'request_chars': size,
+			'observation_fingerprint': obs.fingerprint,
+			'offered_operations': offered,
+			'candidate_counts': counts,
+			'observed_candidate_counts': {
+				op.lower() + '_target': len(obs.candidates[op]) for op in offered if op in decision.TARGET_OPERATIONS
+			},
+			'unselectable_options': obs.unselectable_options,
+			'outcome': 'handback',
+			'decision_attempt': 1,
+			'operation': None,
+			'operation_probability': None,
+			'target_label': None,
+			'target_key': None,
+			'target_probability': None,
+			'returned_model': None,
+			'unable_probability': None,
+			'choice_is_argmax': None,
+			'answers': {},
+			'attempts': [],
+			'bu_action': None,
+			'input_tokens': None,
+			'output_tokens': None,
+			'cost_usd': None,
+		}
+		initial_stats = dict(stats)
+		reply, choice, stop = await self._ask_system1(run, obs, system_state, questions, stats)
+		if (
+			stop is not None
+			and stop[0] == 'low_confidence'
+			and key not in self._confidence_rechecked
+			and browser_state_summary.jev_viewport is not None
+		):
+			retry_questions = {
+				name: {
+					**question,
+					'instructions': (
+						question['instructions']
+						+ '\nReconsider this decision independently. Compare the requested outcome with the observed state and '
+						'with the offered alternatives. Distinguish the exact control and effect needed. Choose UNABLE if '
+						'the page lacks enough evidence to select an action.'
+					),
+				}
+				for name, question in questions.items()
+			}
+			reviewed_clicks, aliases = {}, {}
+			if (
+				reply
+				and reply.has_probabilities
+				and choice
+				and choice.operation == 'CLICK'
+				and choice.target
+				and not (choice.target.risky_effect or choice.target.is_submit or choice.target.editable)
+				and choice.operation_score is not None
+				and choice.operation_score >= self.settings.min_operation_probability
+				and choice.target_probability is not None
+				and choice.target_probability < self.settings.min_target_probability
+			):
+				reviewed_clicks, aliases = await self._focus_click_review(browser_state_summary, obs, reply, retry_questions)
+			retry_stats = {
+				**initial_stats,
+				'decision_attempt': 2,
+				'request_chars': decision.request_size(system_state, retry_questions, model),
+				'candidate_counts': {name: len(q['criteria']) for name, q in retry_questions.items() if name != 'operation'},
+				**({'click_review_aliases': aliases} if reviewed_clicks else {}),
+			}
+			if retry_stats['request_chars'] <= MAX_REQUEST_CHARS:
+				self._confidence_rechecked.add(key)
+				self.trace.write('system1_decision', self.step, **{**stats, 'outcome': 'recheck'})
+				retry_reply, retry_choice, retry_stop = await self._ask_system1(
+					run, obs, system_state, retry_questions, retry_stats
+				)
+				if (
+					reviewed_clicks
+					and retry_stop is not None
+					and retry_stop[0] == 'low_confidence'
+					and retry_choice
+					and retry_choice.operation == 'CLICK'
+					and not retry_choice.target_abstained
+					and choice
+					and retry_choice.operation_score is not None
+					and retry_choice.operation_score >= self.settings.min_operation_probability
+				):
+					target = await self._review_persisting_click_split(
+						run, obs, reviewed_clicks, retry_questions['click_target']['criteria']
+					)
+					if target is not None:
+						retry_stats['target_reviewed_by_planner'] = True
+						retry_stats['target_review_previous_probability'] = retry_choice.target_probability
+						retry_stats.update(target_key=target.key, target_label=target.element()[:120], target_probability=None)
+						retry_choice = choice.model_copy(update={'target': target, 'target_probability': None})
+						retry_stop = None
+				reviewed = reviewed_clicks.get(retry_choice.target.key) if retry_choice and retry_choice.target else None
+				if (retry_stop is None or retry_stop[0] == 'step_done') and (
+					not reviewed_clicks or (retry_choice and retry_choice.operation == 'CLICK' and reviewed is not None)
+				):
+					reply, choice, stop, questions, stats = retry_reply, retry_choice, retry_stop, retry_questions, retry_stats
+					try:
+						fresh = await self.capture_browser_state(include_recent_events=False)
+						current = await state.observe(agent.browser_session, fresh, self.settings, self.step)
+					except Exception as exc:
+						stop = (
+							'observation_changed',
+							f'Could not confirm the page after the confidence recheck: {type(exc).__name__}.',
+						)
+						self.trace.write('system1_decision', self.step, **stats)
+						return self._handback(run, stop, None, choice)
+					if fresh.jev_viewport != browser_state_summary.jev_viewport or current.fingerprint != obs.fingerprint:
+						stop = (
+							'observation_changed',
+							'The page changed during the confidence recheck. Observe it again before acting.',
+						)
+						obs = current
+						self.last_observation = current
+						self.observations[-1] = current
+						self._evidence_key = state.evidence_key(current)
+					elif reviewed is not None:
+						index = choice.target.index if choice and choice.target else None
+						node = fresh.dom_state.selector_map.get(index) if index is not None else None
+						if node is None or node.backend_node_id != reviewed.node.backend_node_id:
+							stop = (
+								'observation_changed',
+								'The reviewed click target was replaced. Observe again before clicking.',
+							)
+						else:
+							self._reviewed_click = (
+								replace(reviewed, planner_target_key=stats['target_key'])
+								if stats.get('target_reviewed_by_planner')
+								else reviewed
+							)
+				else:
+					self.trace.write('system1_decision', self.step, **{**retry_stats, 'outcome': 'recheck_unresolved'})
+		no_new_probe = verification_stalled and (
+			(stop is not None and stop[0] in _NO_PROGRESS_STOPS) or (stop is None and choice and choice.operation == 'WAIT')
+		)
+		if self.gate.evaluate('completion', bool(no_new_probe), 'Repeated verification reviewed unchanged evidence.', self.step):
+			self.finish_only = True
+			stop = (
+				'verification_stalled',
+				'Repeated verification returned the same evidence. Finish with the supported result and state what remains unknown.',
+			)
+		if not stop and choice is not None:
+			if choice.operation == 'PRESS_ENTER':
+				choice.target = enter_field
+			stop, text = await self._action_check(run, obs, choice)
+		else:
+			text = None
+		if stop:
+			self._reviewed_click = None
 			self.trace.write('system1_decision', self.step, **stats)
-			return self._handback(run, stop, obs, choice)
+			navigation = (
+				decision.navigation_options(reply, questions, obs)
+				if stop[0] in {'low_confidence', 'verification_stalled'}
+				and choice
+				and choice.operation == 'CLICK'
+				and reply
+				and reply.has_probabilities
+				else None
+			)
+			return self._handback(run, stop, obs, choice, navigation=navigation)
 		assert choice is not None and reply is not None
 		target = choice.target
-		bu_action = decision.to_bu_action(choice.operation, target, text)
+		bu_action = decision.to_bu_action(choice.operation, target, text, append=run.params.text_mode == 'append')
 		action = agent.ActionModel.model_validate(bu_action)
 		output = agent.AgentOutput(
 			thinking=None,
@@ -695,10 +1061,28 @@ class JevExecutor:
 			path.parent.mkdir(parents=True, exist_ok=True)
 			path.write_text(json.dumps(self._saved_decision, ensure_ascii=False, allow_nan=False, default=str), encoding='utf-8')
 
-	def on_dispatch(self, agent: 'Agent'):
+	async def on_dispatch(self, agent: 'Agent') -> ActionResult | None:
 		record = self.pending_record
 		if self._source == 'system1' and record and record.step == self.step and record.status == 'predicted':
+			if reviewed := self._reviewed_click:
+				self._reviewed_click = None
+				live = await state.click_location(agent.browser_session, reviewed.node, reviewed.document)
+				if live != reviewed.location:
+					record.status = 'discarded'
+					record.error = 'The reviewed click target changed before dispatch. Observe the page again.'
+					self._emit_result()
+					return ActionResult(error=record.error)
+			if record.operation == 'PRESS_ENTER':
+				typed = self._typed_field
+				if typed is None or not await state.still_focused(agent.browser_session, typed.node, typed.document):
+					self._typed_field = None
+					record.status = 'discarded'
+					record.error = 'The typed field no longer has verified focus. Observe the page again before pressing Enter.'
+					self._emit_result()
+					return ActionResult(error=record.error)
+			self._typed_field = None
 			record.status = 'dispatched'
+		return None
 
 	def on_dispatch_error(self, agent: 'Agent', error: BaseException):
 		record = self.pending_record
@@ -723,6 +1107,7 @@ class JevExecutor:
 						name = next(iter(output.action[i].model_dump(exclude_unset=True)), '')
 						if name not in {'delegate_subgoal', 'finish', 'done', 'collect_page'}:
 							self._planner_page_action = True
+							self._typed_field = None
 			return
 		record = self.pending_record
 		if not record or record.step != self.step or record.status != 'dispatched':
@@ -749,6 +1134,12 @@ class JevExecutor:
 			error = result.extracted_content or 'Dropdown selection failed'
 		record.status = 'executed_failed' if error else 'executed_ok'
 		record.error = error
+		if not error and record.operation == 'TYPE_TEXT' and isinstance(index, int):
+			document = state.captured_document(self._routed_observation)
+			summary = agent.browser_session._cached_browser_state_summary
+			node = summary.dom_state.selector_map.get(index) if summary and summary.dom_state else None
+			if document is not None and node is not None:
+				self._typed_field = _TypedField(document, node)
 
 	async def _complete_record(self, run: SubgoalRun, obs: Observation, summary: BrowserStateSummary):
 		record = self.pending_record
@@ -849,6 +1240,44 @@ class JevExecutor:
 			'last_page': last_page,
 			'completion_review': {'success': result.success, 'reason': reason},
 		}
+		observation = self._routed_observation
+		if (
+			observation is not None
+			and self._routed_target is not None
+			and self._routed_target[0] == item.metadata.step_number
+			and observation.url
+			and observation.url == last_page['url']
+			and not observation.state_error
+		):
+			# The planner's browser observation can contain rendered DOM outside the last viewport.
+			# Preserve the observation that supported its decision, with the same size bound and redaction.
+			dom_text = observation.dom_state.llm_representation(include_attributes=agent.settings.include_attributes)
+			dom_text = dom_text[: agent.settings.max_clickable_elements_length]
+			if agent.sensitive_data:
+				dom_text = redact_sensitive_string(dom_text, collect_sensitive_data_values(agent.sensitive_data))
+			if dom_text:
+				payload['final_browser_observation'] = {
+					'url': observation.url,
+					'title': observation.title,
+					'step': item.metadata.step_number,
+					'dom_text': dom_text,
+				}
+				viewport = observation.jev_viewport or {}
+				target_id = viewport.get('target_id')
+				document = viewport.get('document')
+				if (
+					target_id
+					and self._routed_target[1] == target_id
+					and viewport.get('url') == observation.url
+					and (type(document) is int or type(document) is float)
+				):
+					self.final_browser_observation = FinalBrowserObservation(
+						url=observation.url,
+						step=item.metadata.step_number,
+						target_id=target_id,
+						source_document=document,
+						dom_text=dom_text,
+					)
 		error = None
 		try:
 			result.extracted_content = await self.helpers.answer(payload)

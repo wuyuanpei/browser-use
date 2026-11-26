@@ -489,6 +489,9 @@ class DefaultActionWatchdog(BaseWatchdog):
 					self.logger.debug(f'Element xpath: {element_node.xpath}')
 					return input_metadata  # Return coordinates if available
 				except Exception as e:
+					if not event.clear and event.text:
+						# An append needs the original field and its caret, even if focus moved elsewhere.
+						raise
 					# Element not found or error - fall back to typing to the page
 					self.logger.warning(f'Failed to type to element {index_for_logging}: {e}. Falling back to page typing.')
 					try:
@@ -557,7 +560,8 @@ class DefaultActionWatchdog(BaseWatchdog):
 					return None
 
 			# Perform target-level scroll
-			await self._scroll_with_cdp_gesture(pixels)
+			if not await self._scroll_with_cdp_gesture(pixels):
+				raise BrowserError('Could not scroll the active viewport')
 
 			# Note: We don't clear cached state here - let multi_act handle DOM change detection
 			# by explicitly rebuilding and comparing when needed
@@ -1360,27 +1364,13 @@ class DefaultActionWatchdog(BaseWatchdog):
 													this.isContentEditable === true;
 
 							if (hasContentEditable) {
-								// For contenteditable elements, clear all content
-								while (this.firstChild) {
-									this.removeChild(this.firstChild);
-								}
-								this.textContent = "";
-								this.innerHTML = "";
-
-								// Focus and position cursor at the beginning
+								// The application may own the editor's block structure, even while empty.
 								this.focus();
-								const selection = window.getSelection();
-								const range = document.createRange();
-								range.setStart(this, 0);
-								range.setEnd(this, 0);
-								selection.removeAllRanges();
-								selection.addRange(range);
-
-								// Dispatch events
-								this.dispatchEvent(new Event("input", { bubbles: true }));
-								this.dispatchEvent(new Event("change", { bubbles: true }));
-
-								return {cleared: true, method: 'contenteditable', finalText: this.textContent};
+								if (!this.textContent && !this.querySelector('img,video,audio,canvas,iframe,[contenteditable="false"]')) {
+									return {cleared: true, method: 'empty contenteditable', finalText: ''};
+								}
+								this.ownerDocument.getSelection().selectAllChildren(this);
+								return {method: 'contenteditable selection'};
 							} else if (this.value !== undefined) {
 								// For regular inputs with value property
 								try {
@@ -1425,6 +1415,19 @@ class DefaultActionWatchdog(BaseWatchdog):
 			# Check the clear result
 			clear_info = clear_result.get('result', {}).get('value', {})
 			self.logger.debug(f'Clear result: {clear_info}')
+
+			if clear_info.get('method') == 'contenteditable selection':
+				await self._dispatch_key_event(cdp_session, 'keyDown', 'Backspace')
+				await self._dispatch_key_event(cdp_session, 'keyUp', 'Backspace')
+				result = await cdp_session.cdp_client.send.Runtime.callFunctionOn(
+					params={
+						'objectId': object_id,
+						'functionDeclaration': 'function() { return this.textContent; }',
+						'returnByValue': True,
+					},
+					session_id=cdp_session.session_id,
+				)
+				return result.get('result', {}).get('value') == ''
 
 			if clear_info.get('cleared'):
 				final_text = clear_info.get('finalText', '')
@@ -1559,6 +1562,44 @@ class DefaultActionWatchdog(BaseWatchdog):
 		except Exception as e:
 			self.logger.debug(f'All clearing strategies failed: {e}')
 			return False
+
+	async def _move_caret_to_end(self, object_id: str, cdp_session) -> bool:
+		result = await cdp_session.cdp_client.send.Runtime.callFunctionOn(
+			params={
+				'objectId': object_id,
+				'returnByValue': True,
+				'functionDeclaration': """function() {
+					if (!this.isConnected) return false;
+					if (this.isContentEditable) {
+						const selection = this.ownerDocument.getSelection();
+						if (!selection) return false;
+						if (selection.isCollapsed && this.contains(selection.anchorNode)) {
+							const tail = selection.getRangeAt(0).cloneRange();
+							tail.setEnd(this, this.childNodes.length);
+							// Keep the existing caret here so the editor's active typing format survives.
+							if (!tail.toString()) return true;
+						}
+						selection.collapse(this, this.childNodes.length);
+						return true;
+					}
+					if (typeof this.value !== 'string') return false;
+					try {
+						this.setSelectionRange(this.value.length, this.value.length);
+						return true;
+					} catch {
+						return this instanceof HTMLInputElement ? 'end-key' : false;
+					}
+				}""",
+			},
+			session_id=cdp_session.session_id,
+		)
+		moved = result.get('result', {}).get('value')
+		if moved == 'end-key':
+			# Some single-line input types reject setSelectionRange but support End.
+			await self._dispatch_key_event(cdp_session, 'keyDown', 'End')
+			await self._dispatch_key_event(cdp_session, 'keyUp', 'End')
+			return True
+		return moved is True
 
 	async def _focus_element_simple(
 		self, backend_node_id: int, object_id: str, cdp_session, input_coordinates: dict | None = None
@@ -1855,6 +1896,9 @@ class DefaultActionWatchdog(BaseWatchdog):
 				if not cleared_successfully:
 					self.logger.warning('⚠️ Text field clearing failed, typing may append to existing text')
 
+			elif not await self._move_caret_to_end(object_id, cdp_session):
+				raise RuntimeError('Could not place the caret at the end of the editable field')
+
 			# Step 4: Type the text character by character using proper human-like key events
 			# This emulates exactly how a human would type, which modern websites expect
 			if is_sensitive:
@@ -1873,6 +1917,17 @@ class DefaultActionWatchdog(BaseWatchdog):
 			# For contenteditable: after typing first char, check if dropped and retype if needed
 			_check_first_char = _is_contenteditable and len(text) > 0 and clear
 			_first_char = text[0] if _check_first_char else None
+			append_prefix = None
+			if _is_contenteditable and not clear and text and text[0] != '\n':
+				readback = await cdp_session.cdp_client.send.Runtime.callFunctionOn(
+					params={
+						'objectId': object_id,
+						'functionDeclaration': 'function() { return this.textContent; }',
+						'returnByValue': True,
+					},
+					session_id=cdp_session.session_id,
+				)
+				append_prefix = readback.get('result', {}).get('value')
 
 			for i, char in enumerate(text):
 				# Handle newline characters as Enter key
@@ -1955,6 +2010,22 @@ class DefaultActionWatchdog(BaseWatchdog):
 						},
 						session_id=cdp_session.session_id,
 					)
+
+				if i == 0 and isinstance(append_prefix, str):
+					readback = await cdp_session.cdp_client.send.Runtime.callFunctionOn(
+						params={
+							'objectId': object_id,
+							'functionDeclaration': 'function() { return this.textContent; }',
+							'returnByValue': True,
+						},
+						session_id=cdp_session.session_id,
+					)
+					if readback.get('result', {}).get('value') == append_prefix:
+						# Some rich editors consume the first key at a newly formatted leaf.
+						# Retry only the missing character and keep the active caret and marks.
+						await cdp_session.cdp_client.send.Input.insertText(
+							params={'text': char}, session_id=cdp_session.session_id
+						)
 
 				# After first char on contenteditable: check if dropped and retype if needed
 				if i == 0 and _check_first_char and _first_char:
@@ -2113,13 +2184,12 @@ class DefaultActionWatchdog(BaseWatchdog):
 				element.focus();
 
 				// Comprehensive event sequence for maximum framework compatibility
+				// Typing keeps focus. A synthetic blur can close an active editor or autocomplete before submission.
 				const events = [
 					// Input event - primary event for React controlled components
 					{ type: 'input', bubbles: true, cancelable: true },
 					// Change event - important for form validation and Vue v-model
-					{ type: 'change', bubbles: true, cancelable: true },
-					// Blur event - triggers validation in many frameworks
-					{ type: 'blur', bubbles: true, cancelable: true }
+					{ type: 'change', bubbles: true, cancelable: true }
 				];
 
 				let success = true;

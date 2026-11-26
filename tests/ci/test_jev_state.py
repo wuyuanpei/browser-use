@@ -1,11 +1,12 @@
 import asyncio
 
+import pytest
 from pytest_httpserver import HTTPServer
 from werkzeug.wrappers import Request, Response
 
 from browser_use import Agent
 from browser_use.agent.jev.rules import enter_effect
-from browser_use.agent.jev.state import observe, selected_option
+from browser_use.agent.jev.state import evidence_key, observe, selected_option
 from browser_use.agent.jev.views import JevSettings
 from browser_use.browser.session import BrowserSession
 from tests.ci.conftest import create_mock_llm
@@ -66,6 +67,137 @@ async def test_table_and_dialog_context(jev_browser: BrowserSession, httpserver:
 	assert context['Outside'].dialog_key is None
 
 
+async def test_duplicate_post_controls_include_their_own_post(jev_browser, httpserver):
+	await jev_browser.navigate_to(
+		serve_page(
+			httpserver,
+			'/same-name',
+			'<article><p>First AI post by Alice</p><div><button>展开</button></div></article>'
+			'<article><p>Second AI post by Bob</p><div><button>展开</button></div></article>',
+		)
+	)
+	observed = await observe_page(jev_browser)
+	contexts = [c.criterion().get('context', {}) for c in observed.candidates['CLICK'] if c.name == '展开']
+	assert len(contexts) == 2
+	assert 'First AI post by Alice' in str(contexts[0]) and 'Second AI post by Bob' not in str(contexts[0])
+	assert 'Second AI post by Bob' in str(contexts[1]) and 'First AI post by Alice' not in str(contexts[1])
+
+
+async def test_repeated_controls_keep_their_generic_card_position_and_text(jev_browser, httpserver):
+	cards = ''.join(
+		f'<div><h2>{title}</h2><div><button>Like</button><button>Share</button></div></div>'
+		for title in ('Design review by Alice', 'Release notes by Bob', 'Weekly update by Chen')
+	)
+	await jev_browser.navigate_to(
+		serve_page(
+			httpserver,
+			'/generic-cards',
+			'<main><div hidden><h2>Hidden entry</h2><div><button>Like</button><button>Share</button></div></div>'
+			f'{cards}</main><footer><button>Like</button></footer>',
+		)
+	)
+	observed = await observe_page(jev_browser)
+	buttons = [c for c in observed.candidates['CLICK'] if c.name == 'Like']
+	assert len({c.key for c in buttons}) == 4
+	for index, title in enumerate(('Design review by Alice', 'Release notes by Bob', 'Weekly update by Chen'), 1):
+		card = next(c for c in buttons if c.context.get('nearby_text', '').startswith(title))
+		assert card.context['item_position'] == f'{index} of 3'
+		assert all(other not in card.context['nearby_text'] for other in ('Alice', 'Bob', 'Chen') if other not in title)
+	assert sum('item_position' in c.context for c in buttons) == 3
+
+
+async def test_candidate_records_the_browser_focused_editable_field(jev_browser, httpserver):
+	await jev_browser.navigate_to(serve_page(httpserver, '/focused', '<input aria-label="First"><input aria-label="Second">'))
+	observations = []
+	for name in ('Second', 'First'):
+		await browser_eval(jev_browser, f'document.querySelector(\'[aria-label="{name}"]\').focus()')
+		observation = await observe_page(jev_browser)
+		observations.append(observation)
+		fields = observation.candidates['TYPE_TEXT']
+		assert [field.name for field in fields if field.states.get('focused')] == [name]
+	assert observations[0].fingerprint == observations[1].fingerprint
+	assert evidence_key(observations[0]) == evidence_key(observations[1])
+
+
+async def test_click_targets_keep_one_wrapper_per_control(jev_browser, httpserver):
+	await jev_browser.navigate_to(
+		serve_page(
+			httpserver,
+			'/category-tabs',
+			'<style>section{cursor:pointer;width:100px} section div{height:28px;line-height:28px}</style>'
+			'<section onclick="result.value=\'first\'"><div class="outer"><div class="inner">美妆</div></div></section>'
+			'<section onclick="result.value=\'second\'"><div class="outer"><div class="inner">美妆</div></div></section>'
+			'<output id="result"></output>',
+		)
+	)
+	obs = await observe_page(jev_browser)
+	tabs = [c for c in obs.candidates['CLICK'] if c.role == 'div' and c.name == '美妆']
+	assert len(tabs) == 2
+	agent = Agent(task='Open the other category', llm=create_mock_llm(), browser_session=jev_browser)
+	result = await agent.multi_act([agent.ActionModel.model_validate({'click': {'index': tabs[1].index}})])
+	assert result and not result[-1].error
+	assert await browser_eval(jev_browser, 'document.querySelector("output").value') == 'second'
+
+
+@pytest.mark.parametrize('attribute', ['', ' data-v-3f98c6ee'])
+async def test_passive_label_uses_its_click_owner(jev_browser, httpserver, attribute):
+	await jev_browser.navigate_to(
+		serve_page(
+			httpserver,
+			'/passive-label',
+			'<style>.control{cursor:pointer;width:480px;height:36px;line-height:36px}</style>'
+			f'<div class="control" onclick="out.value=\'search\'"><div><span{attribute}>Search</span></div></div>'
+			'<button onclick="out.value=\'separate\'">Search</button><output id="out"></output>',
+		)
+	)
+	obs = await observe_page(jev_browser)
+	search = [c for c in obs.candidates['CLICK'] if c.name == 'Search']
+	assert [c.role for c in search] == ['div', 'button']
+	agent = Agent(task='Open the search field', llm=create_mock_llm(), browser_session=jev_browser)
+	for candidate, effect in zip(search, ('search', 'separate'), strict=True):
+		result = await agent.multi_act([agent.ActionModel.model_validate({'click': {'index': candidate.index}})])
+		assert result and not result[-1].error
+		assert await browser_eval(jev_browser, 'out.value') == effect
+
+
+async def test_label_used_by_a_delegated_handler_remains_an_independent_surface(jev_browser, httpserver):
+	url = serve_page(
+		httpserver,
+		'/delegated-target',
+		'<style>.control{cursor:pointer;width:480px;height:36px;line-height:36px}</style>'
+		'<div class="control" onclick="out.value=event.target.dataset.command||\'outer\'">'
+		'<div><span data-command="inner">Open</span></div></div><output id="out"></output>',
+	)
+	await jev_browser.navigate_to(url)
+	obs = await observe_page(jev_browser)
+	clicks = [c for c in obs.candidates['CLICK'] if c.name == 'Open']
+	assert {c.role for c in clicks} == {'div', 'span'}
+	assert next(c for c in clicks if c.role == 'div').context['contains_same_label'] == 'true'
+	assert next(c for c in clicks if c.role == 'span').context['inside_same_label'] == 'true'
+
+
+async def test_clickable_list_item_owns_its_placeholder_link(jev_browser, httpserver):
+	await jev_browser.navigate_to(
+		serve_page(
+			httpserver,
+			'/folders',
+			'<style>li{width:160px} li a{display:block;width:140px;font-size:16px}</style>'
+			'<ul><li onclick="out.value=\'opened\'"><a href="#">已发送</a></li>'
+			'<li><a href="/archive">已发送</a></li></ul><output id="out"></output>',
+		)
+	)
+	obs = await observe_page(jev_browser)
+	sent = [c for c in obs.candidates['CLICK'] if c.name == '已发送']
+	assert [(c.role, None if not c.href else c.href.rsplit('/', 1)[-1]) for c in sent] == [
+		('listitem', None),
+		('link', 'archive'),
+	]
+	agent = Agent(task='Open sent messages', llm=create_mock_llm(), browser_session=jev_browser)
+	result = await agent.multi_act([agent.ActionModel.model_validate({'click': {'index': sent[0].index}})])
+	assert result and not result[-1].error
+	assert await browser_eval(jev_browser, 'out.value') == 'opened'
+
+
 async def test_options_match_values_and_actual_selection(jev_browser: BrowserSession, httpserver: HTTPServer):
 	await jev_browser.navigate_to(serve_page(httpserver, '/select', SELECT_PAGE))
 	summary = await jev_browser.get_browser_state_summary(include_screenshot=False)
@@ -105,6 +237,42 @@ async def test_viewport_and_scroll_targets(jev_browser: BrowserSession, httpserv
 	box = await observe_page(jev_browser)
 	for key in ['SCROLL_DOWN', 'SCROLL_UP']:
 		assert 'Results' in {c.name for c in box.candidates[key]}
+
+
+async def test_jev_exposes_scroll_for_viewport_center_pane(jev_browser, httpserver):
+	from browser_use import Tools
+
+	await jev_browser.navigate_to(
+		serve_page(
+			httpserver,
+			'/scroll-pane',
+			'<style>body{margin:0;overflow:hidden}</style>'
+			'<main id="pane" style="height:100vh;overflow:auto"><div style="height:200vh">Pane</div></main>',
+		)
+	)
+	obs = await observe_page(jev_browser)
+	assert any(choice.key == 'page' for choice in obs.candidates['SCROLL_DOWN'])
+	scroll = await Tools().scroll(down=True, pages=0.8, browser_session=jev_browser)
+	assert not scroll.error
+	assert await browser_eval(jev_browser, 'pane.scrollTop') > 0
+
+
+async def test_core_scroll_reports_failure_when_no_scroll_was_executed(jev_browser, monkeypatch):
+	from browser_use import Tools
+	from browser_use.browser.events import ScrollEvent
+
+	bus_type = type(jev_browser.event_bus)
+	dispatch = bus_type.dispatch
+
+	def fail_scroll(self, event, *args, **kwargs):
+		if isinstance(event, ScrollEvent):
+			raise RuntimeError('simulated scroll dispatch failure')
+		return dispatch(self, event, *args, **kwargs)
+
+	monkeypatch.setattr(bus_type, 'dispatch', fail_scroll)
+	scroll = await Tools().scroll(down=True, pages=1.0, browser_session=jev_browser)
+	assert scroll.error == 'Failed to execute scroll action.'
+	assert not scroll.long_term_memory
 
 
 async def test_visibility_and_password(jev_browser: BrowserSession, httpserver: HTTPServer):

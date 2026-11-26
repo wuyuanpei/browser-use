@@ -181,6 +181,8 @@ HandbackReason = Literal[
 	'risk_denied',
 	'unsupported_page',
 	'step_limit',
+	'verification_stalled',
+	'observation_changed',
 ]
 
 Operation = Literal[
@@ -222,6 +224,7 @@ class Handback(JevModel):
 	target_label: str | None = None
 	target_probability: float | None = None
 	fingerprint: str | None = None  # observation at handback time, if one was made
+	evidence_key: str | None = None
 
 
 class SubgoalRun(JevModel):
@@ -235,6 +238,7 @@ class SubgoalRun(JevModel):
 	actions: list[ActionRecord] = Field(default_factory=list)
 	applied: bool = False  # any applied action in this run
 	no_effect_streak: int = 0
+	new_evidence: bool = False
 	rejected_fingerprint: str | None = None  # set when this run re-delegates a rejected STEP_DONE
 	status: Literal['active', 'handed_back'] = 'active'
 	handback: Handback | None = None
@@ -306,6 +310,14 @@ class Observation(JevModel):
 	state_error: str | None
 	unselectable_options: int = 0  # options left out because no unique select_dropdown text exists (D30)
 	fingerprint: str  # 5.9
+
+
+class FinalBrowserObservation(JevModel):
+	url: str
+	step: int
+	target_id: str
+	source_document: float
+	dom_text: str
 
 
 class System1Reply(JevModel):

@@ -1,6 +1,7 @@
 import os
 from pathlib import Path
 
+import pytest
 from pytest_httpserver import HTTPServer
 
 from browser_use import BrowserSession
@@ -85,7 +86,10 @@ async def test_decision_guard_on_live_document(httpserver: HTTPServer, tmp_path:
 		await browser.kill()
 
 
-def test_third_stale_executes_and_records_native_result(httpserver: HTTPServer, httpserver_ipv4: HTTPServer, tmp_path: Path):
+@pytest.mark.parametrize('requires_fresh_target', [False, True])
+def test_third_stale_executes_and_records_native_result(
+	httpserver: HTTPServer, httpserver_ipv4: HTTPServer, tmp_path: Path, requires_fresh_target: bool
+):
 	httpserver.expect_request('/task').respond_with_data(
 		'<link rel="icon" href="data:,"><p>Finished</p>', content_type='text/html'
 	)
@@ -141,8 +145,13 @@ def test_third_stale_executes_and_records_native_result(httpserver: HTTPServer, 
 		assert state['stale_retries'] == 2 and state['forced_after_stale'] == 0
 		assert events[-1].payload['stale_reason'] == 'ui_out_of_sync'
 		run.command('predict')
+		run._state['decision']['requires_fresh_target'] = requires_fresh_target
 		run._browser.evaluate("history.replaceState(null,'','?version=third')")
 		state = run.command('tick')
+		if requires_fresh_target:
+			assert state['status'] == 'ready' and state['stale_retries'] == 3 and not state['forced_after_stale']
+			assert not any(event.name == 'action_started' for event in events)
+			return
 		assert state['status'] == 'done'
 		assert state['stale_reasons'] == {'document_changed': 3, 'ui_out_of_sync': 1}
 		assert state['forced_after_stale'] == 1

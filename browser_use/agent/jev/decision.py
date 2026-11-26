@@ -8,6 +8,7 @@ from collections.abc import Collection, Iterable, Mapping
 from typing import Any, Protocol, cast, get_args
 
 from browser_use.agent.jev import questions as wording
+from browser_use.agent.jev.rules import http_url
 from browser_use.agent.jev.views import (
 	MAX_CHOICE_OPTIONS,
 	PAGE_TEXT_LIMIT,
@@ -30,6 +31,7 @@ ENABLED_OPERATIONS: tuple[Operation, ...] = get_args(Operation)
 SYSTEM1_ACTIONS = ['click', 'input', 'select_dropdown', 'scroll', 'wait', 'go_back', 'send_keys', 'switch', 'collect_page']
 TARGET_OPERATIONS = frozenset({'CLICK', 'TYPE_TEXT', 'SELECT', 'SCROLL_UP', 'SCROLL_DOWN'})
 _READ_OPERATIONS = frozenset({'COLLECT', 'SCROLL_UP', 'SCROLL_DOWN'})
+NO_GROUNDED_TARGET = '__no_grounded_target__'
 _NATIVE_ACTIONS = {
 	'TYPE_TEXT': 'input',
 	'SELECT': 'select_dropdown',
@@ -54,8 +56,10 @@ class Decision(JevModel):
 	operation: Operation
 	operation_probability: float | None
 	read_operation_probability: float | None = None
+	operation_score: float | None = None
 	target: Candidate | None = None
 	target_probability: float | None = None
+	target_abstained: bool = False
 	unable_probability: float | None = None
 	choice_is_argmax: dict[str, bool] | None = None
 
@@ -74,12 +78,17 @@ def _targets(obs: Observation, op: str, registered_actions: Collection[str] | No
 
 
 def offered_operations(
-	obs: Observation, run: SubgoalRun, registered_actions: Collection[str], gate: _Gate, *, collect_available: bool = False
+	obs: Observation,
+	run: SubgoalRun,
+	registered_actions: Collection[str],
+	gate: _Gate,
+	*,
+	collect_available: bool = False,
+	enter_field: Candidate | None = None,
 ) -> list[Operation]:
-	executed = run.executed_actions
 	availability = {
 		'GO_BACK': obs.can_go_back,
-		'PRESS_ENTER': bool(executed and executed[-1].operation == 'TYPE_TEXT' and executed[-1].status == 'executed_ok'),
+		'PRESS_ENTER': enter_field is not None,
 		'COLLECT': collect_available,
 		'STEP_DONE': gate.mode('completion') != 'enforce' or not completion_blocked(obs, run),
 	}
@@ -179,6 +188,13 @@ def _limit_targets(targets: list[Candidate], maximum: int, goal_terms: set[str])
 	return [targets[index] for index in sorted(selected)]
 
 
+def _operation_target(candidate: Candidate) -> str:
+	label = candidate.element()
+	if candidate.editable and candidate.states.get('focused'):
+		label += ' (editable and already focused)'
+	return label
+
+
 def build_questions(
 	obs: Observation,
 	run: SubgoalRun,
@@ -187,6 +203,7 @@ def build_questions(
 	research: dict[str, Any] | None = None,
 	registered_actions: Collection[str] | None = None,
 	max_candidates: int = MAX_CHOICE_OPTIONS,
+	enter_field: Candidate | None = None,
 ) -> dict[str, dict[str, Any]]:
 	params = run.params
 	goal_terms = _candidate_terms(f'{params.objective} {params.completion}')
@@ -223,11 +240,13 @@ def build_questions(
 	for op in offered:
 		description = wording.OPERATION_DESCRIPTIONS[op]
 		criteria[op] = description
+		if op == 'PRESS_ENTER' and enter_field is not None:
+			criteria[op] = {'description': description, 'focused_field': enter_field.criterion()}
 		if op not in TARGET_OPERATIONS:
 			continue
 		targets = _limit_targets(_targets(obs, op, registered_actions), max_candidates, goal_terms)
 		if op in ('CLICK', 'TYPE_TEXT', 'SELECT'):
-			criteria[op] = {'description': description, 'current_targets': [c.element() for c in targets]}
+			criteria[op] = {'description': description, 'current_targets': [_operation_target(c) for c in targets]}
 		target_rules = [f'Operation: {op}', wording.TARGET_RULES]
 		if op == 'TYPE_TEXT':
 			target_rules.append(wording.TYPE_TEXT_TARGET_RULE)
@@ -272,6 +291,53 @@ def validate_answer(answer: Any, keys: Iterable[str], has_probabilities: bool) -
 	return choice, float(probs[choice])
 
 
+def navigation_options(reply: System1Reply, questions: Mapping[str, dict[str, Any]], obs: Observation) -> list[dict[str, Any]]:
+	"""Preserve the observed destinations behind an uncertain click for the planner to distinguish."""
+	criteria = questions.get('click_target', {}).get('criteria', {})
+	answer = reply.answers.get('click_target')
+	try:
+		validate_answer(answer, criteria, has_probabilities=True)
+	except InvalidAnswer:
+		return []
+	assert answer is not None
+	links = {
+		c.key: c
+		for c in obs.candidates['CLICK']
+		if c.tag == 'a' and c.href and http_url(c.href) and not (c.risky_effect or c.is_submit)
+	}
+	options: list[dict[str, Any]] = []
+	seen = {obs.url}
+	for key, probability in sorted(answer['probabilities'].items(), key=lambda item: -item[1]):
+		candidate = links.get(key)
+		if probability <= 0 or not candidate or not candidate.href or len(candidate.href) > 1500:
+			continue
+		if candidate.href in seen:
+			continue
+		seen.add(candidate.href)
+		options.append({'label': candidate.name, 'url': candidate.href, 'context': candidate.context, 'probability': probability})
+		if len(options) == 4:
+			break
+	return options
+
+
+def review_click_keys(reply: System1Reply) -> list[str]:
+	# The first choice has already passed reply validation. Keep alternative destinations available via abstention.
+	probabilities = reply.answers['click_target']['probabilities']
+	return [key for key, score in sorted(probabilities.items(), key=lambda item: -item[1]) if score > 0][:6]
+
+
+def focus_click_review(questions: dict, criteria: dict[str, Any]) -> None:
+	question = questions['click_target']
+	question['criteria'] = {**criteria, NO_GROUNDED_TARGET: 'None of these targets is supported'}
+	question['instructions'] += (
+		'\nIdentify the control that carries out the requested effect. The shortlist comes from the previous choice. '
+		'Use DOM attributes and ancestry to identify the actual control. A click point can hit a child of its control. '
+		'Use the observed containing control when a nested option is its display label. '
+		'An element with a different destination or control identity is a separate option. '
+		'Select None of these targets is supported when another candidate is needed or the effect is still uncertain.'
+	)
+
+
 def argmax_flags(reply: System1Reply) -> dict[str, bool] | None:
 	"""Describe each answer for the trace, including unused questions, without applying a gate."""
 	if not reply.has_probabilities:
@@ -291,19 +357,33 @@ def argmax_flags(reply: System1Reply) -> dict[str, bool] | None:
 
 
 def combine(
-	reply: System1Reply, questions: Mapping[str, dict[str, Any]], obs: Observation, *, unable_threshold: float | None = None
+	reply: System1Reply,
+	questions: Mapping[str, dict[str, Any]],
+	obs: Observation,
+	*,
+	unable_threshold: float | None = None,
+	focus_threshold: float | None = None,
 ) -> Decision:
 	op_answer = reply.answers.get('operation')
 	choice, probability = validate_answer(op_answer, questions['operation']['criteria'], reply.has_probabilities)
+	assert op_answer is not None
 	op = cast(Operation, choice)
-	probabilities = op_answer['probabilities'] if reply.has_probabilities and isinstance(op_answer, dict) else {}
+	probabilities = op_answer['probabilities'] if reply.has_probabilities else {}
 	unable_p = probabilities.get('UNABLE')
+	operation_score = probability
+	read_probability = None
+	if probabilities and op in _READ_OPERATIONS:
+		read_probability = math.fsum(probabilities.get(name, 0) for name in _READ_OPERATIONS)
+		# Abstention has its own gate. Compare evidence-gathering with the remaining choices,
+		# including waiting, completing the stage, and actions that could change the site.
+		non_abstention = math.fsum(p for name, p in probabilities.items() if name != 'UNABLE')
+		if non_abstention > 0:
+			operation_score = read_probability / non_abstention
 	result = Decision(
 		operation=op,
 		operation_probability=probability,
-		read_operation_probability=math.fsum(probabilities.get(name, 0) for name in _READ_OPERATIONS)
-		if probabilities and op in _READ_OPERATIONS
-		else None,
+		read_operation_probability=read_probability,
+		operation_score=operation_score,
 		unable_probability=unable_p,
 		choice_is_argmax=argmax_flags(reply),
 	)
@@ -315,9 +395,30 @@ def combine(
 	target, result.target_probability = validate_answer(
 		reply.answers.get(name), questions[name]['criteria'], reply.has_probabilities
 	)
+	if target == NO_GROUNDED_TARGET:
+		result.target_abstained = True
+		return result
 	result.target = next((c for c in obs.candidates.get(op, []) if c.key == target), None)
 	if result.target is None:
 		raise InvalidAnswer('The chosen target is missing from the observation')
+	if (
+		op == 'TYPE_TEXT'
+		and probability is not None
+		and result.target.editable
+		and not (result.target.is_submit or result.target.risky_effect)
+		and focus_threshold is not None
+		and 'click_target' in questions
+		and (click_probability := probabilities.get('CLICK', 0)) > 0
+	):
+		try:
+			focus, focus_probability = validate_answer(
+				reply.answers.get('click_target'), questions['click_target']['criteria'], True
+			)
+		except InvalidAnswer:
+			# This answer is optional evidence about the focus step, which typing already performs.
+			return result
+		if focus == target and focus_probability is not None and focus_probability >= focus_threshold:
+			result.operation_score = min(1.0, probability + click_probability * focus_probability)
 	return result
 
 

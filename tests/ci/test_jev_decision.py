@@ -94,9 +94,11 @@ def test_operation_availability_and_registry_filtering(obs, run):
 	all_tools = d.SYSTEM1_ACTIONS
 	ops = d.offered_operations(obs, run, all_tools, modes)
 	assert set(ops) == {op for op in d.ENABLED_OPERATIONS if op not in ('COLLECT', 'PRESS_ENTER')}
-	run.actions.append(record(1))
-	assert set(d.offered_operations(obs, run, all_tools, modes, collect_available=True)) == set(d.ENABLED_OPERATIONS)
-	run.actions[-1].status = 'executed_failed'
+	field = obs.candidates['TYPE_TEXT'][0]
+	assert set(d.offered_operations(obs, run, all_tools, modes, collect_available=True, enter_field=field)) == set(
+		d.ENABLED_OPERATIONS
+	)
+	assert 'PRESS_ENTER' not in d.offered_operations(obs, run, ['input'], modes, enter_field=field)
 	assert 'PRESS_ENTER' not in d.offered_operations(obs, run, all_tools, modes)
 	assert d.offered_operations(obs, run, [], modes) == ['STEP_DONE', 'UNABLE']
 	ops = d.offered_operations(obs, run, {'switch'}, modes)
@@ -181,6 +183,18 @@ def test_questions_and_chosen_evidence(obs, run):
 	assert d.request_size(state, q, 'jev-latest') == len(
 		json.dumps({'model': 'jev-latest', 'state': state, 'questions': q}, ensure_ascii=False)
 	)
+
+
+def test_operation_questions_distinguish_focus_from_editing(obs, run):
+	field = obs.candidates['TYPE_TEXT'][0]
+	field.states['focused'] = True
+	obs.candidates['CLICK'].append(field)
+	questions = d.build_questions(obs, run, ['CLICK', 'TYPE_TEXT'])
+	for operation in ('CLICK', 'TYPE_TEXT'):
+		assert questions['operation']['criteria'][operation]['current_targets'][-1] == (
+			f'{field.element()} (editable and already focused)'
+		)
+		assert questions[f'{operation.lower()}_target']['criteria'][field.key]['states']['focused'] is True
 
 
 @pytest.mark.parametrize(

@@ -33,6 +33,10 @@ not capture counts. Use the observation at the time of selection for dynamic cla
 rewrite earlier observations. Preserve each source document's identity and observation time/event.
 Structured DOM facts can describe rendered rows/controls outside the viewport. Distinguish those readings
 from visible text and from derived structural hints. Missing viewport words alone do not disprove a result.
+final_native_dom is rendered browser DOM from the completion decision under its recorded step. Its
+independent_sample_id confirms the same URL, target and document. Resolve its text_ref to read original
+page content that may extend outside the viewport. It does not establish visibility or replace sampled
+result-state facts for submissions, control changes, or claims about what was visible.
 Read evidence_limits, per-sample truncation and sampling errors. No images are sent: paths or screenshots
 in archives are not evidence of image pixels you have seen. Never invent missing facts or unseen details.
 In independent_evidence, form_state.controls and observed_controls can reference control_records by ID.
@@ -178,7 +182,7 @@ def _verify_report(config: EvaluationModel, context: dict[str, Any], trace: dict
 
 
 CONTEXT_VERSION = 1
-PROMPT_VERSION = '2026-11-25.2'
+PROMPT_VERSION = '2026-11-26.1'
 
 
 def timestamp():
@@ -296,6 +300,25 @@ def build_context(
 				'evidence': evidence,
 			}
 		)
+	final_native_dom = None
+	native = state.get('final_browser_observation')
+	if execution_status == 'done' and isinstance(native, dict) and independent:
+		last = independent[-1]
+		page = last['evidence'].get('sampled_page', {})
+		if (
+			last.get('phase') == 'final'
+			and last.get('sample_status') == 'completed'
+			and all(
+				native.get(key) is not None and native[key] == page.get(key) for key in ('url', 'source_document', 'target_id')
+			)
+			and type(native.get('step')) is int
+			and isinstance(native.get('dom_text'), str)
+			and native['dom_text']
+		):
+			final_native_dom = page_texts(
+				{'text': native['dom_text'], 'step': native['step'], 'independent_sample_id': last['sample_id']},
+				(page['url'], page['source_document']),
+			)
 	history = []
 	for index, observation in enumerate(state.get('observations', [])):
 		page = observation.get('page', {})
@@ -368,6 +391,7 @@ def build_context(
 			'texts': texts,
 			'descriptions': descriptions,
 			'final_sample_id': independent[-1]['sample_id'] if independent else None,
+			**({'final_native_dom': final_native_dom} if final_native_dom is not None else {}),
 		},
 		'observation_history': history,
 		'actions': [execution_action(action) for action in state.get('history', [])],

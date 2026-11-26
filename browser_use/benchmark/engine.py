@@ -33,9 +33,28 @@ if TYPE_CHECKING:
 	from .tasks import CaseProbe
 
 MAX_STEPS = 100
+DOCUMENT_READY_TIMEOUT = 1.0
+DOCUMENT_READY_POLL = 0.05
 VIEWPORT = {'width': 1366, 'height': 780}
 BrowserMode = Literal['isolated', 'attached_chrome']
 _Result = TypeVar('_Result')
+
+
+def _attached_tools(excluded: list[str], mode: str):
+	"""Keep the shared browser's keyboard actions restricted to verified System1 submission."""
+	from browser_use import Tools
+	from browser_use.tools.views import SendKeysAction
+
+	if mode != 'isolated':
+		return Tools(exclude_actions=excluded)
+
+	class EnterKey(SendKeysAction):
+		keys: Literal['Enter']
+
+	# Only System1 can use the isolated runner's keyboard action. Its dispatch verifies the original field.
+	tools = Tools(exclude_actions=[name for name in excluded if name != 'send_keys'])
+	tools.registry.registry.actions['send_keys'].param_model = EnterKey
+	return tools
 
 
 class RunCancelled(RuntimeError):
@@ -46,6 +65,12 @@ class RunCancelled(RuntimeError):
 
 class BrowserUnavailable(EnvironmentBlocked):
 	"""The shared browser cannot start another case until it recovers."""
+
+
+class PageObservationUnavailable(EnvironmentBlocked):
+	def __init__(self, message: str, target_id: str | None):
+		super().__init__(message)
+		self.target_id = target_id
 
 
 @dataclass(frozen=True)
@@ -147,8 +172,11 @@ class _BoundBrowser:
 	async def bind(self) -> str:
 		browser = self.native
 		if browser is None or not (target := browser.agent_focus_target_id):
-			raise RuntimeError('Browser Use has no active page')
-		bound = await browser.get_or_create_cdp_session(target, focus=False)
+			raise PageObservationUnavailable('Browser Use has no active page', None)
+		try:
+			bound = await browser.get_or_create_cdp_session(target, focus=False)
+		except ValueError as error:
+			raise PageObservationUnavailable('Browser session is unavailable before sampling', target) from error
 		self.bound = bound
 		return bound.target_id
 
@@ -156,15 +184,18 @@ class _BoundBrowser:
 		browser = self.native
 		bound = self.bound
 		if browser is None or bound is None or browser.agent_focus_target_id != bound.target_id:
-			raise RuntimeError('Browser target changed before sampling')
-		active = await browser.get_or_create_cdp_session(bound.target_id, focus=False)
+			raise PageObservationUnavailable('Browser target changed before sampling', bound.target_id if bound else None)
+		try:
+			active = await browser.get_or_create_cdp_session(bound.target_id, focus=False)
+		except ValueError as error:
+			raise PageObservationUnavailable('Browser session is unavailable before sampling', bound.target_id) from error
 		if active.session_id != bound.session_id:
-			raise RuntimeError('Browser session changed before sampling')
+			raise PageObservationUnavailable('Browser session changed before sampling', bound.target_id)
 		group, name = method.split('.')
 		command = getattr(getattr(bound.cdp_client.send, group), name)
 		result = await command(params=params, session_id=bound.session_id)
 		if browser.agent_focus_target_id != bound.target_id:
-			raise RuntimeError('Browser target changed while sampling')
+			raise PageObservationUnavailable('Browser target changed while sampling', bound.target_id)
 		return result
 
 	def call(self, method, **params):
@@ -173,18 +204,53 @@ class _BoundBrowser:
 
 	def evaluate(self, expression: str) -> Any:
 		result = self.call('Runtime.evaluate', expression=expression, returnByValue=True, awaitPromise=True)
+		return self._evaluation_value(result)
+
+	@staticmethod
+	def _evaluation_value(result: dict[str, Any]) -> Any:
 		if result.get('exceptionDetails'):
 			raise RuntimeError(f'Browser evaluation failed: {result["exceptionDetails"].get("text", "")}')
 		return result['result'].get('value')
 
-	def observe(self) -> dict[str, Any]:
-		target = self.bridge.run(self.bind())
-		page = self.evaluate(READ_STATE)
-		if not isinstance(page, dict):
-			# Retry only the read on the owned tab, never the event that caused navigation.
-			page = self.evaluate(READ_STATE)
-		if not isinstance(page, dict):
-			raise RuntimeError('Browser document is unavailable')
+	async def _read_page(self, target: str) -> dict[str, Any]:
+		async def sample():
+			try:
+				return self._evaluation_value(
+					await self.send('Runtime.evaluate', {'expression': READ_STATE, 'returnByValue': True, 'awaitPromise': True})
+				)
+			except RuntimeError as error:
+				message = str(error).casefold()
+				if not isinstance(error, EnvironmentBlocked) and any(
+					text in message for text in ('execution context was destroyed', 'cannot find context with specified id')
+				):
+					return None
+				raise
+
+		page = await sample()
+		if isinstance(page, dict):
+			return page
+		# Navigation can leave the page temporarily without a body. Keep the same bound tab and session.
+		try:
+			async with asyncio.timeout(DOCUMENT_READY_TIMEOUT):
+				while True:
+					await asyncio.sleep(DOCUMENT_READY_POLL)
+					page = await sample()
+					if isinstance(page, dict):
+						return page
+		except TimeoutError as error:
+			raise PageObservationUnavailable('Browser document is unavailable', target) from error
+
+	def observe(self, *, cancel: Callable[[], str | None] | None = None) -> dict[str, Any]:
+		async def read():
+			target = await self.bind()
+			return target, await self._read_page(target)
+
+		try:
+			target, page = self.bridge.run(read(), cancel=cancel, timeout=20)
+		except TimeoutError as error:
+			raise PageObservationUnavailable(
+				'Browser observation timed out', self.bound.target_id if self.bound else None
+			) from error
 		page.update(target_id=target, document_id=document_key(page)[1], observed_at=datetime.now(timezone.utc).isoformat())
 		page['dom_fingerprint'] = page['fingerprint'] = fingerprint(page)
 		return page
@@ -217,6 +283,7 @@ class BrowserUseRun:
 		self._record_dir = record_dir
 		self._chrome = chrome
 		self._stale_streak: list[str] = []
+		self._pending_observation: tuple[str, str | None] | None = None
 		self._jev_dir = None
 		if settings.jev is not None:
 			self._jev_dir = jev_artifact_dir or Path.cwd() / 'artifacts' / 'jev-runs' / uuid4().hex
@@ -297,6 +364,7 @@ class BrowserUseRun:
 
 	def snapshot(self) -> dict[str, Any]:
 		executor = getattr(self._native, '_jev', None)
+		final_observation = executor.final_browser_observation if executor is not None else None
 		return redact_secrets(
 			{
 				**self._state,
@@ -309,6 +377,7 @@ class BrowserUseRun:
 					if executor is not None
 					else {}
 				),
+				**({'final_browser_observation': final_observation.model_dump()} if final_observation is not None else {}),
 				'token_usage': token_usage(self._state['model_calls']),
 				'elements': indexed_elements(self._state['page'].get('actions', [])),
 			},
@@ -342,12 +411,13 @@ class BrowserUseRun:
 
 	async def _start(self, url: str, settings: RunSettings):
 		self._check_cancelled()
-		from browser_use import Agent, BrowserSession, ChatDeepSeek, Tools
+		from browser_use import Agent, BrowserSession, ChatDeepSeek
 
 		self._check_cancelled()
 		if self._chrome is not None:
 			browser = await self._chrome.begin_case()
-			tools = Tools(exclude_actions=self._chrome.excluded_tools)
+			mode = settings.execution_mode if settings.jev is not None and self._jev_dir is not None else 'direct'
+			tools = _attached_tools(self._chrome.excluded_tools, mode)
 		else:
 			executable = os.getenv('BROWSER_USE_EXECUTABLE_PATH')
 			profile = settings.user_data_dir or str(Path(self._temp.name) / 'profile')
@@ -461,7 +531,9 @@ class BrowserUseRun:
 		executor.backend.ask = capture_jev
 
 	def observe(self, phase: str = 'step', reason: str | None = None):
-		page = self._browser.observe()
+		cancel = self._should_cancel if phase != 'final' and self._state['status'] == 'ready' else None
+		page = self._browser.observe(cancel=cancel)
+		self._state.pop('observation_error', None)
 		metadata: dict[str, Any] = {'stale_reason': reason} if reason else {}
 		self._state['page'] = page
 		self._state['observation_index'] += 1
@@ -571,6 +643,10 @@ class BrowserUseRun:
 			self._check_cancelled()
 			if self._state['status'] in {'done', 'blocked'}:
 				return self.snapshot()
+			if self._pending_observation is not None:
+				self.observe(*self._pending_observation)
+				self._pending_observation = None
+				return self.snapshot()
 			if name in {'predict', 'tick'} and self._state['decision'] is None:
 				self._choose()
 			if name in {'act', 'tick'}:
@@ -581,6 +657,18 @@ class BrowserUseRun:
 		finally:
 			self._state['elapsed_ms'] = round((time.monotonic() - self._started) * 1000)
 		return self.snapshot()
+
+	def _observe_after_change(self, phase: str, reason: str | None = None):
+		try:
+			self.observe(phase, reason)
+		except (PageObservationUnavailable, BrowserUnavailable) as error:
+			if isinstance(error, BrowserUnavailable) and self._state['status'] == 'ready':
+				raise
+			failure = {'phase': phase, 'reason': str(error), 'target_id': getattr(error, 'target_id', None)}
+			self._state['observation_error'] = failure
+			self._emit('observation_error', **failure)
+			if self._state['status'] == 'ready':
+				self._pending_observation = (phase, reason)
 
 	def _choose(self):
 		if self._state['decision_rounds'] >= MAX_STEPS:
@@ -611,6 +699,7 @@ class BrowserUseRun:
 			target_guard=guard,
 			document_guard=document,
 			document_stable_during_capture=stable,
+			requires_fresh_target=executor.has_reviewed_click() if executor is not None else False,
 			provider='jev' if source == 'system1' else PROVIDER,
 			decision_source=source,
 			model_call_id=call['id'] if call is not None else None,
@@ -623,6 +712,7 @@ class BrowserUseRun:
 		self._state.update(decision=decision, status='predicted')
 		if call is not None:
 			if source == 'system1':
+				assert executor is not None
 				answers = call['response']['answers']
 				selected = answers['operation']
 				target_answer = answers.get(selected['choice'].lower() + '_target') or {}
@@ -634,6 +724,14 @@ class BrowserUseRun:
 					native_target_probabilities=target_answer.get('probabilities'),
 					latency_ms=call['latency_ms'],
 				)
+				if (reviewed_target := executor.planner_reviewed_click_key()) is not None:
+					decision.update(
+						native_target_key=reviewed_target,
+						target_confidence=None,
+						target_review_model_call_id=next(
+							(c['id'] for c in reversed(calls) if c.get('role') == 'planner' and c['status'] == 'success'), None
+						),
+					)
 			call.update(decision=decision, operation=operation, target=target)
 		self._emit('decision', decision=decision)
 
@@ -656,6 +754,8 @@ class BrowserUseRun:
 
 			reason = self._bridge.run(check(), cancel=self._should_cancel, timeout=20)
 		disposition = stale_disposition(len(self._stale_streak), reason)
+		if decision.get('requires_fresh_target') and reason is not None and disposition in {'execute', 'force'}:
+			disposition = 'retry'
 		if disposition != 'execute':
 			assert reason is not None
 			reasons = self._state['stale_reasons']
@@ -667,7 +767,7 @@ class BrowserUseRun:
 				self._state['stale_retries'] += 1
 			decision['stale_reason'] = reason
 			self._state.update(decision=None, status='ready')
-			self.observe('stale_retry', reason=reason)
+			self._observe_after_change('stale_retry', reason=reason)
 			return
 		self._check_cancelled()
 		operation = decision['operation']
@@ -710,7 +810,7 @@ class BrowserUseRun:
 		elif not results:
 			self._state.update(status='blocked', stop_reason='Browser Use returned no action result')
 		self._emit('action_result', action=action, result=results)
-		self.observe('step')
+		self._observe_after_change('step')
 
 	def close(self):
 		if self._closed:

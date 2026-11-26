@@ -45,6 +45,12 @@ class RiskAuthorization(BaseModel):
 	reason: str
 
 
+class ClickTargetReply(BaseModel):
+	model_config = ConfigDict(extra='forbid')
+	key: str | None
+	reason: str = Field(min_length=1, max_length=500)
+
+
 M = TypeVar('M', bound=BaseModel)
 
 
@@ -69,6 +75,7 @@ class ModelHelpers:
 		self.settings = settings
 		self.invoke = invoke
 		self.timeout = timeout
+		self.planner = planner
 		default = settings.helper_llm or planner
 		self.models = {
 			'text': settings.text_llm or default,
@@ -126,6 +133,26 @@ class ModelHelpers:
 		if proposed['effect'] in {'send', 'publish', 'share'}:
 			payload['visible_fields'] = [field_info(c) for c in obs.candidates.get('TYPE_TEXT', [])[:12]]
 		return await asyncio.wait_for(self._call('risk', prompts.RISK_PROMPT, payload, RiskAuthorization), self.timeout)
+
+	async def review_click_target(
+		self, goal: str, run: SubgoalRun, obs: Observation, choices: dict[str, Any]
+	) -> ClickTargetReply:
+		payload = {
+			'goal': goal,
+			'stage': run.params.model_dump(include={'objective', 'completion'}),
+			'page': {'url': obs.url, 'text': obs.visible_text[:RISK_PAGE_TEXT_LIMIT]},
+			'choices': choices,
+		}
+		messages = [
+			SystemMessage(content=prompts.CLICK_TARGET_REVIEW_PROMPT),
+			UserMessage(content=json.dumps(payload, ensure_ascii=False)),
+		]
+		response = await asyncio.wait_for(
+			self.invoke('planner', self.planner, messages, output_format=ClickTargetReply), self.timeout
+		)
+		if isinstance(response.completion, str):
+			return ClickTargetReply.model_validate_json(response.completion)
+		return ClickTargetReply.model_validate(response.completion)
 
 	async def answer(self, payload: dict) -> str:
 		async with asyncio.timeout(self.settings.answer_timeout):

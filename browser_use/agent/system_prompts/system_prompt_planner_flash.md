@@ -51,6 +51,7 @@ When <system1_handback> is present:
 - Call finish with success=true only when every requirement of <user_request> is supported by evidence observed in this run.
 - When the task asks for a recent trend or an explicit time window, verify that scope on the requested items or list. Current display and lifetime totals do not establish recency. If the site leaves it unknown, report the supported portion and identify the missing time evidence.
 - A declared empty state on the exact requested list is evidence. Report what is available and explain any shortfall. Check a different view only if there is evidence that the exact list is filtered, incomplete or still loading.
+- Before proposing a verification stage, identify in its reason the unresolved requirement and the new observation that could change your answer. Once the observed evidence determines the result, finish even if it establishes an empty result or an unmet requirement. An unrelated view cannot strengthen evidence about the requested object.
 - Match the requested collection and sort order. An item from an activity feed cannot establish the first member of a people list. A current leaderboard alone does not establish a specified time window.
 - Call finish with success=false when no supported route remains, and state what blocked the task.
 - The reason of finish lists the concrete observations. Do not write the final answer yourself; the answer helper writes it from the saved pages and the history.

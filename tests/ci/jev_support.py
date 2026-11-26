@@ -247,6 +247,8 @@ class FakeJev:
 					choice, p = operation, step.get('p', 0.95)
 				elif name == operation.lower() + '_target':
 					choice, p = self._find(question['criteria'], step['target']), step.get('target_p', 0.95)
+				elif name == 'click_target' and 'focus_target' in step:
+					choice, p = self._find(question['criteria'], step['focus_target']), step.get('focus_target_p', 0.95)
 				else:
 					choice, p = keys[0], 0.95
 				probabilities = step.get('operation_probs') if name == 'operation' else None

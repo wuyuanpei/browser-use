@@ -2184,13 +2184,12 @@ class DefaultActionWatchdog(BaseWatchdog):
 				element.focus();
 
 				// Comprehensive event sequence for maximum framework compatibility
+				// Typing keeps focus. A synthetic blur can close an active editor or autocomplete before submission.
 				const events = [
 					// Input event - primary event for React controlled components
 					{ type: 'input', bubbles: true, cancelable: true },
 					// Change event - important for form validation and Vue v-model
-					{ type: 'change', bubbles: true, cancelable: true },
-					// Blur event - triggers validation in many frameworks
-					{ type: 'blur', bubbles: true, cancelable: true }
+					{ type: 'change', bubbles: true, cancelable: true }
 				];
 
 				let success = true;

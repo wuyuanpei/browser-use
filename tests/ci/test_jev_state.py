@@ -1,11 +1,12 @@
 import asyncio
 
+import pytest
 from pytest_httpserver import HTTPServer
 from werkzeug.wrappers import Request, Response
 
 from browser_use import Agent
 from browser_use.agent.jev.rules import enter_effect
-from browser_use.agent.jev.state import observe, selected_option
+from browser_use.agent.jev.state import evidence_key, observe, selected_option
 from browser_use.agent.jev.views import JevSettings
 from browser_use.browser.session import BrowserSession
 from tests.ci.conftest import create_mock_llm
@@ -82,6 +83,42 @@ async def test_duplicate_post_controls_include_their_own_post(jev_browser, https
 	assert 'Second AI post by Bob' in str(contexts[1]) and 'First AI post by Alice' not in str(contexts[1])
 
 
+async def test_repeated_controls_keep_their_generic_card_position_and_text(jev_browser, httpserver):
+	cards = ''.join(
+		f'<div><h2>{title}</h2><div><button>Like</button><button>Share</button></div></div>'
+		for title in ('Design review by Alice', 'Release notes by Bob', 'Weekly update by Chen')
+	)
+	await jev_browser.navigate_to(
+		serve_page(
+			httpserver,
+			'/generic-cards',
+			'<main><div hidden><h2>Hidden entry</h2><div><button>Like</button><button>Share</button></div></div>'
+			f'{cards}</main><footer><button>Like</button></footer>',
+		)
+	)
+	observed = await observe_page(jev_browser)
+	buttons = [c for c in observed.candidates['CLICK'] if c.name == 'Like']
+	assert len({c.key for c in buttons}) == 4
+	for index, title in enumerate(('Design review by Alice', 'Release notes by Bob', 'Weekly update by Chen'), 1):
+		card = next(c for c in buttons if c.context.get('nearby_text', '').startswith(title))
+		assert card.context['item_position'] == f'{index} of 3'
+		assert all(other not in card.context['nearby_text'] for other in ('Alice', 'Bob', 'Chen') if other not in title)
+	assert sum('item_position' in c.context for c in buttons) == 3
+
+
+async def test_candidate_records_the_browser_focused_editable_field(jev_browser, httpserver):
+	await jev_browser.navigate_to(serve_page(httpserver, '/focused', '<input aria-label="First"><input aria-label="Second">'))
+	observations = []
+	for name in ('Second', 'First'):
+		await browser_eval(jev_browser, f'document.querySelector(\'[aria-label="{name}"]\').focus()')
+		observation = await observe_page(jev_browser)
+		observations.append(observation)
+		fields = observation.candidates['TYPE_TEXT']
+		assert [field.name for field in fields if field.states.get('focused')] == [name]
+	assert observations[0].fingerprint == observations[1].fingerprint
+	assert evidence_key(observations[0]) == evidence_key(observations[1])
+
+
 async def test_click_targets_keep_one_wrapper_per_control(jev_browser, httpserver):
 	await jev_browser.navigate_to(
 		serve_page(
@@ -100,6 +137,43 @@ async def test_click_targets_keep_one_wrapper_per_control(jev_browser, httpserve
 	result = await agent.multi_act([agent.ActionModel.model_validate({'click': {'index': tabs[1].index}})])
 	assert result and not result[-1].error
 	assert await browser_eval(jev_browser, 'document.querySelector("output").value') == 'second'
+
+
+@pytest.mark.parametrize('attribute', ['', ' data-v-3f98c6ee'])
+async def test_passive_label_uses_its_click_owner(jev_browser, httpserver, attribute):
+	await jev_browser.navigate_to(
+		serve_page(
+			httpserver,
+			'/passive-label',
+			'<style>.control{cursor:pointer;width:480px;height:36px;line-height:36px}</style>'
+			f'<div class="control" onclick="out.value=\'search\'"><div><span{attribute}>Search</span></div></div>'
+			'<button onclick="out.value=\'separate\'">Search</button><output id="out"></output>',
+		)
+	)
+	obs = await observe_page(jev_browser)
+	search = [c for c in obs.candidates['CLICK'] if c.name == 'Search']
+	assert [c.role for c in search] == ['div', 'button']
+	agent = Agent(task='Open the search field', llm=create_mock_llm(), browser_session=jev_browser)
+	for candidate, effect in zip(search, ('search', 'separate'), strict=True):
+		result = await agent.multi_act([agent.ActionModel.model_validate({'click': {'index': candidate.index}})])
+		assert result and not result[-1].error
+		assert await browser_eval(jev_browser, 'out.value') == effect
+
+
+async def test_label_used_by_a_delegated_handler_remains_an_independent_surface(jev_browser, httpserver):
+	url = serve_page(
+		httpserver,
+		'/delegated-target',
+		'<style>.control{cursor:pointer;width:480px;height:36px;line-height:36px}</style>'
+		'<div class="control" onclick="out.value=event.target.dataset.command||\'outer\'">'
+		'<div><span data-command="inner">Open</span></div></div><output id="out"></output>',
+	)
+	await jev_browser.navigate_to(url)
+	obs = await observe_page(jev_browser)
+	clicks = [c for c in obs.candidates['CLICK'] if c.name == 'Open']
+	assert {c.role for c in clicks} == {'div', 'span'}
+	assert next(c for c in clicks if c.role == 'div').context['contains_same_label'] == 'true'
+	assert next(c for c in clicks if c.role == 'span').context['inside_same_label'] == 'true'
 
 
 async def test_clickable_list_item_owns_its_placeholder_link(jev_browser, httpserver):

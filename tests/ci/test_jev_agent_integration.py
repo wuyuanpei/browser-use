@@ -186,8 +186,9 @@ async def test_planner_repairs_malformed_deepseek_output(httpserver, tmp_path, m
 	)
 	history = await agent.run(max_steps=2)
 	assert create.await_count == 2
-	assert create.await_args is not None
-	messages = json.dumps(create.await_args.kwargs['messages'])
+	request = create.await_args
+	assert request is not None
+	messages = json.dumps(request.kwargs['messages'])
 	expected_diagnostic = 'review_note_placeholder' if 'review_note_placeholder' in invalid else 'Invalid JSON'
 	assert expected_diagnostic in messages
 	assert history.is_done() and history.is_successful() is recover

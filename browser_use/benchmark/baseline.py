@@ -787,7 +787,7 @@ class BaselineManager:
 		def event(record: RunEvent):
 			name, payload, snapshot = record.name, record.payload, record.snapshot
 			append(name, payload)
-			if name in {'action_started', 'action_executed', 'action_result'}:
+			if name in {'action_started', 'action_executed', 'action_result', 'observation_error'}:
 				execution_events.append({'event': name, 'time': now(), **deepcopy(payload)})
 			if record.preview is not None:
 				page, preview = snapshot['page'], record.preview

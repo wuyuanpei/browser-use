@@ -1,16 +1,19 @@
 """PR #1 workbench integration with the 0.13.14 Jev Agent, using only local model services."""
 
+import asyncio
 import json
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from pydantic import ValidationError
 from pytest_httpserver import HTTPServer
 from werkzeug.wrappers import Response
 
 from browser_use.benchmark.chrome_attachment import _OwnedClient
-from browser_use.benchmark.engine import BrowserUnavailable, BrowserUseRun
+from browser_use.benchmark.engine import BrowserUnavailable, BrowserUseRun, _attached_tools
+from browser_use.benchmark.evaluation import build_context
 from browser_use.benchmark.models import (
 	EvaluationModel,
 	ExecutionModel,
@@ -19,7 +22,104 @@ from browser_use.benchmark.models import (
 	load_profile_environment,
 	runtime_settings,
 )
+from browser_use.benchmark.tasks import CaseProbe
 from browser_use.benchmark.token_usage import aggregate_token_usage, token_usage
+
+
+def test_attached_isolated_executor_only_accepts_enter():
+	excluded = ['send_keys', 'evaluate', 'upload_file']
+	for mode in ('direct', 'collaborative'):
+		assert 'send_keys' not in _attached_tools(excluded, mode).registry.registry.actions
+	actions = _attached_tools(excluded, 'isolated').registry.registry.actions
+	assert not {'evaluate', 'upload_file'} & actions.keys()
+	params = actions['send_keys'].param_model
+	assert params.model_validate({'keys': 'Enter'}).model_dump()['keys'] == 'Enter'
+	for keys in ('Control+w', 'Tab', 'Enter Enter'):
+		with pytest.raises(ValidationError):
+			params.model_validate({'keys': keys})
+
+
+def test_workbench_records_the_planner_selected_target_without_system1_confidence(monkeypatch):
+	run = BrowserUseRun.__new__(BrowserUseRun)
+	run._state = {
+		'decision_rounds': 0,
+		'model_calls': [],
+		'decisions': [],
+		'page': {'fingerprint': 'page'},
+		'observation_index': 1,
+	}
+	executor = SimpleNamespace(
+		step_source=lambda: 'system1', has_reviewed_click=lambda: True, planner_reviewed_click_key=lambda: '4'
+	)
+	monkeypatch.setattr(
+		run,
+		'_native',
+		SimpleNamespace(_jev=executor),
+		raising=False,
+	)
+	run._should_cancel = None
+	run._emit = lambda *_args, **_kwargs: None
+
+	async def predict():
+		answers = {
+			'operation': {'choice': 'CLICK', 'probabilities': {'CLICK': 1.0}},
+			'click_target': {'choice': '3', 'confidence': 0.6, 'probabilities': {'3': 0.6, '4': 0.4}},
+		}
+		run._state['model_calls'].extend(
+			[
+				{'id': 1, 'role': 'system1', 'response': {'answers': answers}, 'latency_ms': 1},
+				{'id': 2, 'role': 'planner', 'status': 'success'},
+			]
+		)
+		return {'click': {'index': 4}}, 'click', '4', {}, {}, True
+
+	monkeypatch.setattr(run, '_predict', predict)
+	monkeypatch.setattr(run, '_bridge', SimpleNamespace(run=lambda call, **_: asyncio.run(call)), raising=False)
+	run._choose()
+	chosen = run._state['decision']
+	assert chosen['native_target_key'] == '4'
+	assert chosen['target_confidence'] is None
+	assert chosen['target_review_model_call_id'] == 2
+	assert chosen['model_call_id'] == 1
+	assert chosen['native_target_probabilities'] == {'3': 0.6, '4': 0.4}
+
+
+@pytest.mark.parametrize(
+	('sample_changes', 'status', 'phase', 'included'),
+	[
+		({}, 'completed', 'final', True),
+		({'source_document': 11.5}, 'completed', 'final', False),
+		({'target_id': 'other-tab'}, 'completed', 'final', False),
+		({'url': 'https://example.test/other'}, 'completed', 'final', False),
+		({}, 'error', 'final', False),
+		({}, 'completed', 'step', False),
+	],
+)
+def test_final_native_dom_evidence_requires_a_matching_independent_document(sample_changes, status, phase, included):
+	url = 'https://example.test/feed'
+	dom = 'Rendered entry that the independently sampled viewport does not display'
+	state = {
+		'goal': 'Summarize the rendered entries',
+		'final_browser_observation': {
+			'url': url,
+			'source_document': 10.5,
+			'target_id': 'owner-tab',
+			'step': 3,
+			'dom_text': dom,
+		},
+	}
+	page = {'url': url, 'source_document': 10.5, 'target_id': 'owner-tab', 'text': 'First entry', **sample_changes}
+	samples = [{'phase': phase, 'sample_status': status, 'evidence': {'sampled_page': page}}]
+	context = build_context(state, samples, task_started_at=None, task_ended_at=None, execution_status='done')
+	evidence = context['independent_evidence']
+	if included:
+		native = evidence['final_native_dom']
+		assert native['independent_sample_id'] == 'sample-1' and native['step'] == 3
+		reading = evidence['texts'][native['text']['text_ref']]
+		assert reading['text'] == dom
+		assert evidence['sources'][reading['source_id']] == {'source_url': url, 'source_document': 10.5}
+	else:
+		assert 'final_native_dom' not in evidence and dom not in json.dumps(context)
 
 
 @pytest.mark.parametrize('actual_context', ['dashboard', 'other'])
@@ -50,25 +150,81 @@ async def test_chrome_120_default_tab_requires_dashboard_context(actual_context,
 
 
 @pytest.mark.parametrize('recover', [True, False])
-def test_workbench_resamples_unavailable_document_once(monkeypatch, recover):
-	from browser_use.benchmark.engine import _BoundBrowser
+@pytest.mark.parametrize('context_transition', [False, True])
+def test_workbench_waits_for_the_owned_document(monkeypatch, recover, context_transition):
+	from browser_use.benchmark import engine
 
-	browser = _BoundBrowser(SimpleNamespace(run=lambda call: call))
-	monkeypatch.setattr(browser, 'bind', lambda: 'owned-tab')
-	pages = [None, {'url': 'about:blank', 'text': '', 'actions': []} if recover else None]
+	browser = engine._BoundBrowser(SimpleNamespace(run=lambda call, **kwargs: asyncio.run(call)))
+	monkeypatch.setattr(engine, 'DOCUMENT_READY_POLL', 0.001)
+	monkeypatch.setattr(engine, 'DOCUMENT_READY_TIMEOUT', 0.3 if recover else 0.008)
+	bind = AsyncMock(return_value='owned-tab')
+	monkeypatch.setattr(browser, 'bind', bind)
 	calls = []
 
-	def sample(_script):
-		calls.append(True)
-		return pages.pop(0)
+	async def sample(method, params):
+		calls.append(method)
+		page = {'url': 'about:blank', 'text': '', 'actions': []} if recover and len(calls) == 3 else None
+		if page is None and context_transition:
+			raise RuntimeError({'code': -32000, 'message': 'Execution context was destroyed'})
+		return {'result': {'value': page}}
 
-	monkeypatch.setattr(browser, 'evaluate', sample)
+	monkeypatch.setattr(browser, 'send', sample)
 	if recover:
 		assert browser.observe()['target_id'] == 'owned-tab'
+		assert calls == ['Runtime.evaluate'] * 3
 	else:
-		with pytest.raises(RuntimeError, match='Browser document is unavailable'):
+		with pytest.raises(engine.PageObservationUnavailable, match='Browser document is unavailable'):
 			browser.observe()
-	assert len(calls) == 2
+		assert calls
+	bind.assert_awaited_once()
+
+
+@pytest.mark.parametrize('terminal', [False, True])
+def test_post_action_observation_failure_does_not_replay_an_action(monkeypatch, terminal):
+	from browser_use.benchmark import engine
+
+	document = {'target_id': 'owned-tab', 'document_id': 10.5, 'url': 'about:blank'}
+	run = object.__new__(BrowserUseRun)
+	run._state = {
+		'status': 'predicted',
+		'decision': {
+			'document_guard': document,
+			'document_stable_during_capture': True,
+			'target_guard': None,
+			'operation': 'finish' if terminal else 'click',
+			'target': '',
+			'native_action': {},
+		},
+		'history': [],
+	}
+	run._pending_observation = None
+	run._check_cancelled = lambda: None
+	run._should_cancel = lambda: None
+	monkeypatch.setattr(run, '_browser', SimpleNamespace(native=object()), raising=False)
+	monkeypatch.setattr(run, '_bridge', SimpleNamespace(run=lambda call, **kwargs: asyncio.run(call)), raising=False)
+	run._stale_streak = []
+	run._started = 0
+	emitted = []
+	run._emit = lambda name, **fields: emitted.append((name, fields))
+	run._act = AsyncMock(return_value=[{'is_done': terminal, 'success': True, 'extracted_content': 'Recorded'}])
+	run.finish_execution = lambda: None
+	run.snapshot = lambda: run._state
+	run._choose = lambda: pytest.fail('An incomplete observation should not trigger another prediction or action')
+	observations = []
+
+	def observe(phase='step', reason=None):
+		observations.append(phase)
+		if len(observations) == 1:
+			raise engine.PageObservationUnavailable('Browser document is unavailable', 'owned-tab')
+
+	run.observe = observe
+	monkeypatch.setattr(engine, 'read_document', AsyncMock(return_value=document))
+	run._execute(None)
+	assert run._state['status'] == ('done' if terminal else 'ready')
+	assert [event for event, _ in emitted][-2:] == ['action_result', 'observation_error']
+	run.command('tick')
+	run._act.assert_awaited_once()
+	assert observations == (['step'] if terminal else ['step', 'step'])
 
 
 def test_workbench_explains_prediction_deadline_before_dispatch(monkeypatch):
@@ -240,9 +396,8 @@ def test_workbench_real_page_repredicts_and_keeps_per_role_evidence(
 		jev_artifact_dir=tmp_path / 'attempt',
 	)
 	try:
-		native = run._native
-		assert native is not None
-		predict = native._get_next_action
+		assert run._native is not None
+		predict = run._native._get_next_action
 		timeout = True
 
 		async def time_out_once(summary):
@@ -252,7 +407,7 @@ def test_workbench_real_page_repredicts_and_keeps_per_role_evidence(
 				raise TimeoutError('simulated planner call timeout')
 			await predict(summary)
 
-		monkeypatch.setattr(native, '_get_next_action', time_out_once)
+		monkeypatch.setattr(run._native, '_get_next_action', time_out_once)
 		first = run.command('tick')
 		assert not timeout
 		assert first['history'][-1]['operation'] == 'delegate_subgoal'
@@ -271,6 +426,13 @@ def test_workbench_real_page_repredicts_and_keeps_per_role_evidence(
 		assert final['replans'] == 1
 		assert final['status'] == 'done' and final['result']['markdown'] == 'The page shows Saved.' and len(saved) == 1
 		assert run._browser.evaluate("document.querySelector('output').textContent") == 'Saved'
+		sample = CaseProbe({}).inspect(run._browser.evaluate, run._browser.observe())
+		context = build_context(
+			final, [{'phase': 'final', **sample}], task_started_at=None, task_ended_at=None, execution_status='done'
+		)
+		evidence = context['independent_evidence']
+		native = evidence['final_native_dom']
+		assert 'Saved' in evidence['texts'][native['text']['text_ref']]['text']
 		assert final['execution_mode'] == 'isolated' and final['system1_provider'] == 'jev'
 		calls = {c['id']: c for c in final['model_calls']}
 		assert calls[discarded['model_call_id']]['decision']['stale_reason'] == 'document_changed'

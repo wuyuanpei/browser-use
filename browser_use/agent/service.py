@@ -2955,17 +2955,19 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 				pre_action_url = await self.browser_session.get_current_page_url()
 				pre_action_focus = self.browser_session.agent_focus_target_id
 
+				result = None
 				if self._jev is not None and self._jev.step_source() == 'system1':
-					self._jev.on_dispatch(self)
-				result = await self.tools.act(
-					action=action,
-					browser_session=self.browser_session,
-					file_system=self.file_system,
-					page_extraction_llm=self.settings.page_extraction_llm,
-					sensitive_data=self.sensitive_data,
-					available_file_paths=self.available_file_paths,
-					extraction_schema=self.extraction_schema,
-				)
+					result = await self._jev.on_dispatch(self)
+				if result is None:
+					result = await self.tools.act(
+						action=action,
+						browser_session=self.browser_session,
+						file_system=self.file_system,
+						page_extraction_llm=self.settings.page_extraction_llm,
+						sensitive_data=self.sensitive_data,
+						available_file_paths=self.available_file_paths,
+						extraction_schema=self.extraction_schema,
+					)
 
 				if result.error:
 					await self._demo_mode_log(

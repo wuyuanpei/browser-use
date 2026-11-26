@@ -65,6 +65,16 @@ def _parse_checks(value: Any) -> Any:
 	return {'default': value} if isinstance(value, str) else value
 
 
+CandidatePipeline = Literal['pr5', 'extended']
+EffectiveCandidatePipeline = Literal['pr5', 'extended', 'pr5_with_regions']
+
+
+def resolve_candidate_pipeline(requested: CandidatePipeline | None, screenshot_policy: str) -> EffectiveCandidatePipeline:
+	if requested is not None:
+		return requested
+	return 'pr5_with_regions' if screenshot_policy == 'off' else 'extended'
+
+
 class JevSettings(JevModel):
 	mode: Literal['isolated', 'collaborative', 'off'] = 'isolated'
 	system1: Literal['jev', 'llm'] = 'jev'
@@ -74,6 +84,9 @@ class JevSettings(JevModel):
 	jev_api_key: str | None = Field(default=None, repr=False, exclude=True)
 	jev_timeout: float = Field(default=10, gt=0, le=120)
 	screenshot_policy: Literal['off', 'always', 'smart'] = 'off'
+	candidate_pipeline: CandidatePipeline | None = None
+	pruning_budget_ms: float = Field(default=300, ge=0, allow_inf_nan=False)
+	vision_escalation: bool = True
 	vision_max_side: int = Field(default=1600, ge=320, le=4096)
 	vision_jpeg_quality: int = Field(default=72, ge=30, le=95)
 	# LLM backend
@@ -89,6 +102,7 @@ class JevSettings(JevModel):
 	answer_prompt: str | None = None
 	answer_timeout: float = Field(default=120, gt=0)
 	# thresholds and limits
+	min_read_operation_probability: float = Field(default=0.6, ge=0, le=1)
 	min_operation_probability: float = Field(default=0.8, ge=0, le=1)
 	min_target_probability: float = Field(default=0.8, ge=0, le=1)
 	unable_probability_handback: float = Field(default=0.25, ge=0, le=1)
@@ -99,6 +113,10 @@ class JevSettings(JevModel):
 	# programmatic checks
 	checks: Annotated[JevChecks, BeforeValidator(_parse_checks)] = Field(default_factory=JevChecks)
 	risky_action_labels: list[str] | None = None
+
+	@property
+	def effective_candidate_pipeline(self) -> EffectiveCandidatePipeline:
+		return resolve_candidate_pipeline(self.candidate_pipeline, self.screenshot_policy)
 
 	@model_validator(mode='before')
 	@classmethod
@@ -136,6 +154,10 @@ class DelegateSubgoalParams(JevModel):
 	)
 	inputs: str | None = Field(
 		default=None, description='Values System1 must enter, e.g. "From=Zurich; To=London". Omit if nothing needs typing.'
+	)
+	text_mode: Literal['replace', 'append'] = Field(
+		default='replace',
+		description='How to type into an existing field. Use append for text that must preserve and follow its current contents. Use a separate stage when another field needs replacement.',
 	)
 	may_submit: bool = Field(
 		default=False,
@@ -183,6 +205,50 @@ class DelegateSubgoalParamsSmart(DelegateSubgoalParams):
 class FinishParams(JevModel):
 	success: bool = Field(description='True only if every requirement of the task is supported by evidence.')
 	reason: str = Field(description='Concrete observations supporting this decision. Use the language of the task.')
+
+
+class ScrollRegionParams(JevModel):
+	key: str
+	down: bool
+
+
+class ScrollRegion(JevModel):
+	key: str
+	backend_node_id: int
+	target_id: str
+	document: float
+	scroll_top: int
+	scroll_height: int
+	client_height: int
+
+
+class ScrollObservation(JevModel):
+	target_id: str
+	document: float
+	root_y: float
+	root_overflow_y: str | None = None
+	center_id: int | None = None
+	center_path: str | None = None
+	center_y: float | None = None
+	center_embedded: bool = False
+	page_suppressed: bool = False
+	# Selector index -> (target, frame, backend node, scrollTop).
+	indexed: dict[int, tuple[str, str | None, int, float]] = Field(default_factory=dict)
+
+
+class ScrollEffect(JevModel):
+	target_key: str | None
+	root_delta_y: float | None = None
+	center_delta_y: float | None = None
+	target_delta_y: float | None = None
+	url_changed: bool | None = None
+	measurable: bool = False
+
+	@property
+	def page_changed(self) -> bool | None:
+		if self.url_changed or any((self.root_delta_y, self.center_delta_y, self.target_delta_y)):
+			return True
+		return False if self.measurable else None
 
 
 class CollectPageParams(BaseModel):
@@ -235,6 +301,7 @@ class ActionRecord(JevModel):
 	error: str | None = None
 	verified: bool | None = None  # SELECT only: the chosen option was selected in the next observation (5.8)
 	page_changed: bool | None = None
+	scroll_effect: ScrollEffect | None = None
 	url_after: str | None = None
 	applied: bool = False  # counts as an actual change (D15), set when status becomes executed_ok
 
@@ -268,6 +335,9 @@ class SubgoalRun(JevModel):
 	decisions: int = 0
 	vision_decisions: int = 0
 	vision: bool = False
+	vision_at_start: bool = Field(default_factory=lambda data: data['vision'])
+	no_effect_escalated: bool = False
+	escalations: list[dict[str, Any]] = Field(default_factory=list)
 	vision_source: Literal['policy', 'planner', 'escalation'] | None = None
 	vision_reason: str | None = None
 	review_delegation: bool = False
@@ -337,6 +407,8 @@ class Observation(JevModel):
 	url: str
 	title: str
 	scroll: dict[str, int]  # y, viewport_height, page_height, pixels_above, pixels_below
+	scroll_regions: list[ScrollRegion] = Field(default_factory=list)
+	scroll_observation: ScrollObservation | None = Field(default=None, exclude=True)
 	viewport_width: int = 0
 	viewport_height: int = 0
 	visible_text: str  # full visible text, appendix F, at most 50,000 characters

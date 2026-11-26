@@ -2,12 +2,15 @@
 
 import json
 import math
+import re
+import unicodedata
 from collections.abc import Collection, Iterable, Mapping
 from typing import Any, Protocol, cast, get_args
 
 from browser_use.agent.jev import questions as wording
 from browser_use.agent.jev.views import (
 	DEFAULT_SCREENSHOT_REASON,
+	MAX_CHOICE_OPTIONS,
 	PAGE_TEXT_LIMIT,
 	SCROLL_PAGES,
 	SEGMENT_ACTIONS_LIMIT,
@@ -26,8 +29,21 @@ from browser_use.agent.jev.views import (
 from browser_use.agent.jev.vision import PreparedImage
 
 ENABLED_OPERATIONS: tuple[Operation, ...] = get_args(Operation)
-SYSTEM1_ACTIONS = ['click', 'input', 'select_dropdown', 'scroll', 'wait', 'go_back', 'send_keys', 'switch', 'collect_page']
+SYSTEM1_INTERNAL_ACTIONS = frozenset({'collect_page', 'scroll_region'})
+SYSTEM1_ACTIONS = [
+	'click',
+	'input',
+	'select_dropdown',
+	'scroll',
+	'wait',
+	'go_back',
+	'send_keys',
+	'switch',
+	'collect_page',
+	'scroll_region',
+]
 TARGET_OPERATIONS = frozenset({'CLICK', 'TYPE_TEXT', 'SELECT', 'SCROLL_UP', 'SCROLL_DOWN'})
+_READ_OPERATIONS = frozenset({'COLLECT', 'SCROLL_UP', 'SCROLL_DOWN'})
 _NATIVE_ACTIONS = {
 	'TYPE_TEXT': 'input',
 	'SELECT': 'select_dropdown',
@@ -51,6 +67,7 @@ class InvalidAnswer(ValueError):
 class Decision(JevModel):
 	operation: Operation
 	operation_probability: float | None
+	read_operation_probability: float | None = None
 	target: Candidate | None = None
 	target_probability: float | None = None
 	unable_probability: float | None = None
@@ -147,7 +164,7 @@ def build_state(
 		}
 	if params.inputs:
 		subgoal['inputs'] = params.inputs
-	subgoal.update(may_submit=params.may_submit, requires_action=params.requires_action)
+	subgoal.update(may_submit=params.may_submit, requires_action=params.requires_action, text_mode=params.text_mode)
 	if params.requires_action and not run.applied:
 		subgoal['pending_apply'] = True
 	if params.review_note:
@@ -165,6 +182,52 @@ def build_state(
 	return state
 
 
+def _candidate_terms(text: str) -> set[str]:
+	text = unicodedata.normalize('NFKC', text).casefold()
+	terms = set(re.findall(r'[^\W\d_\u3400-\u9fff]{2,}|\d+', text))
+	for run in re.findall(r'[\u3400-\u9fff]+', text):
+		terms.update(run[i : i + size] for size in (2, 3, 4) for i in range(len(run) - size + 1))
+	return terms
+
+
+def ranked_target_indices(targets: list[Candidate], goal_terms: set[str]) -> list[int]:
+	"""Prioritize by PR #5 relevance, preserving input order on ties."""
+
+	def priority(index: int) -> tuple[bool, int, bool]:
+		candidate = targets[index]
+		label = _candidate_terms(f'{candidate.name} {candidate.placeholder or ""}')
+		scope = _candidate_terms(' '.join(candidate.context.values()))
+		return (
+			candidate.key == 'page',
+			2 * sum(len(term) for term in label & goal_terms) + len(scope & goal_terms),
+			candidate.editable or candidate.kind == 'tab',
+		)
+
+	return sorted(range(len(targets)), key=priority, reverse=True)
+
+
+def _limit_targets(targets: list[Candidate], maximum: int, goal_terms: set[str]) -> list[Candidate]:
+	if len(targets) <= maximum:
+		return targets
+	selected = ranked_target_indices(targets, goal_terms)[:maximum]
+	return [targets[index] for index in sorted(selected)]
+
+
+def subgoal_terms(run: SubgoalRun) -> set[str]:
+	return _candidate_terms(f'{run.params.objective} {run.params.completion}')
+
+
+def select_targets(
+	obs: Observation, run: SubgoalRun, offered: list[Operation], registered_actions: Collection[str] | None, maximum: int
+) -> dict[str, list[Candidate]]:
+	goal_terms = subgoal_terms(run)
+	return {
+		op: _limit_targets(_targets(obs, op, registered_actions), maximum, goal_terms)
+		for op in offered
+		if op in TARGET_OPERATIONS
+	}
+
+
 def build_questions(
 	obs: Observation,
 	run: SubgoalRun,
@@ -172,10 +235,16 @@ def build_questions(
 	*,
 	research: dict[str, Any] | None = None,
 	registered_actions: Collection[str] | None = None,
+	max_candidates: int = MAX_CHOICE_OPTIONS,
 	vision: PreparedImage | bool | None = None,
+	selected_targets: dict[str, list[Candidate]] | None = None,
 ) -> dict[str, dict[str, Any]]:
 	params = run.params
+	if selected_targets is None:
+		selected_targets = select_targets(obs, run, offered, registered_actions, max_candidates)
 	context = [f'Current objective: {params.objective}', f'Completion: {params.completion}']
+	if params.text_mode == 'append':
+		context.append('Append only the requested new text to the current field.')
 	if params.inputs:
 		context.append(f'Inputs: {params.inputs}')
 	if params.review_note:
@@ -210,7 +279,7 @@ def build_questions(
 		criteria[op] = description
 		if op not in TARGET_OPERATIONS:
 			continue
-		targets = _targets(obs, op, registered_actions)
+		targets = selected_targets[op]
 		if op in ('CLICK', 'TYPE_TEXT', 'SELECT'):
 			criteria[op] = {'description': description, 'current_targets': [c.element() for c in targets]}
 		target_rules = [f'Operation: {op}', wording.TARGET_RULES]
@@ -220,9 +289,13 @@ def build_questions(
 			target_rules.append(wording.COLLECTION_BOUNDARY)
 		if vision:
 			target_rules.append(wording.VISION_TARGET_RULES)
-		include_rect = bool(vision) and op in ('CLICK', 'TYPE_TEXT', 'SELECT')
-		target_criteria = {c.key: c.criterion(include_rect=include_rect) for c in targets}
-		if include_rect and isinstance(vision, PreparedImage):
+		target_criteria = {
+			c.key: c.criterion(
+				include_rect=bool(vision) and (op in ('CLICK', 'TYPE_TEXT', 'SELECT') or c.key.startswith('region:'))
+			)
+			for c in targets
+		}
+		if isinstance(vision, PreparedImage):
 			for item in target_criteria.values():
 				if 'rect' in item:
 					item['rect'] = vision.project_rect(item['rect'])
@@ -300,10 +373,14 @@ def combine(
 	op_answer = reply.answers.get('operation')
 	choice, probability = validate_answer(op_answer, questions['operation']['criteria'], reply.has_probabilities)
 	op = cast(Operation, choice)
-	unable_p = op_answer['probabilities'].get('UNABLE') if reply.has_probabilities and isinstance(op_answer, dict) else None
+	probabilities = op_answer['probabilities'] if reply.has_probabilities and isinstance(op_answer, dict) else {}
+	unable_p = probabilities.get('UNABLE')
 	result = Decision(
 		operation=op,
 		operation_probability=probability,
+		read_operation_probability=math.fsum(probabilities.get(name, 0) for name in _READ_OPERATIONS)
+		if probabilities and op in _READ_OPERATIONS
+		else None,
 		unable_probability=unable_p,
 		choice_is_argmax=argmax_flags(reply),
 	)
@@ -321,7 +398,9 @@ def combine(
 	return result
 
 
-def to_bu_action(op: Operation, candidate: Candidate | None = None, text: str | None = None) -> dict[str, dict[str, Any]]:
+def to_bu_action(
+	op: Operation, candidate: Candidate | None = None, text: str | None = None, *, append: bool = False
+) -> dict[str, dict[str, Any]]:
 	if op in TARGET_OPERATIONS and candidate is None:
 		raise ValueError(f'{op} requires a target')
 	if op == 'CLICK' and candidate is not None:
@@ -330,10 +409,12 @@ def to_bu_action(op: Operation, candidate: Candidate | None = None, text: str | 
 		if candidate.kind == 'element' and candidate.index is not None:
 			return {'click': {'index': candidate.index}}
 	if op == 'TYPE_TEXT' and candidate is not None and candidate.index is not None and text is not None:
-		return {'input': {'index': candidate.index, 'text': text, 'clear': True}}
+		return {'input': {'index': candidate.index, 'text': text, 'clear': not append}}
 	if op == 'SELECT' and candidate is not None and candidate.index is not None and candidate.match_text is not None:
 		return {'select_dropdown': {'index': candidate.index, 'text': candidate.match_text}}
 	if op in ('SCROLL_UP', 'SCROLL_DOWN') and candidate is not None:
+		if candidate.kind == 'scroll' and candidate.key.startswith('region:'):
+			return {'scroll_region': {'key': candidate.key, 'down': op == 'SCROLL_DOWN'}}
 		params = {'down': op == 'SCROLL_DOWN', 'pages': SCROLL_PAGES}
 		if candidate.index is not None:
 			params['index'] = candidate.index

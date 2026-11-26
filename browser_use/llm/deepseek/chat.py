@@ -16,11 +16,11 @@ from openai import (
 	Timeout,
 )
 from openai.types.chat import ChatCompletion
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from browser_use.llm.base import BaseChatModel
 from browser_use.llm.deepseek.serializer import DeepSeekMessageSerializer
-from browser_use.llm.exceptions import ModelProviderError, ModelRateLimitError
+from browser_use.llm.exceptions import ModelOutputFormatError, ModelProviderError, ModelRateLimitError
 from browser_use.llm.messages import BaseMessage
 from browser_use.llm.schema import SchemaOptimizer
 from browser_use.llm.views import ChatInvokeCompletion, ChatInvokeUsage
@@ -179,7 +179,8 @@ class ChatDeepSeek(BaseChatModel):
 				raise ModelProviderError(str(e), model=self.name) from e
 
 		# ② Function Calling path (with tools or output_format)
-		if tools or (output_format is not None and hasattr(output_format, 'model_json_schema')):
+		json_mode = not tools and output_format is not None and kwargs.get('response_format') == {'type': 'json_object'}
+		if not json_mode and (tools or (output_format is not None and hasattr(output_format, 'model_json_schema'))):
 			try:
 				call_tools = tools
 				tool_choice = None
@@ -209,22 +210,22 @@ class ChatDeepSeek(BaseChatModel):
 				if not msg.tool_calls:
 					raise ValueError('Expected tool_calls in response but got none')
 				raw_args = msg.tool_calls[0].function.arguments
-				if isinstance(raw_args, str):
-					parsed = json.loads(raw_args)
-				else:
-					parsed = raw_args
-				# --------- Fix: only use model_validate when output_format is not None ----------
-				if output_format is not None:
-					return ChatInvokeCompletion(
-						completion=output_format.model_validate(parsed),
+				try:
+					parsed = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+					completion = output_format.model_validate(parsed) if output_format is not None else parsed
+				except (json.JSONDecodeError, ValidationError) as e:
+					if output_format is None:
+						raise
+					raise ModelOutputFormatError(
+						str(e),
+						model=self.name,
+						raw_text=raw_args,
+						finish_reason=getattr(resp.choices[0], 'finish_reason', None),
 						usage=self._get_usage(resp),
-					)
-				else:
-					# If no output_format, return dict directly
-					return ChatInvokeCompletion(
-						completion=parsed,
-						usage=self._get_usage(resp),
-					)
+					) from e
+				return ChatInvokeCompletion(completion=completion, usage=self._get_usage(resp))
+			except ModelOutputFormatError:
+				raise
 			except RateLimitError as e:
 				raise ModelRateLimitError(str(e), model=self.name) from e
 			except (APIError, APIConnectionError, APITimeoutError, APIStatusError) as e:
@@ -232,8 +233,8 @@ class ChatDeepSeek(BaseChatModel):
 			except Exception as e:
 				raise ModelProviderError(str(e), model=self.name) from e
 
-		# ③ JSON Output path (official response_format)
-		if output_format is not None and hasattr(output_format, 'model_json_schema'):
+		# ③ Explicit JSON Output path (official response_format)
+		if json_mode and output_format is not None:
 			try:
 				resp = await client.chat.completions.create(  # type: ignore
 					model=self.model,

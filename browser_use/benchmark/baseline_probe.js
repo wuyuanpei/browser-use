@@ -55,6 +55,28 @@
         ...(description ? {current_description: description} : {}),
         ...(e.tagName === 'SELECT' ? {selected_options: [...e.selectedOptions].map(o => ({value:o.value,label:o.label}))} : {})};
     });
+  const richText = [...document.querySelectorAll('[contenteditable="true"]')]
+    .filter(e => rendered(e) && !e.parentElement?.isContentEditable).slice(0, 8).map(editor => {
+      const format = new Map();
+      const walker = document.createTreeWalker(editor, NodeFilter.SHOW_TEXT);
+      let current;
+      for (let i = 0; i < 250 && (current = walker.nextNode()); i++) {
+        const parent = current.parentElement;
+        if (!current.textContent.trim() || !rendered(parent)) continue;
+        const style = getComputedStyle(parent);
+        const bold = Number(style.fontWeight) >= 600, italic = /^(italic|oblique)/.test(style.fontStyle);
+        if (!bold && !italic) continue;
+        const key = [bold, italic].join(',');
+        if (!format.has(key)) format.set(key, {bold, italic, runs: []});
+        const runs = format.get(key).runs;
+        if (runs.length < 20) runs.push(bounded(current.textContent, 300, 'rich_text.formatted_text'));
+      }
+      return {node: node(editor), label: explicitLabel(editor)?.label || null,
+        text: bounded(text(editor), 5000, 'rich_text.text'), format: [...format.values()],
+        unordered_lists: [...editor.querySelectorAll('ul')].filter(rendered).slice(0, 12)
+          .map(list => [...list.children].filter(item => item.matches('li') && rendered(item)).slice(0, 30)
+            .map(item => bounded(text(item), 300, 'rich_text.list_item')))};
+    });
   const article = document.querySelector('.article-content');
   const wiki = document.querySelector('#mw-content-text .mw-parser-output');
   const stay = document.querySelector('.detail-copy');
@@ -207,6 +229,6 @@
     ctrip_direct_selected: selectedDirect,
     flight_rows: rows.map(flightFact),
     baidu_scholar: scholar, law_form: law, questionnaire,
-    research_note: note, truncation,
+    research_note: note, ...(richText.length ? {rich_text: richText} : {}), truncation,
   };
 })()

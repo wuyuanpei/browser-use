@@ -7,7 +7,9 @@ from typing import Any, Literal
 from urllib.parse import urlsplit, urlunsplit
 
 from dotenv import dotenv_values
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, computed_field, field_validator
+
+from browser_use.agent.jev.views import CandidatePipeline, EffectiveCandidatePipeline, resolve_candidate_pipeline
 
 PROVIDER = 'browser_use'
 ExecutionMode = Literal['direct', 'isolated', 'collaborative']
@@ -57,11 +59,28 @@ class RunSettings(BaseModel):
 	profile: Literal['debug', 'final_report']
 	execution_mode: ExecutionMode = 'direct'
 	screenshot_policy: Literal['off', 'always', 'smart'] = 'off'
+	candidate_pipeline: CandidatePipeline | None = None
+	vision_escalation: bool | None = Field(default=None, validate_default=True)
+	min_read_operation_probability: float = Field(default=0.6, ge=0, le=1)
 	jev: ModelEndpoint | None = None
 	execution: ExecutionModel
 	evaluation: EvaluationModel
 	headless: bool
 	user_data_dir: str | None
+
+	@field_validator('vision_escalation', mode='before')
+	@classmethod
+	def _smart_escalation(cls, value: Any, info: ValidationInfo) -> Any:
+		if info.data.get('screenshot_policy') != 'smart':
+			return None
+		return True if value is None else value
+
+	@computed_field
+	@property
+	def effective_candidate_pipeline(self) -> EffectiveCandidatePipeline | None:
+		if self.jev is None:
+			return None
+		return resolve_candidate_pipeline(self.candidate_pipeline, self.screenshot_policy)
 
 	def system1_config(self) -> dict[str, str]:
 		if self.jev is not None:
@@ -155,7 +174,14 @@ def model_profiles() -> list[dict[str, Any]]:
 
 
 def runtime_settings(
-	provider=None, mode=None, screenshot_mode=False, *, screenshot_policy=None, model_profile=None
+	provider=None,
+	mode=None,
+	screenshot_mode=False,
+	*,
+	screenshot_policy=None,
+	vision_escalation=None,
+	candidate_pipeline=None,
+	model_profile=None,
 ) -> RunSettings:
 	mode = 'direct' if mode is None else mode
 	if mode not in ('direct', 'isolated', 'collaborative'):
@@ -203,6 +229,8 @@ def runtime_settings(
 		profile=profile,
 		execution_mode=mode,
 		screenshot_policy=policy,
+		candidate_pipeline=candidate_pipeline,
+		vision_escalation=vision_escalation,
 		jev=jev,
 		execution=ExecutionModel(
 			model=endpoint.model, base_url=endpoint.base_url, api_key=endpoint.api_key, timeout=timeout, max_tokens=max_tokens

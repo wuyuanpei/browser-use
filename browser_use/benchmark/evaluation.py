@@ -23,6 +23,11 @@ prove results using independently observed state. Actions can establish process 
 Preserve the user's quantity, scope, correctness, detail, links and time requirements. Interpret approximate
 language in context; explain consequential ambiguity. A missing extracted metadata field alone is not failure:
 read the original text. Do not silently weaken a requested time window or demand an unrequested answer key.
+For a requested time window or recent trend, cite evidence about the reported items or the exact list and
+its time scope. A current view, capture time, lifetime counts and recency labels on unrelated page sections
+do not establish that scope. For example, classic topics and their accumulated views can establish popular
+topics, but do not show which topics are trending recently. Use unknown when matching items are evidenced but
+the requested recency is unverified. For an explicit ranking window, require evidence of that window itself.
 Captures can overlap, one URL can have several items, and rankings can change. Deduplicate actual items,
 not capture counts. Use the observation at the time of selection for dynamic claims; later evidence does not
 rewrite earlier observations. Preserve each source document's identity and observation time/event.
@@ -173,7 +178,7 @@ def _verify_report(config: EvaluationModel, context: dict[str, Any], trace: dict
 
 
 CONTEXT_VERSION = 1
-PROMPT_VERSION = '2026-11-02.1'
+PROMPT_VERSION = '2026-11-25.2'
 
 
 def timestamp():

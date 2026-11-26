@@ -27,7 +27,7 @@ from browser_use.agent.cloud_events import (
 )
 from browser_use.agent.message_manager.utils import save_conversation
 from browser_use.llm.base import BaseChatModel
-from browser_use.llm.exceptions import ModelOutputTruncatedError, ModelProviderError, ModelRateLimitError
+from browser_use.llm.exceptions import ModelOutputFormatError, ModelOutputTruncatedError, ModelProviderError, ModelRateLimitError
 from browser_use.llm.messages import BaseMessage, ContentPartImageParam, ContentPartTextParam, UserMessage
 from browser_use.tokens.service import TokenCost
 
@@ -38,6 +38,8 @@ from pydantic import BaseModel, ValidationError
 from uuid_extensions import uuid7str
 
 from browser_use import Browser, BrowserProfile, BrowserSession
+from browser_use.agent.jev.decision import SYSTEM1_INTERNAL_ACTIONS
+from browser_use.agent.jev.usage import planner_feedback_scope
 from browser_use.agent.jev.views import CheckName, JevSettings
 from browser_use.agent.judge import construct_judge_messages
 
@@ -332,7 +334,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			owned = {
 				name
 				for name, action in actions.items()
-				if name in {'delegate_subgoal', 'finish', 'collect_page'}
+				if name in {'delegate_subgoal', 'finish', *SYSTEM1_INTERNAL_ACTIONS}
 				and action.param_model.__module__ == 'browser_use.agent.jev.views'
 			}
 			if owned or (jev is not None and jev.mode != 'off'):
@@ -852,7 +854,9 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 				create_model(include_actions=['finish'], page_url=page_url)
 			)
 		else:
-			planner_actions = [name for name in self.tools.registry.registry.actions if name not in {'finish', 'collect_page'}]
+			planner_actions = [
+				name for name in self.tools.registry.registry.actions if name not in {'finish', *SYSTEM1_INTERNAL_ACTIONS}
+			]
 			self.PlannerDoneAgentOutput = self.DoneAgentOutput
 		self.PlannerAgentOutput = self._output_model_for_actions(create_model(include_actions=planner_actions, page_url=page_url))
 
@@ -1168,10 +1172,12 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		self.logger.debug(f'🌐 Step {self.state.n_steps}: Getting browser state...')
 		# Always take screenshots for all steps
 		self.logger.debug('📸 Requesting browser state with include_screenshot=True')
-		browser_state_summary = await self.browser_session.get_browser_state_summary(
-			include_screenshot=True,  # always capture even if use_vision=False so that cloud sync is useful (it's fast now anyway)
-			include_recent_events=self.include_recent_events,
-		)
+		if self._jev is None:
+			browser_state_summary = await self.browser_session.get_browser_state_summary(
+				include_screenshot=True, include_recent_events=self.include_recent_events
+			)
+		else:
+			browser_state_summary = await self._jev.capture_browser_state(include_recent_events=self.include_recent_events)
 		if browser_state_summary.screenshot:
 			self.logger.debug(f'📸 Got browser state WITH screenshot, length: {len(browser_state_summary.screenshot)}')
 		else:
@@ -1795,47 +1801,56 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 				judge_log += f'   {judgement.reasoning}\n'
 				self.logger.info(judge_log)
 
+	@staticmethod
+	def _planner_format_error(error: Exception) -> str | None:
+		cause = error.__cause__ if isinstance(error, ModelOutputFormatError) else error
+		if isinstance(cause, json.JSONDecodeError):
+			return f'Invalid JSON at line {cause.lineno}, column {cause.colno}: {cause.msg}'
+		if isinstance(cause, ValidationError):
+			issues = cause.errors(include_input=False, include_context=False, include_url=False)
+			return '; '.join(f'{".".join(map(str, issue["loc"]))}: {issue["type"]}' for issue in issues[:5])[:500]
+		return None
+
 	async def _get_model_output_with_retry(self, input_messages: list[BaseMessage]) -> AgentOutput:
-		"""Get model output with retry logic for empty actions"""
-		model_output = await self.get_model_output(input_messages)
-		self.logger.debug(
-			f'✅ Step {self.state.n_steps}: Got LLM response with {len(model_output.action) if model_output.action else 0} actions'
-		)
-
-		if (
-			not model_output.action
-			or not isinstance(model_output.action, list)
-			or all(action.model_dump() == {} for action in model_output.action)
-		):
-			self.logger.warning('Model returned empty action. Retrying...')
-
-			clarification_message = UserMessage(
-				content='You forgot to return an action. Please respond with a valid JSON action according to the expected schema with your assessment and next actions.'
-			)
-
-			retry_messages = input_messages + [clarification_message]
-			model_output = await self.get_model_output(retry_messages)
-
-			if not model_output.action or all(action.model_dump() == {} for action in model_output.action):
-				self.logger.warning('Model still returned empty after retry. Inserting safe noop action.')
-				if self._isolated_jev():
-					model_output.action = [
-						self.ActionModel.model_validate(
-							{'finish': {'success': False, 'reason': 'No next action returned by LLM!'}}
-						)
-					]
+		"""Give the planner one chance to correct an unusable response before dispatch."""
+		messages = input_messages
+		reason = ''
+		for attempt in (1, 2):
+			model_output = None
+			start = time.monotonic()
+			try:
+				with planner_feedback_scope():
+					model_output = await self.get_model_output(messages)
+			except (ValidationError, ModelProviderError) as error:
+				problem = self._planner_format_error(error) if self._jev is not None else None
+				if self._jev is not None and isinstance(error, ModelOutputFormatError):
+					await self._jev.usage.record_format_error(
+						self._jev.step,
+						'planner',
+						self.llm.model,
+						error,
+						start=start,
+						attempt=attempt,
+						planner_feedback_retry=problem is not None and attempt == 1,
+					)
+				if problem is None:
+					raise
+				reason = f'Planner response did not match the action schema: {problem}'
+			else:
+				if isinstance(model_output.action, list) and any(action.model_dump() for action in model_output.action):
 					return model_output
-				action_instance = self.ActionModel()
-				setattr(
-					action_instance,
-					'done',
-					{
-						'success': False,
-						'text': 'No next action returned by LLM!',
-					},
-				)
-				model_output.action = [action_instance]
+				reason = 'No next action returned by LLM!'
+			self.logger.warning(reason)
+			messages = input_messages + [UserMessage(content=f'{reason} Return a valid JSON action matching the action schema.')]
 
+		failure_action = (
+			{'finish': {'success': False, 'reason': reason}}
+			if self._isolated_jev()
+			else {'done': {'success': False, 'text': reason}}
+		)
+		if model_output is None:
+			return self.AgentOutput.model_validate({'action': [failure_action]})
+		model_output.action = [self.ActionModel.model_validate(failure_action)]
 		return model_output
 
 	async def _handle_post_llm_processing(
@@ -2114,6 +2129,8 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			# Just re-raise - Pydantic's validation errors are already descriptive
 			raise
 		except (ModelRateLimitError, ModelProviderError) as e:
+			if self._jev is not None and isinstance(e, ModelOutputFormatError):
+				raise
 			# Check if we can switch to a fallback LLM
 			if not self._try_switch_to_fallback_llm(e):
 				# No fallback available, re-raise the original error

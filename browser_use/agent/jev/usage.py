@@ -1,6 +1,8 @@
 """Attribute actual model requests independently of planner decision rounds."""
 
 import logging
+from contextlib import contextmanager
+from contextvars import ContextVar
 from time import monotonic
 from typing import Any, Literal
 
@@ -9,12 +11,26 @@ from pydantic import BaseModel
 from browser_use.agent.jev.trace import JevTrace
 from browser_use.agent.jev.views import JEV_INPUT_USD_PER_MTOK, System1Reply
 from browser_use.llm.base import BaseChatModel
+from browser_use.llm.exceptions import ModelOutputFormatError
 from browser_use.llm.messages import BaseMessage
 from browser_use.llm.views import ChatInvokeUsage
 from browser_use.tokens.service import TokenCost
 
 logger = logging.getLogger(__name__)
 Role = Literal['planner', 'system1', 'text', 'summary', 'answer', 'risk', 'other']
+
+
+_planner_feedback_scope = ContextVar('jev_planner_feedback_scope', default=False)
+
+
+@contextmanager
+def planner_feedback_scope():
+	# The retry controller records rejected planner calls after it selects the feedback disposition.
+	token = _planner_feedback_scope.set(True)
+	try:
+		yield
+	finally:
+		_planner_feedback_scope.reset(token)
 
 
 class RoleUsage(BaseModel):
@@ -48,6 +64,8 @@ class UsageLedger:
 		self.cursor = len(token_cost.usage_history)
 		self.vision_requests = 0
 		self.vision_rejections = 0
+		self.escalations_by_reason: dict[str, int] = {}
+		self.escalations_executed = 0
 		self.vision_disabled: dict[str, int] | None = None
 		self.roles = {name: RoleUsage() for name in ('planner', 'system1', 'text', 'summary', 'answer', 'risk', 'other')}
 
@@ -102,6 +120,37 @@ class UsageLedger:
 		for entry in pending:
 			await self._record_llm('other', entry.model, entry.usage, step, None, True, None, 1)
 
+	async def _claim_usage(self, step: int, model: str, usage: ChatInvokeUsage | None):
+		# Claim this response's entry. Unrelated calls still belong to 'other'.
+		entries = self.cost.usage_history
+		pending = entries[self.cursor :]
+		self.cursor = len(entries)
+		claimed = False
+		for entry in reversed(pending):
+			if not claimed and usage is not None and entry.model == model and entry.usage == usage:
+				claimed = True
+			else:
+				await self._record_llm('other', entry.model, entry.usage, step, None, True, None, 1)
+
+	async def record_format_error(
+		self,
+		step: int,
+		role: Role,
+		model: str,
+		error: ModelOutputFormatError,
+		*,
+		start: float,
+		attempt: int,
+		planner_feedback_retry: bool = False,
+	):
+		record = error.trace_record(role=role, model=model, planner_feedback_retry=planner_feedback_retry)
+		self.trace.write('llm_output_parse_error', step, **record)
+		# TokenCost tracks successful returns. A rejected provider reply is billable as well.
+		if error.usage is not None:
+			self.cost.add_usage(model, error.usage)
+		await self._claim_usage(step, model, error.usage)
+		await self._record_llm(role, model, error.usage, step, start, False, type(error).__name__, attempt)
+
 	async def invoke(
 		self, step: int, role: Role, llm: BaseChatModel, messages: list[BaseMessage], *, attempt: int = 1, **kwargs: Any
 	):
@@ -109,20 +158,14 @@ class UsageLedger:
 		start = monotonic()
 		try:
 			response = await llm.ainvoke(messages, **kwargs)
+		except ModelOutputFormatError as error:
+			if role != 'planner' or not _planner_feedback_scope.get():
+				await self.record_format_error(step, role, llm.model, error, start=start, attempt=attempt)
+			raise
 		except BaseException as exc:
 			await self._record_llm(role, llm.model, None, step, start, False, type(exc).__name__, attempt)
 			raise
-		# TokenCost.register_llm wraps ainvoke and appends its usage before returning.
-		# Claim only this response's entry; unrelated entries still go to 'other'.
-		entries = self.cost.usage_history
-		pending = entries[self.cursor :]
-		self.cursor = len(entries)
-		claimed = False
-		for entry in reversed(pending):
-			if not claimed and response.usage is not None and entry.model == llm.model and entry.usage == response.usage:
-				claimed = True
-			else:
-				await self._record_llm('other', entry.model, entry.usage, step, None, True, None, 1)
+		await self._claim_usage(step, llm.model, response.usage)
 		await self._record_llm(role, llm.model, response.usage, step, start, True, None, attempt)
 		return response
 
@@ -145,12 +188,18 @@ class UsageLedger:
 		if self.vision_disabled is None:
 			self.vision_disabled = {'status': status, 'step': step}
 
+	def record_escalation(self, reason: str) -> None:
+		self.escalations_by_reason[reason] = self.escalations_by_reason.get(reason, 0) + 1
+
 	def summary(self) -> dict[str, dict]:
 		rows = {role: counters.model_dump() for role, counters in self.roles.items()}
 		rows['system1'].update(
 			vision_requests=self.vision_requests,
 			text_requests=self.roles['system1'].calls - self.vision_requests,
 			vision_rejections=self.vision_rejections,
+			escalations=sum(self.escalations_by_reason.values()),
+			escalations_executed=self.escalations_executed,
+			escalations_by_reason=self.escalations_by_reason.copy(),
 			vision_disabled=self.vision_disabled.copy() if self.vision_disabled else None,
 		)
 		# Native BU does not publish an entry or its latency when no usage is returned.

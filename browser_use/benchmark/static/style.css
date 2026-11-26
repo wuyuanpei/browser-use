@@ -797,7 +797,7 @@ button.trace-row:hover { background: #f0f3f5; border-color: #a5b4aa; }
 button.trace-row.active:hover { background: #e0eee5; border-color: #2f8a60; }
 button.trace-row:focus-visible { outline: 2px solid #2f8a60; outline-offset: 1px; }
 .trace-row > span { width: 100%; min-width: 0; }
-.trace-row.has-declaration { aspect-ratio: auto; }
+.trace-row.has-declaration, .trace-row:has(.trace-note) { aspect-ratio: auto; }
 .screenshot-declaration { display: grid; gap: 4px; overflow-wrap: anywhere; font-size: 12px; }
 @media (min-width: 600px) {
   .trace-row.has-declaration { grid-column: span 2; }
@@ -844,6 +844,9 @@ button.trace-row:focus-visible { outline: 2px solid #2f8a60; outline-offset: 1px
 .plan-goal-body { min-width: 0; }
 .screenshot-mode-control { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 13px; }
 .screenshot-mode-options { display: inline-flex; gap: 4px; }
+.vision-escalation-control { display: inline-flex; align-items: center; gap: 4px; margin-left: 6px; }
+.vision-escalation-control input { accent-color: var(--green); }
+.trace-note { font-size: 11px; overflow-wrap: anywhere; }
 .screenshot-mode-options button { padding: 7px 10px; font-size: 12px; }
 .screenshot-mode-options button[aria-pressed="true"] { background: #e7f3ea; border-color: #2f8a60; color: #216c49; }
 #planning-goals p { margin: 5px 0; }

@@ -89,7 +89,7 @@ class ModelHelpers:
 	) -> str | None:
 		payload = {
 			'original_goal': goal,
-			'subgoal': run.params.model_dump(include={'objective', 'completion', 'inputs'}),
+			'subgoal': run.params.model_dump(include={'objective', 'completion', 'inputs', 'text_mode'}),
 			'field': field_info(field),
 			'page': {
 				'url': obs.url,

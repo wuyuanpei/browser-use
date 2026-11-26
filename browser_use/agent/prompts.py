@@ -61,13 +61,13 @@ class SystemPrompt:
 				from browser_use.agent.jev.prompts import COLLABORATIVE_EXTENSION
 
 				prompt += f'\n{COLLABORATIVE_EXTENSION}'
-			if jev_mode is not None and jev_screenshot_policy == 'smart':
-				from browser_use.agent.jev.prompts import SYSTEM1_VISION_EXTENSION
-
-				prompt += f'\n{SYSTEM1_VISION_EXTENSION}'
 
 		if extend_system_message:
 			prompt += f'\n{extend_system_message}'
+		if override_system_message is None and jev_mode is not None and jev_screenshot_policy == 'smart':
+			from browser_use.agent.jev.prompts import SYSTEM1_VISION_EXTENSION
+
+			prompt += f'\n{SYSTEM1_VISION_EXTENSION}'
 
 		self.system_message = SystemMessage(content=prompt, cache=True)
 

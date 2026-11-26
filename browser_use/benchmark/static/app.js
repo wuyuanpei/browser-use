@@ -48,6 +48,9 @@ function consumeModelProfile() {
   renderModelProfile();
 }
 const screenshotPolicy = record => record?.screenshot_policy || (record?.screenshot_mode ? 'always' : 'off');
+function screenshotSettings() {
+  return { screenshot_policy: screenshotChoice, vision_escalation: screenshotChoice === 'smart' ? $('vision-escalation').checked : null };
+}
 const screenshotLabel = policy => ({ off: '始终关闭', always: '始终开启', smart: '智能截图' })[policy] || '始终关闭';
 const modeLabel = mode => ({ direct: 'BU 直接执行', isolated: 'Jev 隔离模式', collaborative: 'Jev 协作模式', planned: 'Planner 子任务' })[mode] || '直接执行';
 const handoffLabel = trigger => ({ initial: '初始规划', STEP_DONE: '完成检查', UNABLE: '无法推进',
@@ -57,7 +60,7 @@ const providerLabel = p => ({ laya: 'Laya', deepseek: 'DeepSeek', jev: 'Jev', fi
 const nativeProvider = provider => provider === 'fixture' || provider === 'browser_use';
 const callLabel = c => ({collect:'Collect helper · 页面摘要', summarize:'Summarize helper · 任务输出', summary:'页面摘要助手', answer:'最终答复助手', risk:'提交效果确认', other:'其他模型调用', verify:'Verify helper · 独立复核'})[c?.kind] || (c?.kind === 'planner' ? (c.trigger ? `Planner / ${handoffLabel(c.trigger)}` : 'Planner') : c?.kind === 'text' ? 'Text helper' : c?.kind === 'deepseek' ? `DeepSeek (System1)${c.stage ? ` / 第 ${c.decision_round} 轮 / ${c.stage === 'operation' ? '操作选择' : '目标选择'}` : ''}` : c?.kind === 'jev' ? jevCallLabel(c) : providerLabel(c?.kind));
 const decisionCount = attempt => attempt?.decision_calls ?? ((attempt?.laya_calls || 0) + (attempt?.deepseek_calls || 0) + (attempt?.jev_calls || 0));
-const callCounts = a => `${decisionCount(a)} / ${a.text_calls || 0} / ${a.planner_calls || 0}<small>收集 ${a.collect_calls || 0} · 总结 ${a.summarize_calls || 0}</small><small>${a.decision_rounds ?? decisionCount(a)} 决策轮 · ${a.replans || 0} 次改计划</small>`;
+const callCounts = a => `${decisionCount(a)} / ${a.text_calls || 0} / ${a.planner_calls || 0}<small>收集 ${a.collect_calls || 0} · 总结 ${a.summarize_calls || 0}</small><small>${a.decision_rounds ?? decisionCount(a)} 决策轮 · ${a.replans || 0} 次交回后再委派</small>`;
 function tokenPanel(usage, title = 'Token 消耗', panelKey = 'tokens') {
   if (!usage) return '<p class="token-note">Token 用量暂无记录</p>';
   const n = key => Number.isFinite(usage[key]) ? escape(usage[key].toLocaleString('en-US')) : '—';
@@ -256,7 +259,7 @@ function decisionTrail(calls) {
   return rows.map(({ call, members }) => {
     const grouped = call.kind === 'deepseek' && call.stage && Number.isInteger(call.decision_round);
     const operation = members.find(c => c.stage === 'operation') || call;
-    const modelChoice = call.vision ? jevModelChoice(call) : null;
+    const modelChoice = call.vision || call.outcome === 'escalated' ? jevModelChoice(call) : null;
     const target = members.find(c => c.stage && c.stage !== 'operation');
     const status = members.some(c => c.status === 'error' || c.application_status === 'rejected') ? 'error'
       : members.some(c => c.status === 'pending') ? 'pending'
@@ -275,6 +278,8 @@ function jevScreenshot(call) {
     || Object.keys(call.request_images || {}).length > 0);
 }
 function jevCallLabel(call) {
+  if (call.outcome === 'escalated') return 'Jev（文本→升级）';
+  if (call.vision_trigger?.startsWith('escalation:')) return call.vision_rejected ? 'Jev（截图·升级，被拒）' : 'Jev（截图·升级）';
   if (call.vision_rejected) return call.vision_trigger === 'planner' ? 'Jev（截图·Planner，被拒）' : 'Jev（截图，被拒）';
   if (!jevScreenshot(call)) return 'Jev';
   return call.vision_trigger === 'planner' ? 'Jev（截图·Planner）' : 'Jev（截图）';
@@ -293,9 +298,13 @@ function traceCard(call, index, active) {
   const decision = declaration ? `screenshot_required: ${declaration.screenshot_required ?? '未填'}` : '';
   const reason = declaration ? declaration.screenshot_reason?.trim() || '理由未填' : '';
   const detail = declaration ? `<span class="screenshot-declaration"><strong>${escape(decision)}</strong><span>${escape(reason)}</span></span>` : '';
-  const description = [`${index + 1}. ${call.label}`, action, decision, reason, call.model, call.target ? `target ${call.target}` : '',
+  const trigger = call.escalation_from || (call.vision_trigger?.startsWith('escalation:') ? call.vision_trigger.slice('escalation:'.length) : '');
+  const failures = call.parse_failures || [];
+  const parseNote = !failures.length ? '' : (failures.at(-1).planner_feedback_retry ?? failures.at(-1).retried) ? `解析失败 ${failures.length} 次，已重试` : '解析失败，已放弃';
+  const note = trigger ? `升级原因：${trigger}` : parseNote;
+  const description = [`${index + 1}. ${call.label}`, action, decision, reason, note, call.model, call.target ? `target ${call.target}` : '',
     call.subgoal_id, `${call.latency_ms ?? 0} ms`, status].filter(Boolean).join(' · ');
-  return `<button type="button" class="trace-row ${declaration ? 'has-declaration' : ''} ${active ? 'active' : ''}" data-call-id="${call.id}" aria-pressed="${active}" aria-label="${escape(description)}" title="${escape(description)}"><span class="trace-top"><span class="number">${String(index + 1).padStart(2, '0')}</span><span class="call-status ${call.status === 'error' ? 'failed' : ''}">${escape(status)}</span></span><span class="trace-main"><span class="trace-kind">${escape(label)}</span><b>${escape(action)}</b></span>${detail}<span class="trace-bottom"><span class="time">${call.latency_ms ?? 0} ms</span><small>${call.target ? '#'+escape(call.target) : ''}</small></span></button>`;
+  return `<button type="button" class="trace-row ${declaration ? 'has-declaration' : ''} ${active ? 'active' : ''}" data-call-id="${call.id}" aria-pressed="${active}" aria-label="${escape(description)}" title="${escape(description)}"><span class="trace-top"><span class="number">${String(index + 1).padStart(2, '0')}</span><span class="call-status ${call.status === 'error' ? 'failed' : ''}">${escape(status)}</span></span><span class="trace-main"><span class="trace-kind">${escape(label)}</span><b>${escape(action)}</b></span>${detail}${note ? `<span class="trace-note">${escape(note)}</span>` : ''}<span class="trace-bottom"><span class="time">${call.latency_ms ?? 0} ms</span><small>${call.target ? '#'+escape(call.target) : ''}</small></span></button>`;
 }
 function renderModelCalls() {
   const calls = executionCalls();
@@ -339,7 +348,9 @@ function renderModelCalls() {
   const output = ['laya', 'jev'].includes(selected?.kind) && selected.response != null
     ? Object.fromEntries(Object.entries(selected.response).filter(([key]) => key !== 'question_contexts'))
     : selected?.response;
-  const outputText = selected?.error
+  const outputText = selected?.parse_failures?.length
+    ? exactPayload({ response: output ?? null, parse_failures: selected.parse_failures, ...(selected.error ? {error:selected.error} : {}) })
+    : selected?.error
     ? exactPayload({ response: output ?? null, error: selected.error })
     : output != null ? exactPayload(output) : 'No response recorded.';
   if ($('model-output').textContent !== outputText) $('model-output').textContent = outputText;
@@ -371,6 +382,7 @@ function controls() {
     button.disabled = !configuring || !jevMode;
     button.setAttribute('aria-pressed', String(screenshotChoice === policy));
   }
+  $('vision-escalation').disabled = !configuring || !jevMode || screenshotChoice !== 'smart';
   const inspecting = selectedCallId !== null || selectedFrame !== null || (view === 'baseline' && (pinnedRun || pinnedAttempt));
   const running = view === 'free' ? live : state?.baseline_attempt?.execution_status === 'running';
   const disabledStatus = (inspecting || running) && !(configuring && editingRunSettings) ? state?.vision_disabled : null;
@@ -484,7 +496,7 @@ function sourceLink(url, label = '原文链接') {
 }
 function taskResult() {
   // New task output belongs to the task, independently of the selected notebook step.
-  return Array.isArray(state?.research?.pages) ? state?.result : researchVersion()?.result;
+  return (Array.isArray(state?.research?.pages) ? state?.result : researchVersion()?.result) || state?.partial_result;
 }
 function renderResearch() {
   const research = state?.research, version = researchVersion();
@@ -707,7 +719,10 @@ function selectBaselineGroup(group) {
 }
 function screenshotDecisionCounts(record) {
   if (screenshotPolicy(record) !== 'smart' || !Number.isInteger(record.screenshot_decisions_missing)) return '';
-  return `Planner 请求截图 ${record.planner_screenshot_requests} · 复盘委托 ${record.review_delegations} · 复盘漏填 ${record.screenshot_decisions_missing}`;
+  const planner = `Planner 请求截图 ${record.planner_screenshot_requests} · 复盘委托 ${record.review_delegations} · 复盘漏填 ${record.screenshot_decisions_missing}`;
+  if (!Number.isInteger(record.escalations)) return planner;
+  const reasons = Object.entries(record.escalations_by_reason || {}).map(([reason, count]) => `${reason}:${count}`).join(';');
+  return `${planner} · 运行时升级 ${record.escalations} · 升级后执行 ${record.escalations_executed}${reasons ? ' · '+reasons : ''}`;
 }
 function renderBaseline() {
   const batch = baseline.batch;
@@ -802,6 +817,16 @@ function clearFreeTask() {
   if (view === 'free') { state = freeState; render(); }
 }
 function acceptBaseline(data) {
+  for (const task of data.tasks || []) {
+    if (!task.url?.includes('/fixture.html?scenario=')) continue;
+    const url = new URL(task.url, location.origin);
+    const scenario = url.searchParams.get('scenario');
+    if (url.origin === location.origin && url.pathname === '/fixture.html' && scenario && !websites[scenario]) {
+      websites[scenario] = url.href;
+      goals[scenario] = task.goal;
+      $('scenario').add(new Option(task.name, scenario), $('scenario').querySelector('[value="custom"]'));
+    }
+  }
   const old = baseline.batch;
   if (data.active && !baseline.active) clearFreeTask();
   baseline = { ...baseline, ...data };
@@ -906,7 +931,7 @@ function startBaseline(taskIds) {
     showBaselineError(Error('重复次数必须为 1–10 的整数。'));
     return;
   }
-  baselineAction('start', { repeats, system1_provider: browserUseProvider, execution_mode: executionChoice, screenshot_policy: screenshotChoice, model_profile: modelProfileChoice, ...(taskIds ? { task_ids: taskIds } : {}) });
+  baselineAction('start', { repeats, system1_provider: browserUseProvider, execution_mode: executionChoice, ...screenshotSettings(), model_profile: modelProfileChoice, ...(taskIds ? { task_ids: taskIds } : {}) });
 }
 async function selectView(next) {
   selectedFrame = null;
@@ -1072,7 +1097,7 @@ $("task-form").addEventListener("submit", (event) => {
         scenario: $("scenario").value,
         system1_provider: browserUseProvider,
         execution_mode: executionChoice,
-        screenshot_policy: screenshotChoice,
+        ...screenshotSettings(),
         model_profile: modelProfileChoice,
         url: $("website-url").value.trim(),
         goal: $("goal").value,
@@ -1194,6 +1219,7 @@ $('execution-mode').addEventListener('change', () => {
 for (const policy of ['off', 'always', 'smart']) {
   $(`screenshot-${policy}`).addEventListener('click', () => { editingRunSettings = true; screenshotChoice = policy; controls(); });
 }
+$('vision-escalation').addEventListener('change', () => { editingRunSettings = true; controls(); });
 fetch("/api/state")
   .then((r) => r.json())
   .then((s) => {

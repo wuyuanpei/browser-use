@@ -20,6 +20,9 @@ from browser_use.agent.jev.questions import VISION_RULES
 from browser_use.agent.jev.service import _is_repeated_empty, _is_review_delegation
 from browser_use.agent.jev.views import ActionRecord, DelegateSubgoalParams, DelegateSubgoalParamsSmart, Handback, SubgoalRun
 from browser_use.agent.views import AgentStepInfo
+from browser_use.benchmark.tasks import INSPECT_PAGE
+from browser_use.browser.events import TypeTextEvent
+from browser_use.browser.session import BrowserSession
 from tests.ci.conftest import create_mock_llm
 from tests.ci.jev_support import FakeJev, browser_eval, serve_page
 from tests.ci.jev_support import jev_browser as _jev_browser_fixture  # noqa: F401
@@ -82,6 +85,235 @@ def test_only_adjacent_empty_subgoals_count():
 	assert _is_repeated_empty([a, a], 'A')
 	a.actions[-1].status = 'unknown'
 	assert not _is_repeated_empty([a, a], 'A')
+
+
+@pytest.mark.parametrize(('filler_count', 'operation'), [(30, 'CLICK'), (215, 'CLICK'), (619, 'CLICK'), (619, 'TYPE_TEXT')])
+async def test_dense_inbox_keeps_compose_and_search(jev_browser, httpserver, tmp_path, filler_count, operation):
+	filler = ''.join(
+		f'<button style="height:22px;overflow:hidden;white-space:nowrap">邮件 {i}</button>' for i in range(filler_count)
+	)
+	url = serve_page(
+		httpserver,
+		'/dense-inbox',
+		'<div style="display:flex;flex-direction:column-reverse">'
+		f'<div style="display:grid;grid-template-columns:repeat(32,minmax(0,1fr));width:1100px">{filler}</div>'
+		"<button onclick=\"document.querySelector('output').textContent='草稿已打开'\">写信</button>"
+		'<input type="search" placeholder="搜索邮件" oninput="document.querySelector(\'output\').textContent=this.value">'
+		'<output></output></div>',
+	)
+	search = operation == 'TYPE_TEXT'
+	target = '搜索邮件' if search else '写信'
+	fake = FakeJev(httpserver, [{'operation': operation, 'target': target}, {'operation': 'STEP_DONE'}])
+	objective = '在搜索邮件框输入会议' if search else '打开写信编辑器'
+	planner = create_mock_llm([subgoal(objective), planner_action('finish', success=True, reason='Inbox action applied')])
+	agent = Agent(
+		task=f'Visit {url} and {objective}.',
+		llm=planner,
+		browser_session=jev_browser,
+		use_judge=False,
+		jev=JevSettings(
+			jev_api_key='test',
+			jev_base_url=httpserver.url_for('/'),
+			text_llm=create_mock_llm(['{"text":"会议"}']),
+			answer_llm=create_mock_llm(['{"text":"Inbox action applied"}']),
+			trace_path=tmp_path / 'trace.jsonl',
+		),
+	)
+	observed = []
+
+	async def inspect(at_step):
+		if at_step.history.is_done():
+			observed.append(await browser_eval(jev_browser, 'document.querySelector("output").textContent'))
+
+	history = await agent.run(max_steps=5, on_step_end=inspect)
+	assert fake.requests and not fake.errors
+	questions = fake.requests[0]['questions']
+	assert len(questions['click_target']['criteria']) == min(filler_count + 2, 200)
+	assert any('搜索邮件' in entry['element'] for entry in questions['type_text_target']['criteria'].values())
+	first = next(event for event in _events(tmp_path / 'trace.jsonl') if event['event'] == 'system1_decision')
+	assert first['observed_candidate_counts']['click_target'] == filler_count + 2
+	assert history.is_successful() and observed == (['会议'] if search else ['草稿已打开'])
+
+
+@pytest.mark.parametrize('mode,expected', [('append', '前缀关键点'), ('replace', '关键点')])
+async def test_jev_applies_explicit_rich_text_mode(jev_browser, httpserver, tmp_path, mode, expected):
+	url = serve_page(
+		httpserver,
+		'/rich-text',
+		'<div id="editor" aria-label="正文" role="textbox" contenteditable="true">'
+		'<p id="tail">前缀</p><ul id="items"><li>第一项</li><li>第二项</li><li>第三项</li></ul></div>'
+		'<script>if (location.search.includes("append")) {'
+		'editor.prepend(items);'
+		'editor.focus(); getSelection().collapse(tail.firstChild, tail.textContent.length);'
+		'document.execCommand("bold"); document.execCommand("italic");'
+		'let drop = true; editor.addEventListener("beforeinput", e => {'
+		'if (drop && e.data === "关") { drop = false; e.preventDefault(); }'
+		'}); }</script>',
+	)
+	fake = FakeJev(httpserver, [{'operation': 'TYPE_TEXT', 'target': '正文'}, {'operation': 'STEP_DONE'}])
+	plan = planner_action(
+		'delegate_subgoal',
+		objective='写入关键点',
+		completion='正文显示关键点',
+		reason='按任务填写',
+		inputs='关键点',
+		text_mode=mode,
+		requires_action=True,
+	)
+	agent = Agent(
+		task=f'Open {url}?{mode} and use {mode} to write 关键点 in the rich text editor.',
+		llm=create_mock_llm([plan, planner_action('finish', success=True, reason='Text present')]),
+		browser_session=jev_browser,
+		use_judge=False,
+		jev=JevSettings(
+			jev_api_key='local-test',
+			jev_base_url=httpserver.url_for('/'),
+			trace_path=tmp_path / 'trace.jsonl',
+			text_llm=create_mock_llm(['{"text":"关键点"}']),
+			answer_llm=create_mock_llm(['{"text":"Text present"}']),
+		),
+	)
+	proof = []
+
+	async def inspect(running):
+		if running.history.is_done():
+			proof.append(
+				await browser_eval(
+					jev_browser,
+					'[(document.querySelector("#tail") || editor).textContent, editor.querySelectorAll("li").length, '
+					'[...editor.querySelectorAll("i, em")].some(el => el.textContent === "关键点"), '
+					'[...editor.querySelectorAll("b, strong")].some(el => el.textContent === "关键点")]',
+				)
+			)
+			proof.append((await browser_eval(jev_browser, INSPECT_PAGE))['facts']['rich_text'][0])
+
+	await agent.run(max_steps=5, on_step_end=inspect)
+	assert not fake.errors
+	assert proof[0] == [expected, 3 if mode == 'append' else 0, mode == 'append', mode == 'append']
+	assert proof[1]['text'].endswith(expected)
+	assert proof[1]['format'] == ([{'bold': True, 'italic': True, 'runs': ['关键点']}] if mode == 'append' else [])
+	assert proof[1]['unordered_lists'] == ([['第一项', '第二项', '第三项']] if mode == 'append' else [])
+
+
+async def test_replacing_empty_editor_preserves_managed_nodes(jev_browser, httpserver):
+	url = serve_page(
+		httpserver,
+		'/empty-editor',
+		'<div id="editor" contenteditable="true"><div data-editor-block><br></div></div>'
+		'<script>editor.addEventListener("beforeinput", e => {'
+		'if (!editor.querySelector("[data-editor-block]")) e.preventDefault();'
+		'});</script>',
+	)
+	await jev_browser.navigate_to(url)
+	summary = await jev_browser.get_browser_state_summary()
+	target = next(node for node in summary.dom_state.selector_map.values() if node.attributes.get('id') == 'editor')
+	event = jev_browser.event_bus.dispatch(TypeTextEvent(node=target, text='hello', clear=True))
+	await event.event_result(raise_if_any=True, raise_if_none=False)
+	assert await browser_eval(jev_browser, 'editor.querySelector("[data-editor-block]").innerText') == 'hello'
+
+
+async def test_append_does_not_fall_back_to_focused_field(jev_browser, httpserver, monkeypatch):
+	from browser_use.browser.watchdogs.default_action_watchdog import DefaultActionWatchdog
+
+	url = serve_page(httpserver, '/append', '<input id="target" value="prefix"><input id="other" value="unrelated">')
+	await jev_browser.navigate_to(url)
+	summary = await jev_browser.get_browser_state_summary()
+	target = next(node for node in summary.dom_state.selector_map.values() if node.attributes.get('id') == 'target')
+	await browser_eval(jev_browser, 'other.focus()')
+
+	async def lose_target(*_args, **_kwargs):
+		raise RuntimeError('editable target detached')
+
+	monkeypatch.setattr(DefaultActionWatchdog, '_input_text_element_node_impl', lose_target)
+	monkeypatch.setattr(DefaultActionWatchdog, '_click_element_node_impl', lose_target)
+	event = jev_browser.event_bus.dispatch(TypeTextEvent(node=target, text='suffix', clear=False))
+	with pytest.raises(RuntimeError, match='editable target detached'):
+		await event.event_result(raise_if_any=True, raise_if_none=False)
+	assert await browser_eval(jev_browser, '[target.value, other.value]') == ['prefix', 'unrelated']
+
+
+async def test_jev_reobserves_when_categories_load_during_native_capture(jev_browser, httpserver, monkeypatch, tmp_path):
+	url = serve_page(
+		httpserver,
+		'/load-category',
+		'<main id="panel">Nothing loaded yet</main><output></output>',
+	)
+	fake = FakeJev(httpserver, [{'operation': 'CLICK', 'target': 'Beauty'}, {'operation': 'STEP_DONE'}])
+	plan = create_mock_llm([subgoal('Find Beauty'), planner_action('finish', success=True, reason='Beauty selected')])
+	agent = Agent(
+		task=f'Open {url} and select Beauty.',
+		llm=plan,
+		browser_session=jev_browser,
+		use_judge=False,
+		jev=JevSettings(
+			jev_api_key='test',
+			jev_base_url=httpserver.url_for('/'),
+			trace_path=tmp_path / 'trace.jsonl',
+			answer_llm=create_mock_llm(['{"text":"Beauty selected"}']),
+		),
+	)
+	executor = agent._jev
+	assert executor is not None
+	capture = jev_browser.get_browser_state_summary
+	switched = False
+
+	async def change_during_capture(**kwargs):
+		nonlocal switched
+		summary = await capture(**kwargs)
+		if not switched and executor.active_run and summary.url == url:
+			switched = True
+			await browser_eval(
+				jev_browser,
+				"""panel.innerHTML = `<button onclick="this.parentElement.textContent='Beauty selected'">Beauty</button>`""",
+			)
+		return summary
+
+	monkeypatch.setattr(BrowserSession, 'get_browser_state_summary', lambda self, **kwargs: change_during_capture(**kwargs))
+	history = await agent.run(max_steps=6)
+	assert switched and history.is_successful()
+	assert not fake.errors
+	request = fake.requests[0]
+	assert 'Beauty' in request['state']['page']['text'] and 'Nothing loaded yet' not in request['state']['page']['text']
+	assert any('Beauty' in v['element'] for v in request['questions']['click_target']['criteria'].values())
+	rows = _events(tmp_path / 'trace.jsonl')
+	handback = next(row for row in rows if row['event'] == 'handback' and row['reason'] == 'step_done')
+	same_step = next(row for row in rows if row['event'] == 'system1_decision' and row['step'] == handback['step'])
+	assert handback['fingerprint'] == same_step['observation_fingerprint']
+
+
+async def test_read_only_operation_can_use_split_confidence(jev_browser, httpserver):
+	url = serve_page(httpserver, '/split-confidence', '<main style="height:200vh"><p>Visible article</p></main>')
+	fake = FakeJev(
+		httpserver,
+		[
+			{'operation': 'COLLECT', 'operation_probs': {'COLLECT': 0.58, 'SCROLL_DOWN': 0.41, 'UNABLE': 0.01}},
+			{'operation': 'STEP_DONE'},
+		],
+	)
+	planner = create_mock_llm(
+		[
+			planner_action(
+				'delegate_subgoal', objective='Read the article', completion='Article saved', reason='Capture visible text'
+			),
+			planner_action('finish', success=True, reason='Article saved'),
+		]
+	)
+	agent = Agent(
+		task=f'Visit {url} and save the visible article.',
+		llm=planner,
+		browser_session=jev_browser,
+		use_judge=False,
+		jev=JevSettings(
+			jev_api_key='test',
+			jev_base_url=httpserver.url_for('/'),
+			summary_llm=create_mock_llm(['{"text":"Visible article"}']),
+			answer_llm=create_mock_llm(['{"text":"Article saved"}']),
+		),
+	)
+
+	history = await agent.run(max_steps=5)
+	assert not fake.errors
+	assert any('collect_page' in action for action in history.model_actions())
 
 
 async def test_replan_after_intervening_prerequisite(jev_browser, httpserver: HTTPServer, tmp_path: Path):
@@ -223,6 +455,8 @@ async def start_stage(
 	body=None,
 	requires=False,
 	screenshot_policy: Literal['off', 'always', 'smart'] = 'off',
+	vision_escalation=True,
+	min_read_operation_probability=0.6,
 	screenshot_fields=None,
 	save_conversation_path=None,
 ):
@@ -242,6 +476,8 @@ async def start_stage(
 		trace_path=tmp_path / 'trace.jsonl',
 		max_candidates=max_candidates,
 		screenshot_policy=screenshot_policy,
+		vision_escalation=vision_escalation,
+		min_read_operation_probability=min_read_operation_probability,
 		checks=checks or JevChecks(),
 	)
 	agent = Agent(
@@ -293,8 +529,579 @@ async def test_missing_screenshot_uses_text_in_the_same_decision(jev_browser, ht
 		await close_driver(agent)
 
 
+async def scroll_stage(jev_browser, httpserver, tmp_path, **settings):
+	agent, executor, _ = await start_stage(jev_browser, httpserver, tmp_path, **settings)
+	fixture = Path(__file__).resolve().parents[2] / 'browser_use/benchmark/static/fixture.html'
+	httpserver.expect_request('/region-fixture').respond_with_data(fixture.read_bytes(), content_type='text/html; charset=utf-8')
+	await jev_browser.navigate_to(httpserver.url_for('/region-fixture') + '?scenario=scroll-panel')
+	return agent, executor
+
+
+async def test_region_scroll_moves_only_panel_and_consumes_budget(jev_browser, httpserver, tmp_path):
+	fake = _VisionJev(httpserver, [{'operation': 'SCROLL_DOWN', 'target': 'Filters'}])
+	agent, executor = await scroll_stage(jev_browser, httpserver, tmp_path, max_actions=1, screenshot_policy='always')
+	try:
+		assert (await routed(agent)).model_output is not None
+		assert await browser_eval(jev_browser, "document.querySelector('#filter-panel').scrollTop > 0 && scrollY === 0")
+		run = executor.runs[-1]
+		assert len(run.executed_actions) == 1 and 'scroll_region' in run.executed_actions[0].bu_action
+		assert (await routed(agent)).model_output is None and run.handback is not None and run.handback.reason == 'action_budget'
+		effect = run.executed_actions[0].scroll_effect
+		assert effect and effect.measurable and effect.root_delta_y == 0
+		assert effect.target_delta_y is not None and effect.target_delta_y > 0
+		assert run.executed_actions[0].page_changed is True
+		criteria = fake.requests[0]['questions']['scroll_down_target']['criteria']
+		assert 'rect' in criteria[run.executed_actions[0].target_key]
+		assert 'scroll_region' not in str(agent._planner_output_format().model_json_schema())
+	finally:
+		await close_driver(agent)
+
+
+@pytest.mark.parametrize(
+	'mutation',
+	[
+		'p.remove()',
+		'p.replaceWith(p.cloneNode(true))',
+		'p.scrollTop=p.scrollHeight',
+		"document.body.insertAdjacentHTML('beforeend','<div style=\"position:fixed;inset:0;background:gray;z-index:2147483647\"></div>')",
+	],
+)
+async def test_region_scroll_rechecks_selected_node_before_wheel(mutation, jev_browser, httpserver, tmp_path):
+	FakeJev(httpserver, [{'operation': 'SCROLL_DOWN', 'target': 'Filters'}])
+	agent, executor = await scroll_stage(jev_browser, httpserver, tmp_path)
+	try:
+		summary = await agent._prepare_context(AgentStepInfo(0, 10))
+		out = await routed(agent, summary=summary, execute=False)
+		assert out.model_output is not None
+		await browser_eval(jev_browser, f"(()=>{{const p=document.querySelector('#filter-panel');{mutation};return true}})()")
+		agent.state.last_model_output = out.model_output
+		await agent._execute_actions()
+		await agent._post_process()
+		await agent._finalize(summary)
+		run = executor.runs[-1]
+		assert len(run.executed_actions) == 1 and run.executed_actions[0].status == 'executed_failed'
+		assert (await routed(agent)).model_output is None and run.handback is not None and run.handback.reason == 'action_error'
+	finally:
+		await close_driver(agent)
+
+
+async def test_cancelled_region_wheels_still_trigger_no_effect(jev_browser, httpserver, tmp_path):
+	FakeJev(httpserver, [{'operation': 'SCROLL_DOWN', 'target': 'Filters'}] * 2)
+	agent, executor = await scroll_stage(jev_browser, httpserver, tmp_path)
+	try:
+		await browser_eval(
+			jev_browser,
+			"let wheelCount=0; const counter=document.createElement('output'); document.body.prepend(counter); "
+			"document.querySelector('#filter-panel').addEventListener('wheel',e=>{e.preventDefault(); "
+			"counter.textContent='Wheel '+ ++wheelCount;},{passive:false}); true",
+		)
+		await routed(agent)
+		await routed(agent)
+		assert (await routed(agent)).model_output is None
+		assert await browser_eval(jev_browser, "document.querySelector('output').textContent") == 'Wheel 2'
+		run = executor.runs[-1]
+		assert len(run.executed_actions) == 2 and run.handback is not None and run.handback.reason == 'no_effect'
+		for action in run.executed_actions:
+			assert action.scroll_effect and action.scroll_effect.target_delta_y == 0 and action.page_changed is False
+	finally:
+		await close_driver(agent)
+
+
+async def test_page_scroll_after_root_locks_counts_no_effect_and_escalates(jev_browser, httpserver, tmp_path):
+	fake = _VisionJev(httpserver, [{'operation': 'SCROLL_DOWN', 'target': 'the whole page'}] * 2 + [{'operation': 'STEP_DONE'}])
+	agent, executor, _ = await start_stage(
+		jev_browser,
+		httpserver,
+		tmp_path,
+		screenshot_policy='smart',
+		body=(
+			'<main style="height:220vh"><p id="activity">Initial content</p></main>'
+			'<aside aria-label="Side panel" style="position:fixed;left:0;top:100px;width:180px;height:220px;overflow:auto">'
+			'<div style="height:800px">Scrollable content</div></aside>'
+		),
+	)
+	try:
+		run = executor.runs[-1]
+		for n in range(2):
+			summary = await agent._prepare_context(AgentStepInfo(agent.state.n_steps - 1, 30))
+			prediction = await routed(agent, execute=False, summary=summary)
+			assert prediction.model_output is not None and run.no_effect_streak == n
+			assert run.actions[-1].target_key == 'page'
+			# The page locked after prediction, when the offered page action was already selected.
+			await browser_eval(jev_browser, "document.documentElement.style.overflowY='hidden'")
+			agent.state.last_model_output = prediction.model_output
+			await agent._execute_actions()
+			await agent._post_process()
+			await agent._finalize(summary)
+			assert await browser_eval(
+				jev_browser, "scrollY === 0 && getComputedStyle(document.documentElement).overflowY === 'hidden'"
+			)
+			await browser_eval(jev_browser, f"activity.textContent='New viewport text {n}'")
+			if n == 0:
+				await browser_eval(jev_browser, "document.documentElement.style.overflowY=''")
+
+		assert (await routed(agent)).model_output is None
+		assert run.no_effect_escalated and run.vision_source == 'escalation'
+		assert run.handback and run.handback.reason == 'step_done'
+		assert (
+			len(fake.requests) == 3
+			and fake.requests[-1]['state']['current_subgoal']['screenshot_guidance']['source'] == 'escalation'
+		)
+		for request, expected in zip(
+			fake.requests, ('Initial content', 'New viewport text 0', 'New viewport text 1'), strict=True
+		):
+			assert expected in request['state']['page']['text']
+		assert 'page' not in fake.requests[-1]['questions']['scroll_down_target']['criteria']
+		assert 'Side panel' in str(fake.requests[-1]['questions']['scroll_down_target']['criteria'])
+		events = _events(tmp_path / 'trace.jsonl')
+		results = [event for event in events if event['event'] == 'action_result' and event['operation'] == 'SCROLL_DOWN']
+		assert len(results) == 2
+		for event in results:
+			assert event['status'] == 'executed_ok' and event['page_changed'] is False
+			assert event['scroll_effect'] == {
+				'target_key': 'page',
+				'root_delta_y': 0,
+				'center_delta_y': None,
+				'target_delta_y': None,
+				'url_changed': False,
+				'measurable': True,
+			}
+		locked = next(event for event in events if event['event'] == 'scroll_page_suppressed')
+		assert locked['reason'] == 'root_locked_without_center_scroll' and locked['overflow_y'] == 'hidden'
+	finally:
+		await close_driver(agent)
+
+
+@pytest.mark.parametrize(
+	('operation', 'threshold', 'execute'), [('SCROLL_DOWN', 0.6, True), ('CLICK', 0.6, False), ('SCROLL_DOWN', 0.8, False)]
+)
+async def test_read_threshold_only_changes_selected_read_operations(
+	operation, threshold, execute, jev_browser, httpserver, tmp_path
+):
+	FakeJev(
+		httpserver,
+		[
+			{
+				'operation': operation,
+				'target': 'the whole page' if operation == 'SCROLL_DOWN' else 'Plain',
+				'operation_probs': {operation: 0.72, 'WAIT': 0.28},
+			},
+			{'operation': 'STEP_DONE'},
+		],
+	)
+	agent, executor, _ = await start_stage(
+		jev_browser,
+		httpserver,
+		tmp_path,
+		min_read_operation_probability=threshold,
+		body='<main style="height:220vh"><button>Plain</button></main>',
+	)
+	try:
+		result = await routed(agent)
+		assert (result.model_output is not None) is execute
+		if execute:
+			assert await browser_eval(jev_browser, 'scrollY') > 0
+			assert (await routed(agent)).model_output is None
+			action = executor.runs[-1].executed_actions[0]
+			effect = action.scroll_effect
+			assert action.page_changed and effect and effect.measurable
+			assert effect.root_delta_y is not None and effect.root_delta_y > 0
+		else:
+			handback = executor.runs[-1].handback
+			assert handback is not None and handback.reason == 'low_confidence'
+		events = _events(tmp_path / 'trace.jsonl')
+		assert next(r for r in events if r['event'] == 'run_config')['min_read_operation_probability'] == threshold
+		assert next(r for r in events if r['event'] == 'system1_decision')['read_operation_probability'] == (
+			0.72 if operation == 'SCROLL_DOWN' else None
+		)
+	finally:
+		await close_driver(agent)
+
+
 def image_requests(server):
 	return server.expect_request('/v1/systemone', method='POST', headers={'TypeSafe-Danger-Zone-Images': 'true'})
+
+
+LOW_CLICK = {'operation': 'CLICK', 'target': 'Plain', 'p': 0.62, 'target_p': 0.68}
+
+
+@pytest.mark.parametrize(
+	('reason', 'first'),
+	[
+		('low_confidence', LOW_CLICK),
+		('unable_probability', {'operation': 'UNABLE'}),
+		('unable', {'operation': 'UNABLE'}),
+		('repeated_action', {'operation': 'CLICK', 'target': 'Plain'}),
+	],
+)
+async def test_runtime_image_retry_uses_same_observation(reason, first, jev_browser, httpserver, tmp_path, monkeypatch):
+	fake = _VisionJev(
+		httpserver, [first, {'operation': 'CLICK', 'target': 'Enable'}, {'operation': 'STEP_DONE'}, {'operation': 'STEP_DONE'}]
+	)
+	conversations = tmp_path / 'conversations'
+	agent, executor, _ = await start_stage(
+		jev_browser,
+		httpserver,
+		tmp_path,
+		screenshot_policy='smart',
+		screenshot_fields={'screenshot_required': False, 'screenshot_reason': 'Labels should suffice.'},
+		checks=JevChecks(confidence='off') if reason == 'unable' else JevChecks(),
+		save_conversation_path=conversations,
+	)
+	try:
+		summary = await agent._prepare_context(AgentStepInfo(0, 10))
+		run = executor.runs[-1]
+		if reason == 'repeated_action':
+			obs = await service.state.observe(jev_browser, summary, executor.settings, executor.step)
+			button = next(c for c in obs.candidates['CLICK'] if c.name == 'Plain')
+			for n in (1, 2):
+				run.actions.append(
+					ActionRecord(
+						n=n,
+						step=1,
+						run_id=run.id,
+						operation='CLICK',
+						target_key=button.key,
+						bu_action={'click': {'index': button.index}},
+						fingerprint_before=obs.fingerprint,
+						url_before=obs.url,
+						status='executed_ok',
+					)
+				)
+		observe = AsyncMock(wraps=service.state.observe)
+		prepare = Mock(wraps=service.prepare_screenshot)
+		monkeypatch.setattr(service.state, 'observe', observe)
+		monkeypatch.setattr(service, 'prepare_screenshot', prepare)
+		assert (await routed(agent, summary=summary)).model_output is not None
+		assert observe.await_count == prepare.call_count == 1
+		assert await browser_eval(jev_browser, 'document.querySelector("output").textContent') == 'Enabled'
+		assert len(fake.requests) == 2 and not fake.errors
+		text_packet, image_packet = fake.requests
+		image_state = json.loads(json.dumps(image_packet['state']))
+		assert image_state['page'].pop('screenshot') in image_packet['assets']
+		assert image_state['page'].pop('viewport')
+		guidance = image_state['current_subgoal'].pop('screenshot_guidance')
+		assert guidance == {'required': True, 'source': 'escalation', 'reason': run.vision_reason}
+		assert image_state == text_packet['state'] and 'assets' not in text_packet
+		assert {k: list(q['criteria']) for k, q in text_packet['questions'].items()} == {
+			k: list(q['criteria']) for k, q in image_packet['questions'].items()
+		}
+		assert run.vision and not run.vision_at_start and run.screenshot_declared is False and run.vision_source == 'escalation'
+		assert run.decisions == run.vision_decisions == 1
+		assert run.escalations == [{'step': run.started_step, 'reason': reason, 'outcome': 'executed'}]
+		events = _events(tmp_path / 'trace.jsonl')
+		rows = [r for r in events if r['event'] == 'system1_decision']
+		assert [(r['outcome'], r['vision_trigger'], r['escalation_from'], r['planner_declared']) for r in rows] == [
+			('escalated', None, reason, False),
+			('execute', f'escalation:{reason}', reason, False),
+		]
+		assert next(r for r in events if r['event'] == 'run_config')['vision_escalation'] is True
+		assert len(list(conversations.glob('*_escalated.json'))) == 1
+		normal = [f for f in conversations.glob('system1_*.json') if not f.stem.endswith('_escalated')]
+		assert (
+			len(normal) == 1
+			and (conversations / json.loads(normal[0].read_text(encoding='utf-8'))['request_images']['page-screenshot']).is_file()
+		)
+		assert 'System1 switched to images after:' in str((await routed(agent)).context_messages[-1].content)
+		assert executor.usage_by_role()['system1']['escalations_executed'] == 1
+		assert not (
+			await executor.delegate(
+				DelegateSubgoalParams(objective='Next', completion='New stage', reason='Advance'), jev_browser
+			)
+		).error
+		await routed(agent)
+		assert [r['vision_trigger'] for r in _events(tmp_path / 'trace.jsonl') if r['event'] == 'system1_decision'] == [
+			None,
+			f'escalation:{reason}',
+			f'escalation:{reason}',
+			None,
+		]
+		assert not executor.runs[-1].vision and not executor.runs[-1].escalations
+	finally:
+		await close_driver(agent)
+
+
+async def test_image_retry_reuses_targets_after_request_size_halving(jev_browser, httpserver, tmp_path, monkeypatch):
+	fake = _VisionJev(httpserver, [LOW_CLICK, {'operation': 'CLICK', 'target': 'Enable'}])
+	fillers = ''.join(f'<button aria-label="{i} {"x" * 115}">Other</button>' for i in range(48))
+	body = "<button>Plain</button><button onclick=\"document.querySelector('output').value='Enabled'\">Enable</button>"
+	agent, executor, _ = await start_stage(
+		jev_browser, httpserver, tmp_path, screenshot_policy='smart', max_candidates=32, body=body + fillers + '<output></output>'
+	)
+	try:
+		measured_sizes = []
+		request_size = service.decision.request_size
+
+		def measure_request(*args, **kwargs):
+			size = request_size(*args, **kwargs)
+			if not measured_sizes:
+				# Force exactly the 32-target request over budget, independent of Chrome's assigned node IDs.
+				monkeypatch.setattr(service, 'MAX_REQUEST_CHARS', size - 1)
+			measured_sizes.append(size)
+			return size
+
+		monkeypatch.setattr(service.decision, 'request_size', measure_request)
+		select_targets = Mock(wraps=service.decision.select_targets)
+		monkeypatch.setattr(service.decision, 'select_targets', select_targets)
+		assert (await routed(agent)).model_output is not None
+		assert await browser_eval(jev_browser, 'document.querySelector("output").value') == 'Enabled'
+		text, image = fake.requests
+		keys = list(text['questions']['click_target']['criteria'])
+		assert 1 < len(keys) < executor.settings.max_candidates
+		assert list(image['questions']['click_target']['criteria']) == keys
+		limits = [call.args[-1] for call in select_targets.call_args_list]
+		assert limits == [32 >> i for i in range(len(limits))] and limits[-1] == len(keys)
+		full_text_size, limited_text_size, image_size = measured_sizes
+		assert limits == [32, 16]
+		assert max(limited_text_size, image_size) <= service.MAX_REQUEST_CHARS < full_text_size
+		rows = [r for r in _events(tmp_path / 'trace.jsonl') if r['event'] == 'system1_decision']
+		for row, packet in zip(rows, fake.requests, strict=True):
+			assert row['request_chars'] == len(json.dumps(packet, ensure_ascii=False)) <= service.MAX_REQUEST_CHARS
+			assert row['observed_candidate_counts']['click_target'] > executor.settings.max_candidates
+			assert row['candidate_counts']['click_target'] == len(keys)
+	finally:
+		await close_driver(agent)
+
+
+async def test_failed_image_choice_uses_second_stop_and_logs_both_checks(jev_browser, httpserver, tmp_path):
+	fake = _VisionJev(httpserver, [LOW_CLICK, {'operation': 'UNABLE'}])
+	agent, executor, _ = await start_stage(jev_browser, httpserver, tmp_path, screenshot_policy='smart')
+	try:
+		out = await routed(agent)
+		run = executor.runs[-1]
+		assert len(fake.requests) == 2 and run.handback and run.handback.reason == 'unable_probability'
+		assert 'System1 retried with the viewport image after low_confidence; it still stopped: unable_probability.' in str(
+			out.context_messages[-1].content
+		)
+		assert run.escalations[-1]['outcome'] == 'handed_back' and not run.vision and executor.pending_record is None
+		assert [
+			r['request_vision'] for r in _events(tmp_path / 'trace.jsonl') if r['event'] == 'check' and r['name'] == 'confidence'
+		] == [False, True]
+	finally:
+		await close_driver(agent)
+
+
+@pytest.mark.parametrize(
+	('policy', 'enabled', 'declared', 'disabled', 'expected_vision'),
+	[
+		('off', True, None, False, False),
+		('always', True, None, False, True),
+		('smart', False, False, False, False),
+		('smart', True, True, False, True),
+		('smart', True, False, True, False),
+	],
+)
+async def test_image_retry_policy_gates(policy, enabled, declared, disabled, expected_vision, jev_browser, httpserver, tmp_path):
+	fake = _VisionJev(httpserver, [LOW_CLICK])
+	agent, executor, _ = await start_stage(
+		jev_browser,
+		httpserver,
+		tmp_path,
+		screenshot_policy=policy,
+		vision_escalation=enabled,
+		screenshot_fields={'screenshot_required': declared, 'screenshot_reason': 'Review the target.'},
+	)
+	try:
+		run = executor.runs[-1]
+		if disabled:
+			executor._disable_vision(run, 415)
+		await routed(agent)
+		assert run.handback and run.handback.reason == 'low_confidence'
+		assert len(fake.requests) == 1 and ('assets' in fake.requests[0]) is expected_vision and not run.escalations
+		assert next(r for r in _events(tmp_path / 'trace.jsonl') if r['event'] == 'run_config')['vision_escalation'] is enabled
+	finally:
+		await close_driver(agent)
+
+
+@pytest.mark.parametrize(
+	'reason',
+	[
+		'invalid_answer',
+		'action_error',
+		'step_error',
+		'submit_not_allowed',
+		'risk_not_allowed',
+		'risk_denied',
+		'out_of_scope',
+		'action_budget',
+		'text_unavailable',
+		'system1_error',
+		'too_many_candidates',
+		'state_too_large',
+		'unsupported_page',
+		'wait_limit',
+		'step_limit',
+		'step_done',
+		'repeated_action',
+	],
+)
+def test_non_visual_stops_and_repeated_typing_never_escalate(reason):
+	choice = service.decision.Decision(
+		operation='TYPE_TEXT', operation_probability=0.95, target_probability=0.95, unable_probability=0.02
+	)
+	assert service._escalation_reason((reason, 'stop'), choice) is None
+
+
+async def test_cancelled_image_retry_archives_actual_attempts(jev_browser, httpserver, tmp_path):
+	arrived = asyncio.Event()
+	release = threading.Event()
+	loop = asyncio.get_running_loop()
+
+	def block(request):
+		assert request.files['page-screenshot'].read()
+		loop.call_soon_threadsafe(arrived.set)
+		release.wait(timeout=15)
+		return Response('{}', mimetype='application/json')
+
+	image_requests(httpserver).respond_with_handler(block)
+	FakeJev(httpserver, [LOW_CLICK])
+	conversations = tmp_path / 'conversations'
+	agent, executor, _ = await start_stage(
+		jev_browser, httpserver, tmp_path, screenshot_policy='smart', save_conversation_path=conversations
+	)
+	task = asyncio.create_task(routed(agent, execute=False))
+	try:
+		await asyncio.wait_for(arrived.wait(), 15)
+		task.cancel()
+		with pytest.raises(asyncio.CancelledError):
+			await task
+		assert executor.pending_record is None
+		assert [r['outcome'] for r in _events(tmp_path / 'trace.jsonl') if r['event'] == 'system1_decision'] == [
+			'escalated',
+			'interrupted',
+		]
+		assert len(list(conversations.glob('system1_*.json'))) == 2 and len(list(conversations.glob('system1_*.jpg'))) == 1
+		assert executor.runs[-1].escalations[-1]['outcome'] == 'retry_failed'
+		usage = executor.usage_by_role()['system1']
+		assert (usage['decisions'], usage['vision_requests'], usage['text_requests'], usage['escalations_executed']) == (
+			1,
+			1,
+			1,
+			0,
+		)
+	finally:
+		release.set()
+		await close_driver(agent)
+
+
+async def test_repeated_type_text_uses_one_text_helper_and_one_jev_request(jev_browser, httpserver, tmp_path, monkeypatch):
+	fake = _VisionJev(httpserver, [{'operation': 'TYPE_TEXT', 'target': 'Town'}])
+	agent, executor, _ = await start_stage(
+		jev_browser, httpserver, tmp_path, screenshot_policy='smart', body='<label>Town <input></label>'
+	)
+	try:
+		run = executor.runs[-1]
+		summary = await agent._prepare_context(AgentStepInfo(0, 10))
+		obs = await service.state.observe(jev_browser, summary, executor.settings, executor.step)
+		target = obs.candidates['TYPE_TEXT'][0]
+		for n in (1, 2):
+			run.actions.append(
+				ActionRecord(
+					n=n,
+					step=1,
+					run_id=run.id,
+					operation='TYPE_TEXT',
+					target_key=target.key,
+					bu_action={'input': {'index': target.index, 'text': 'Luzern'}},
+					text='Luzern',
+					fingerprint_before=obs.fingerprint,
+					url_before=obs.url,
+					status='executed_ok',
+				)
+			)
+		helper = AsyncMock(return_value='Luzern')
+		monkeypatch.setattr(executor.helpers, 'text', helper)
+		await routed(agent, summary=summary)
+		assert len(fake.requests) == 1 and helper.await_count == 1 and not run.escalations
+		assert run.handback and run.handback.reason == 'repeated_action'
+	finally:
+		await close_driver(agent)
+
+
+async def test_discarded_upgraded_prediction_is_not_an_execution(jev_browser, httpserver, tmp_path):
+	fake = _VisionJev(httpserver, [LOW_CLICK, {'operation': 'CLICK', 'target': 'Enable'}])
+	agent, executor, _ = await start_stage(jev_browser, httpserver, tmp_path, screenshot_policy='smart')
+	try:
+		assert (await routed(agent, execute=False)).model_output is not None
+		assert len(fake.requests) == 2 and executor.usage_by_role()['system1']['escalations_executed'] == 0
+		await executor.aclose()
+		run = executor.runs[-1]
+		assert not run.vision_at_start and run.vision
+		assert _is_repeated_empty([run, run], run.identity, False) and not _is_repeated_empty([run, run], run.identity, True)
+		assert run.escalations[-1]['outcome'] == 'retry_failed'
+		assert await browser_eval(jev_browser, 'document.querySelector("output").textContent') == 'Default'
+	finally:
+		await close_driver(agent)
+
+
+@pytest.mark.parametrize('budget_exhausted', [False, True])
+async def test_no_effect_once_checks_remaining_budget(budget_exhausted, jev_browser, httpserver, tmp_path):
+	fake = _VisionJev(httpserver, [{'operation': 'CLICK', 'target': 'Plain'}])
+	agent, executor, _ = await start_stage(jev_browser, httpserver, tmp_path, screenshot_policy='smart')
+	try:
+		run = executor.runs[-1]
+		run.no_effect_streak = 2
+		if budget_exhausted:
+			run.actions.append(
+				ActionRecord(
+					n=1,
+					step=1,
+					run_id=run.id,
+					operation='WAIT',
+					bu_action={'wait': {}},
+					fingerprint_before='old',
+					url_before=run.start_url,
+					status='executed_ok',
+				)
+			)
+			run.max_actions = 1
+		await routed(agent)
+		assert run.no_effect_escalated and run.vision and run.vision_source == 'escalation'
+		assert executor.usage_by_role()['system1']['escalations_by_reason'] == {'no_effect': 1}
+		if budget_exhausted:
+			assert run.handback and run.handback.reason == 'action_budget' and not fake.requests
+			assert run.escalations[-1]['outcome'] == 'handed_back'
+		else:
+			assert (
+				len(fake.requests) == 1
+				and fake.requests[0]['state']['current_subgoal']['screenshot_guidance']['source'] == 'escalation'
+			)
+			assert run.escalations[-1]['outcome'] == 'executed'
+			run.no_effect_streak = 2
+			await routed(agent)
+			assert run.handback and run.handback.reason == 'no_effect' and len(fake.requests) == 1 and len(run.escalations) == 1
+	finally:
+		await close_driver(agent)
+
+
+@pytest.mark.parametrize('failure', ['missing', 415, 503])
+async def test_image_retry_fails_without_third_request(failure, jev_browser, httpserver, tmp_path, monkeypatch):
+	monkeypatch.setattr(backends, 'JEV_RETRY_DELAYS', (0, 0))
+	if isinstance(failure, int):
+		image_requests(httpserver).respond_with_data(status=failure)
+	else:
+		monkeypatch.setattr(service, 'prepare_screenshot', Mock(return_value=None))
+	FakeJev(httpserver, [LOW_CLICK])
+	agent, executor, _ = await start_stage(jev_browser, httpserver, tmp_path, screenshot_policy='smart')
+	try:
+		await routed(agent)
+		run = executor.runs[-1]
+		assert run.handback and run.handback.reason == 'low_confidence' and run.decisions == 1 and not run.vision_decisions
+		types = [r.mimetype for r, _ in httpserver.log if r.path == '/v1/systemone']
+		count = {'missing': 0, 415: 1, 503: 3}[failure]
+		assert types == ['application/json'] + ['multipart/form-data'] * count
+		outcome = {'missing': 'vision_unavailable', 415: 'vision_rejected', 503: 'retry_failed'}[failure]
+		assert run.escalations[0]['outcome'] == outcome
+		assert (executor._vision_disabled is not None) == (failure == 415)
+		if failure == 503:
+			assert 'Retrying with the image failed:' in run.handback.detail
+		if failure == 'missing':
+			assert any(
+				r['event'] == 'vision_unavailable' and r['vision_trigger'] == 'escalation:low_confidence'
+				for r in _events(tmp_path / 'trace.jsonl')
+			)
+	finally:
+		await close_driver(agent)
 
 
 @pytest.mark.parametrize(
@@ -384,7 +1191,7 @@ async def test_smart_sends_each_stage_its_declared_input(jev_browser, httpserver
 async def test_smart_review_missing_fields_and_changed_vision(jev_browser, httpserver, tmp_path):
 	fake = _VisionJev(httpserver, [{'operation': op} for op in ('UNABLE', 'UNABLE', 'STEP_DONE', 'UNABLE')])
 	agent, executor, params = await start_stage(
-		jev_browser, httpserver, tmp_path, screenshot_policy='smart', checks=JevChecks(confidence='off')
+		jev_browser, httpserver, tmp_path, screenshot_policy='smart', vision_escalation=False, checks=JevChecks(confidence='off')
 	)
 	try:
 		first = await routed(agent)
@@ -784,13 +1591,13 @@ async def test_handbacks_use_actual_page_and_results(case, steps, limit, expecte
 		await close_driver(agent)
 
 
-@pytest.mark.parametrize('case', ['step_limit', 'step_error', 'out_of_scope', 'too_many_candidates', 'state_too_large'])
-async def test_prechecks_do_not_call_model(case, jev_browser, httpserver, tmp_path):
+@pytest.mark.parametrize('case', ['step_limit', 'step_error', 'out_of_scope', 'candidate_limit', 'state_too_large'])
+async def test_prechecks_and_candidate_limit(case, jev_browser, httpserver, tmp_path):
 	agent, e, _ = await start_stage(
 		jev_browser,
 		httpserver,
 		tmp_path,
-		max_candidates=1 if case == 'too_many_candidates' else 200,
+		max_candidates=1 if case == 'candidate_limit' else 200,
 		goal='long original goal ' * 8000 if case == 'state_too_large' else 'Check controls',
 	)
 	fake = FakeJev(httpserver, [])
@@ -806,8 +1613,14 @@ async def test_prechecks_do_not_call_model(case, jev_browser, httpserver, tmp_pa
 			summary = await agent._prepare_context(AgentStepInfo(0, 20))
 		out = await e.route(agent, summary)
 		assert out.model_output is None
-		assert e.runs[-1].handback and e.runs[-1].handback.reason == case
-		assert fake.requests == []
+		handback = e.runs[-1].handback
+		if case == 'candidate_limit':
+			assert handback and handback.reason == 'unable_probability'
+			assert len(fake.requests) == 1
+			assert len(fake.requests[0]['questions']['click_target']['criteria']) == 1
+		else:
+			assert handback and handback.reason == case
+			assert fake.requests == []
 	finally:
 		await close_driver(agent)
 

@@ -181,6 +181,9 @@ class _BoundBrowser:
 		target = self.bridge.run(self.bind())
 		page = self.evaluate(READ_STATE)
 		if not isinstance(page, dict):
+			# Retry only the read on the owned tab, never the event that caused navigation.
+			page = self.evaluate(READ_STATE)
+		if not isinstance(page, dict):
 			raise RuntimeError('Browser document is unavailable')
 		page.update(target_id=target, document_id=document_key(page)[1], observed_at=datetime.now(timezone.utc).isoformat())
 		page['dom_fingerprint'] = page['fingerprint'] = fingerprint(page)
@@ -219,6 +222,7 @@ class BrowserUseRun:
 			self._jev_dir = jev_artifact_dir or Path.cwd() / 'artifacts' / 'jev-runs' / uuid4().hex
 			self._jev_dir.mkdir(parents=True, exist_ok=True)
 		self._model_role: ContextVar[str | None] = ContextVar('benchmark_jev_model_role', default=None)
+		self._prediction_text_call: dict[str, Any] | None = None
 		config = settings.system1_config()
 		self._state: dict[str, Any] = dict(
 			goal=goal,
@@ -228,6 +232,9 @@ class BrowserUseRun:
 			execution_mode=settings.execution_mode,
 			screenshot_mode=settings.screenshot_policy == 'always',
 			screenshot_policy=settings.screenshot_policy,
+			vision_escalation=settings.vision_escalation,
+			candidate_pipeline=settings.effective_candidate_pipeline,
+			min_read_operation_probability=settings.min_read_operation_probability if settings.jev is not None else None,
 			model_profile=settings.profile,
 			browser_mode='attached_chrome' if chrome is not None else 'isolated',
 			text_model=settings.evaluation.model,
@@ -295,14 +302,26 @@ class BrowserUseRun:
 	def snapshot(self) -> dict[str, Any]:
 		executor = getattr(self._native, '_jev', None)
 		roles = executor.usage_by_role() if executor is not None else {}
-		disabled = roles.get('system1', {}).get('vision_disabled')
+		system1_usage = roles.get('system1', {})
+		disabled = system1_usage.get('vision_disabled')
 		runs = executor.runs if executor is not None else []
 		reviews = [run for run in runs if run.review_delegation]
 		return redact_secrets(
 			{
 				**self._state,
-				**({'jev_usage_by_role': roles} if roles else {}),
+				**(
+					{
+						'jev_usage_by_role': roles,
+						'replans': executor.redelegations,
+						'research': {'pages': [record.model_dump() for record in executor.captures.records]},
+					}
+					if executor is not None
+					else {}
+				),
 				'vision_disabled': disabled['status'] if disabled else None,
+				'escalations': system1_usage.get('escalations', 0),
+				'escalations_executed': system1_usage.get('escalations_executed', 0),
+				'escalations_by_reason': system1_usage.get('escalations_by_reason', {}),
 				'planner_screenshot_requests': sum(run.screenshot_declared is True for run in runs),
 				'review_delegations': len(reviews),
 				'screenshot_decisions_missing': (
@@ -342,6 +361,7 @@ class BrowserUseRun:
 	async def _start(self, url: str, settings: RunSettings):
 		self._check_cancelled()
 		from browser_use import Agent, BrowserSession, ChatDeepSeek, Tools
+		from browser_use.llm.exceptions import ModelOutputFormatError
 
 		self._check_cancelled()
 		if self._chrome is not None:
@@ -378,7 +398,13 @@ class BrowserUseRun:
 			role = self._model_role.get()
 			kind = role or PROVIDER
 			with self.model_call(kind, model=execution.model, request=request, **({'role': role} if role else {})) as record:
-				reply = await original(messages, output_format=output_format, **kwargs)
+				try:
+					reply = await original(messages, output_format=output_format, **kwargs)
+				except ModelOutputFormatError as error:
+					record['parse_failures'] = [error.trace_record(role=role or 'planner', model=execution.model)]
+					if error.usage is not None:
+						record['response'] = {'usage': error.usage.model_dump(mode='json', exclude_none=True)}
+					raise
 				record['response'] = reply.model_dump(mode='json', exclude_none=True)
 				return reply
 
@@ -395,6 +421,9 @@ class BrowserUseRun:
 			jev_config['jev'] = JevSettings(
 				mode=settings.execution_mode,
 				screenshot_policy=settings.screenshot_policy,
+				vision_escalation=settings.vision_escalation is not False,
+				candidate_pipeline=settings.candidate_pipeline,
+				min_read_operation_probability=settings.min_read_operation_probability,
 				jev_base_url=settings.jev.base_url,
 				jev_model=settings.jev.model,
 				jev_api_key=settings.jev.api_key,
@@ -455,6 +484,12 @@ class BrowserUseRun:
 				path.parent.mkdir(exist_ok=True)
 				path.write_bytes(base64.b64decode(images['page-screenshot'], validate=True))
 				image_files['page-screenshot'] = name
+			trigger = executor.current_vision_trigger if images else None
+			escalated_from = None
+			if trigger and trigger.startswith('escalation:') and self._prediction_text_call is not None:
+				first = self._prediction_text_call
+				first.update(outcome='escalated', escalation_from=trigger.removeprefix('escalation:'))
+				escalated_from = first['id']
 			with self.model_call(
 				'jev',
 				role='system1',
@@ -464,8 +499,11 @@ class BrowserUseRun:
 				request_images=image_files,
 				request_format='multipart/form-data' if images else 'application/json',
 				vision=bool(images),
-				vision_trigger=executor.current_vision_trigger if images else None,
+				vision_trigger=trigger,
+				**({'escalated_from_call_id': escalated_from} if escalated_from is not None else {}),
 			) as record:
+				if not images:
+					self._prediction_text_call = record
 				try:
 					reply = await ask(state, questions, images=images)
 				except BaseException as error:
@@ -526,7 +564,7 @@ class BrowserUseRun:
 			elapsed = round((time.monotonic() - self._record_started) * 1000)
 			(self._record_dir / f'{elapsed:06d}.jpg').write_bytes(base64.b64decode(image, validate=True))
 
-	async def _predict(self):
+	async def _predict(self, *, retry_timeout: bool = True):
 		from browser_use.agent.views import AgentStepInfo
 
 		agent = self._native
@@ -544,7 +582,16 @@ class BrowserUseRun:
 		document['url'] = summary.url
 		self._summary = summary
 		agent.state.last_model_output = agent.state.last_result = None
-		await agent._get_next_action(summary)
+		# Only a text call from this prediction can be the first half of an image retry.
+		self._prediction_text_call = None
+		try:
+			await agent._get_next_action(summary)
+		except TimeoutError:
+			if not retry_timeout or agent._jev is None:
+				raise
+			# No action has been dispatched. Reobserve before the single prediction retry.
+			self._emit('prediction_retry', reason='model_timeout')
+			return await self._predict(retry_timeout=False)
 		model_output = agent.state.last_model_output
 		if model_output is None:
 			raise RuntimeError('Browser Use did not return a decision')
@@ -611,9 +658,14 @@ class BrowserUseRun:
 		if self._state['decision_rounds'] >= MAX_STEPS:
 			raise RunCancelled('timeout')
 		calls_before = len(self._state['model_calls'])
-		raw, operation, target, guard, document, stable = self._bridge.run(
-			self._predict(), cancel=self._should_cancel, timeout=150
-		)
+		try:
+			raw, operation, target, guard, document, stable = self._bridge.run(
+				self._predict(), cancel=self._should_cancel, timeout=150
+			)
+		except TimeoutError as error:
+			if str(error):
+				raise
+			raise TimeoutError('Browser Use prediction timed out before dispatch') from error
 		executor = getattr(self._native, '_jev', None)
 		source = executor.step_source() if executor is not None else 'llm'
 		role = 'system1' if source == 'system1' else 'planner'
@@ -743,6 +795,19 @@ class BrowserUseRun:
 			if self._chrome is None:
 				self._bridge.close()
 			self._temp.cleanup()
+
+	def record_timeout_evidence(self):
+		"""Expose captured material without assigning a successful result to an unfinished run."""
+		executor = getattr(self._native, '_jev', None)
+		captures = executor.captures.records if executor is not None else []
+		lines = ['# 任务超时后的部分证据', '', '下列内容是在中断前保存的页面材料。剩余条件和最终结果尚未确认。']
+		for page in captures[-8:]:
+			lines.extend(['', f'## {page.title or "已保存页面"}', '', page.url, '', page.summary or page.text[:1500]])
+		if page := self._state.get('page'):
+			if page.get('text'):
+				lines.extend(['', '## 最后一次网页采样', '', page['url'], '', page['text'][:1500]])
+		self._state['partial_result'] = {'markdown': '\n'.join(lines)}
+		self._emit('partial_result')
 
 	def finish_execution(self):
 		"""Flush Jev's last action outcome and role totals while the test page is still observable."""

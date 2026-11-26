@@ -144,6 +144,8 @@ def command(name, body):
 				body.get('execution_mode'),
 				screenshot_mode=body.get('screenshot_mode', False),
 				screenshot_policy=body.get('screenshot_policy'),
+				vision_escalation=body.get('vision_escalation'),
+				candidate_pipeline=body.get('candidate_pipeline'),
 				model_profile=body.get('model_profile'),
 				before_start=close_browser,
 			)
@@ -165,7 +167,17 @@ def command(name, body):
 	FREE_PAUSE.clear()
 	if name == 'reset':
 		scenario = body.get('scenario', 'flights')
-		if scenario not in {'travel', 'research', 'flights', 'custom'}:
+		if scenario not in {
+			'travel',
+			'research',
+			'flights',
+			'custom',
+			'visual-cards',
+			'visual-icons',
+			'visual-cards-plain',
+			'scroll-panel',
+			'dense',
+		}:
 			raise ValueError('Unknown demo scenario')
 		goal = body.get('goal', '').strip()
 		if not goal or len(goal) > 2000:
@@ -200,6 +212,8 @@ def command(name, body):
 			body.get('execution_mode'),
 			body.get('screenshot_mode', False),
 			screenshot_policy=body.get('screenshot_policy'),
+			vision_escalation=body.get('vision_escalation'),
+			candidate_pipeline=body.get('candidate_pipeline'),
 			model_profile=body.get('model_profile'),
 		)
 		if CHROME is not None:

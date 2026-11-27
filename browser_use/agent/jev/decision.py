@@ -263,7 +263,7 @@ def build_questions(
 	context = [f'Current objective: {params.objective}', f'Completion: {params.completion}']
 	if params.text_mode == 'append':
 		context.append('Append only the requested new text to the current field.')
-	elif params.text_mode == 'auto' and 'TYPE_TEXT' in offered:
+	elif params.text_mode == 'auto' and any(target.rich_text for target in selected_targets.get('TYPE_TEXT', [])):
 		context.append('Auto appends only new text in rich-text editors and replaces values in ordinary fields.')
 	if params.inputs:
 		context.append(f'Inputs: {params.inputs}')

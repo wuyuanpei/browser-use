@@ -265,6 +265,8 @@ async def test_jev_applies_rich_text_mode(jev_browser, httpserver, tmp_path, mod
 
 	await agent.run(max_steps=5, on_step_end=inspect)
 	assert not fake.errors
+	if mode is None:
+		assert 'Auto appends only new text' in fake.requests[0]['questions']['operation']['instructions']
 	assert proof[0] == [
 		expected,
 		3 if preserves_content else 0,

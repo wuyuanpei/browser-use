@@ -12,16 +12,12 @@ from browser_use.tokens.service import TokenCost
 from tests.ci.conftest import create_mock_llm
 
 
-def test_escalations_are_independent_of_request_counts(tmp_path):
+def test_image_and_text_requests_are_counted_independently(tmp_path):
 	ledger = UsageLedger(TokenCost(include_cost=False), JevTrace(tmp_path / 'trace.jsonl', 'test'))
-	for reason in ('low_confidence', 'no_effect', 'low_confidence'):
-		ledger.record_escalation(reason)
-	ledger.escalations_executed += 1
 	ledger.record_jev(None, 1, vision=True)
 	ledger.record_jev(None, 1)
 	row = ledger.summary()['system1']
-	assert (row['escalations'], row['escalations_executed'], row['vision_requests'], row['text_requests']) == (3, 1, 1, 1)
-	assert row['escalations_by_reason'] == {'low_confidence': 2, 'no_effect': 1}
+	assert (row['vision_requests'], row['text_requests']) == (1, 1)
 
 
 async def test_shared_model_retry_and_missing_usage(tmp_path):

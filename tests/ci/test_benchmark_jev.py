@@ -3,6 +3,7 @@
 import asyncio
 import csv
 import json
+import logging
 import threading
 import time
 from contextlib import contextmanager
@@ -91,7 +92,13 @@ def test_workbench_explains_prediction_deadline_before_dispatch(monkeypatch):
 	assert run._state['decision_rounds'] == 0
 
 
-def test_modes_and_model_profiles_are_independent(monkeypatch, tmp_path: Path):
+@pytest.fixture
+def vision_warnings(caplog, monkeypatch):
+	monkeypatch.setattr(logging.getLogger('browser_use'), 'propagate', True)
+	return caplog
+
+
+def test_modes_and_model_profiles_are_independent(monkeypatch, tmp_path: Path, vision_warnings):
 	for name in ('TYPESAFE_API_KEY', 'REPORT_TEXT_MODEL', 'REPORT_TEXT_MODEL_BASE_URL', 'REPORT_TEXT_MODEL_REASONING'):
 		monkeypatch.delenv(name, raising=False)
 	monkeypatch.setenv('PLANNER_API_KEY', 'mock-plan-key')
@@ -109,10 +116,8 @@ def test_modes_and_model_profiles_are_independent(monkeypatch, tmp_path: Path):
 	path.write_text('TYPESAFE_API_KEY=mock-local-key\nUNRELATED_CONFIG=ignored\n', encoding='utf-8')
 	load_profile_environment(path)
 	for mode in ('isolated', 'collaborative'):
-		assert runtime_settings('jev', mode, screenshot_policy='always', vision_escalation=True).vision_escalation is None
-		assert runtime_settings('jev', mode, screenshot_policy='off', vision_escalation=False).vision_escalation is None
-		assert runtime_settings('jev', mode, screenshot_policy='smart').vision_escalation is True
-		assert runtime_settings('jev', mode, screenshot_policy='smart', vision_escalation=False).vision_escalation is False
+		for policy in ('off', 'always', 'smart'):
+			assert runtime_settings('jev', mode, screenshot_policy=policy).screenshot_policy == policy
 		for profile in ('debug', 'final_report'):
 			settings = runtime_settings('jev', mode, model_profile=profile)
 			assert settings.execution_mode == mode and settings.profile == profile
@@ -121,21 +126,27 @@ def test_modes_and_model_profiles_are_independent(monkeypatch, tmp_path: Path):
 			public = json.dumps(settings.model_dump())
 			assert all(key not in public for key in ('mock-local-key', 'mock-plan-key', 'mock-eval-key', 'mock-report-key'))
 	assert runtime_settings().system1_config()['provider'] == 'browser_use'
+	settings = runtime_settings('jev', 'isolated', screenshot_policy='smart', vision_escalation=True)
+	config = {name: getattr(settings, name) for name in RunSettings.model_fields}
+	assert RunSettings.model_validate({**config, 'vision_escalation': None}) == settings
+	assert 'vision_escalation' not in settings.model_dump()
+	assert vision_warnings.messages.count('Ignoring removed vision_escalation setting.') == 2
 
 
-def test_baseline_archives_jev_policy_frames_and_report_column(tmp_path, monkeypatch):
+def test_baseline_archives_jev_policy_frames_and_report_column(tmp_path, monkeypatch, vision_warnings):
 	for name in ('PLANNER_API_KEY', 'TEXT_MODEL_API_KEY', 'TYPESAFE_API_KEY'):
 		monkeypatch.setenv(name, 'mock-benchmark-key')
 	manager = BaselineManager(tmp_path, 'http://127.0.0.1:8824')
 	monkeypatch.setattr(manager, 'work', lambda *_: None)
-	manager.start([manager.tasks[0]['id']], 1, 'jev', 'isolated', screenshot_policy='always')
+	manager.start([manager.tasks[0]['id']], 1, 'jev', 'isolated', screenshot_policy='always', vision_escalation=True)
+	assert vision_warnings.messages.count('Ignoring removed vision_escalation setting.') == 1
 	batch = manager.batch
 	assert batch and batch['screenshot_policy'] == 'always' and batch['screenshot_mode']
 	run_id = batch['id']
 	folder = manager.folder(run_id)
 	manifest = json.loads((folder / 'manifest.json').read_text(encoding='utf-8'))
 	assert manifest['screenshot_policy'] == 'always' and manifest['jev_model'] == batch['system1']['model']
-	assert manifest['vision_escalation'] is None
+	assert 'vision_escalation' not in manifest
 	row = batch['attempts'][0]
 	assert row['screenshot_policy'] == 'always' and row['jev_model'] == manifest['jev_model']
 	assert row['vision_disabled'] is None
@@ -155,7 +166,39 @@ def test_baseline_archives_jev_policy_frames_and_report_column(tmp_path, monkeyp
 		manager.frame(run_id, row['id'], 'system1_images/../trace.json')
 
 
-def test_server_accepts_visual_presets_and_freezes_escalation_for_reset_and_batch(tmp_path, monkeypatch):
+def test_workbench_reads_legacy_screenshot_counts_without_optional_fields(tmp_path, monkeypatch):
+	for name in ('PLANNER_API_KEY', 'TEXT_MODEL_API_KEY', 'TYPESAFE_API_KEY'):
+		monkeypatch.setenv(name, 'mock-benchmark-key')
+	manager = BaselineManager(tmp_path, 'http://127.0.0.1:8824')
+	monkeypatch.setattr(manager, 'work', lambda *_: None)
+	batch = manager.start([manager.tasks[0]['id']], 1, 'jev', 'isolated', screenshot_policy='smart')['batch']
+	run_id = batch['id']
+	folder = manager.folder(run_id)
+	archive = folder / 'summary.json'
+	legacy = json.loads(archive.read_bytes())
+	legacy['vision_escalation'] = True
+	row = legacy['attempts'][0]
+	row.update(vision_escalation=True, escalations=2, escalations_by_reason={'no_effect': 2})
+	archive.write_text(json.dumps(legacy), encoding='utf-8')
+	before = archive.read_bytes()
+	manager.batch = None
+
+	read = manager.read_run(run_id)
+	assert read['escalations'] == 2 and read['escalations_by_reason'] == {'no_effect': 2}
+	snapshot = manager.read_attempt(run_id, row['id'])
+	assert snapshot['vision_escalation'] is True
+	assert 'escalations_executed' not in snapshot['baseline_attempt']
+	assert archive.read_bytes() == before
+
+	manager.write_summary(read)
+	with (folder / 'summary.csv').open(encoding='utf-8-sig', newline='') as stream:
+		archived = next(csv.DictReader(stream))
+	assert archived['escalations'] == '2' and archived['escalations_by_reason'] == 'no_effect:2'
+	report = (folder / 'report.zh.md').read_text(encoding='utf-8')
+	assert '运行时升级' in report and '| 2 | — | no_effect:2 |' in report
+
+
+def test_server_accepts_visual_presets_and_ignores_legacy_vision_setting(tmp_path, monkeypatch, vision_warnings):
 	from browser_use.benchmark import server
 
 	for name in ('PLANNER_API_KEY', 'TEXT_MODEL_API_KEY', 'TYPESAFE_API_KEY'):
@@ -168,7 +211,8 @@ def test_server_accepts_visual_presets_and_freezes_escalation_for_reset_and_batc
 	opened = []
 
 	def open_run(url, goal, settings, **kwargs):
-		opened.append((url, settings.vision_escalation))
+		assert 'vision_escalation' not in settings.model_dump()
+		opened.append((url, settings.screenshot_policy))
 		return SimpleNamespace(snapshot=lambda: {}, close=lambda: None)
 
 	monkeypatch.setattr(server, 'BrowserUseRun', open_run)
@@ -186,7 +230,7 @@ def test_server_accepts_visual_presets_and_freezes_escalation_for_reset_and_batc
 			},
 		)
 	assert opened == [
-		(server.ORIGIN + '/fixture.html?scenario=' + scene, False)
+		(server.ORIGIN + '/fixture.html?scenario=' + scene, 'smart')
 		for scene in ('visual-cards', 'visual-icons', 'visual-cards-plain', 'scroll-panel', 'dense')
 	]
 	batch = server.command(
@@ -194,8 +238,9 @@ def test_server_accepts_visual_presets_and_freezes_escalation_for_reset_and_batc
 		{'task_ids': preset_ids, 'execution_mode': 'isolated', 'screenshot_policy': 'smart', 'vision_escalation': False},
 	)['batch']
 	manifest = json.loads((manager.folder(batch['id']) / 'manifest.json').read_bytes())
-	assert manager._settings is not None and manager._settings.vision_escalation is False
-	assert batch['vision_escalation'] is False and manifest['vision_escalation'] is False
+	assert manager._settings is not None and manager._settings.screenshot_policy == 'smart'
+	assert all('vision_escalation' not in record for record in (manifest, batch, *batch['attempts']))
+	assert vision_warnings.messages.count('Ignoring removed vision_escalation setting.') == len(preset_ids) + 1
 	assert manifest['suite_version'] == '2026-11-26.1'
 
 
@@ -256,7 +301,7 @@ def _save_work_fixture(
 	policy,
 	*,
 	image_error=None,
-	vision_escalation=None,
+	initial_screenshot=False,
 	planner_parse_failures=0,
 	hold_planner_retry=None,
 	omit_first_parse_usage=False,
@@ -277,7 +322,10 @@ def _save_work_fixture(
 	httpserver.expect_request('/save', method='POST').respond_with_handler(save)
 	declarations = iter(
 		(
-			{'screenshot_required': False, 'screenshot_reason': 'The Save label is enough.'},
+			{
+				'screenshot_required': initial_screenshot,
+				'screenshot_reason': _VISUAL_REASON if initial_screenshot else 'The Save label is enough.',
+			},
 			{},
 			{'screenshot_required': True, 'screenshot_reason': _VISUAL_REASON},
 		)
@@ -423,7 +471,6 @@ def _save_work_fixture(
 		profile='debug',
 		execution_mode='isolated',
 		screenshot_policy=policy,
-		vision_escalation=vision_escalation,
 		execution=ExecutionModel(**endpoint, timeout=10, max_tokens=500),
 		evaluation=EvaluationModel(**endpoint, reasoning={}),
 		jev=ModelEndpoint(model='local-jev', base_url=httpserver_ipv4.url_for('/').rstrip('/'), api_key='dummy-jev-key'),
@@ -546,7 +593,6 @@ def _run_save_batch(httpserver, tmp_path, monkeypatch, settings):
 		'jev',
 		'isolated',
 		screenshot_policy=settings.screenshot_policy,
-		vision_escalation=settings.vision_escalation,
 	)
 	assert manager.thread is not None
 	manager.thread.join(timeout=90)
@@ -576,7 +622,6 @@ def _open_inspector(manager, settings, tmp_path, monkeypatch):
 						'execution_mode': 'direct',
 						'jev': None,
 						'screenshot_policy': 'off',
-						'vision_escalation': None,
 						'user_data_dir': str(tmp_path / 'inspector-profile'),
 					}
 				),
@@ -633,13 +678,10 @@ def test_baseline_recovers_after_jev_rejects_image(httpserver, httpserver_ipv4, 
 
 
 def test_smart_batch_counts_reviews_and_displays_planner_declarations(httpserver, httpserver_ipv4, tmp_path, monkeypatch):
-	settings, saved, requests = _save_work_fixture(
-		httpserver, httpserver_ipv4, tmp_path, monkeypatch, 'smart', vision_escalation=False
-	)
+	settings, saved, requests = _save_work_fixture(httpserver, httpserver_ipv4, tmp_path, monkeypatch, 'smart')
 	manager, batch, running_status = _run_save_batch(httpserver, tmp_path, monkeypatch, settings)
 	row = batch['attempts'][0]
 	assert row['status'] == 'passed' and saved == [True]
-	assert row['vision_escalation'] is False and batch['vision_escalation'] is False
 	assert running_status == [(False, None), (False, None), (True, None), (True, None)]
 	assert [bool(image) for _, image in requests] == [False, False, True, True]
 	snapshot = manager.read_attempt(batch['id'], row['id'])
@@ -678,9 +720,9 @@ def test_workbench_auth_failure_is_not_an_image_rejection(httpserver, httpserver
 	assert len(requests) == 1 and requests[0][1]
 
 
-def test_escalation_and_recovered_parse_error_in_workbench(httpserver, httpserver_ipv4, tmp_path, monkeypatch):
+def test_workbench_recovers_planner_parse_error_with_l1(httpserver, httpserver_ipv4, tmp_path, monkeypatch):
 	settings, saved, requests = _save_work_fixture(
-		httpserver, httpserver_ipv4, tmp_path, monkeypatch, 'smart', planner_parse_failures=1
+		httpserver, httpserver_ipv4, tmp_path, monkeypatch, 'smart', planner_parse_failures=1, initial_screenshot=True
 	)
 	manager, batch, _ = _run_save_batch(httpserver, tmp_path, monkeypatch, settings)
 	row = batch['attempts'][0]
@@ -688,19 +730,13 @@ def test_escalation_and_recovered_parse_error_in_workbench(httpserver, httpserve
 	snapshot = manager.read_attempt(batch['id'], row['id'])
 	folder = manager.folder(batch['id'])
 	manifest = json.loads((folder / 'manifest.json').read_bytes())
-	assert all(level['vision_escalation'] is True for level in (manifest, batch, row, snapshot))
-	reason = 'unable_probability'
-	for level in (batch, row, snapshot):
-		assert level['escalations'] == level['escalations_executed'] == 1
-		assert level['escalations_by_reason'] == {reason: 1}
-	assert [bool(image) for _, image in requests] == [False, True, True]
+	legacy_fields = {'vision_escalation', 'escalations', 'escalations_executed', 'escalations_by_reason'}
+	assert all(legacy_fields.isdisjoint(level) for level in (manifest, batch, row, snapshot))
+	assert [bool(image) for _, image in requests] == [True, True]
 	calls = snapshot['model_calls']
-	text, image, sticky = [call for call in calls if call['kind'] == 'jev']
-	assert text['outcome'] == 'escalated' and text['escalation_from'] == reason
-	assert image['escalated_from_call_id'] == text['id'] and image['bu_step'] == text['bu_step']
-	assert image['observation_index'] == text['observation_index']
-	assert image['vision_trigger'] == sticky['vision_trigger'] == f'escalation:{reason}'
-	assert 'escalated_from_call_id' not in sticky
+	image, done = [call for call in calls if call['kind'] == 'jev']
+	assert image['vision_trigger'] == done['vision_trigger'] == 'planner'
+	assert all({'escalated_from_call_id', 'escalation_from'}.isdisjoint(call) for call in (image, done))
 	assert image['response']['answers']['operation']['choice'] == 'CLICK'
 	assert snapshot['history'][-1]['model_call_id'] == image['id']
 	first, corrected, finish = [c for c in calls if c['kind'] == 'planner']
@@ -712,24 +748,23 @@ def test_escalation_and_recovered_parse_error_in_workbench(httpserver, httpserve
 	assert [call['response']['usage']['prompt_tokens'] for call in (first, corrected, finish)] == [12, 12, 12]
 	assert snapshot['token_usage']['planner_input_tokens'] == snapshot['jev_usage_by_role']['planner']['prompt_tokens'] == 36
 	events = [json.loads(line) for line in Path(snapshot['jev_trace_path']).read_text(encoding='utf-8').splitlines()]
+	assert not any(event['event'] == 'vision_escalation' or 'vision_escalation' in event for event in events)
 	(logged,) = [event for event in events if event['event'] == 'llm_output_parse_error']
 	assert all(logged[key] == value for key, value in failure.items())
 	with (folder / 'summary.csv').open(encoding='utf-8-sig', newline='') as stream:
 		archived = next(csv.DictReader(stream))
-	assert archived['escalations_by_reason'] == f'{reason}:1'
-	assert archived['escalations'] == archived['escalations_executed'] == '1'
-	assert f'| 1 | 1 | {reason}:1 |' in (folder / 'report.zh.md').read_text(encoding='utf-8')
+	assert legacy_fields.isdisjoint(archived)
+	assert '运行时升级' not in (folder / 'report.zh.md').read_text(encoding='utf-8')
 	with _open_inspector(manager, settings, tmp_path, monkeypatch) as evaluate:
-		use_vision = "document.querySelector('#vision-escalation')"
-		assert evaluate(use_vision + '.checked && ' + use_vision + '.disabled')
+		assert evaluate("document.querySelector('#vision-escalation') === null")
 		evaluate(
 			"const mode=document.querySelector('#execution-mode'); mode.value='isolated'; mode.dispatchEvent(new Event('change')); document.querySelector('#screenshot-smart').click()"
 		)
-		assert evaluate('!' + use_vision + '.disabled')
+		assert evaluate("document.querySelector('#screenshot-smart').getAttribute('aria-pressed')") == 'true'
 		kinds = evaluate("[...document.querySelectorAll('#history .trace-kind')].map(e => e.textContent)")
-		assert kinds.count('Jev（文本→升级）') == 1 and kinds.count('Jev（截图·升级）') == 2
+		assert [kind for kind in kinds if kind.startswith('Jev')] == ['Jev（截图·Planner）', 'Jev（截图·Planner）']
 		notes = evaluate("[...document.querySelectorAll('#history .trace-note')].map(e => e.textContent)")
-		assert notes.count(f'升级原因：{reason}') == 3 and '解析失败 1 次，已重试' in notes
+		assert notes == ['解析失败 1 次，已重试']
 		evaluate(f'document.querySelector(\'[data-call-id="{first["id"]}"]\').click()')
 		assert json.loads(evaluate("document.querySelector('#model-output').textContent"))['parse_failures'] == [failure]
 

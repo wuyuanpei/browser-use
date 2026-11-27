@@ -1,6 +1,8 @@
 """Public Jev configuration and shared decision, observation, and execution records."""
 
 import json
+import logging
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Annotated, Any, Literal, Self
 from urllib.parse import urlsplit
@@ -8,6 +10,8 @@ from urllib.parse import urlsplit
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, field_validator, model_validator
 
 from browser_use.llm.base import BaseChatModel
+
+logger = logging.getLogger(__name__)
 
 PAGE_TEXT_LIMIT = 6_000
 VISIBLE_TEXT_LIMIT = 50_000
@@ -65,6 +69,14 @@ def _parse_checks(value: Any) -> Any:
 	return {'default': value} if isinstance(value, str) else value
 
 
+def ignore_legacy_vision_escalation(data: Any) -> Any:
+	if isinstance(data, Mapping) and 'vision_escalation' in data:
+		logger.warning('Ignoring removed vision_escalation setting.')
+		data = dict(data)
+		data.pop('vision_escalation')
+	return data
+
+
 CandidatePipeline = Literal['pr5', 'extended']
 EffectiveCandidatePipeline = Literal['pr5', 'extended', 'pr5_with_regions']
 
@@ -86,7 +98,6 @@ class JevSettings(JevModel):
 	screenshot_policy: Literal['off', 'always', 'smart'] = 'off'
 	candidate_pipeline: CandidatePipeline | None = None
 	pruning_budget_ms: float = Field(default=300, ge=0, allow_inf_nan=False)
-	vision_escalation: bool = True
 	vision_max_side: int = Field(default=1600, ge=320, le=4096)
 	vision_jpeg_quality: int = Field(default=72, ge=30, le=95)
 	# LLM backend
@@ -121,6 +132,7 @@ class JevSettings(JevModel):
 	@model_validator(mode='before')
 	@classmethod
 	def _disabled_settings(cls, data: Any) -> Any:
+		data = ignore_legacy_vision_escalation(data)
 		if isinstance(data, dict) and data.get('mode') == 'off':
 			return {'mode': 'off'}
 		return data
@@ -336,9 +348,7 @@ class SubgoalRun(JevModel):
 	vision_decisions: int = 0
 	vision: bool = False
 	vision_at_start: bool = Field(default_factory=lambda data: data['vision'])
-	no_effect_escalated: bool = False
-	escalations: list[dict[str, Any]] = Field(default_factory=list)
-	vision_source: Literal['policy', 'planner', 'escalation'] | None = None
+	vision_source: Literal['policy', 'planner'] | None = None
 	vision_reason: str | None = None
 	review_delegation: bool = False
 	screenshot_declared: bool | None = None

@@ -222,7 +222,6 @@ class BrowserUseRun:
 			self._jev_dir = jev_artifact_dir or Path.cwd() / 'artifacts' / 'jev-runs' / uuid4().hex
 			self._jev_dir.mkdir(parents=True, exist_ok=True)
 		self._model_role: ContextVar[str | None] = ContextVar('benchmark_jev_model_role', default=None)
-		self._prediction_text_call: dict[str, Any] | None = None
 		config = settings.system1_config()
 		self._state: dict[str, Any] = dict(
 			goal=goal,
@@ -232,7 +231,6 @@ class BrowserUseRun:
 			execution_mode=settings.execution_mode,
 			screenshot_mode=settings.screenshot_policy == 'always',
 			screenshot_policy=settings.screenshot_policy,
-			vision_escalation=settings.vision_escalation,
 			candidate_pipeline=settings.effective_candidate_pipeline,
 			min_read_operation_probability=settings.min_read_operation_probability if settings.jev is not None else None,
 			model_profile=settings.profile,
@@ -319,9 +317,6 @@ class BrowserUseRun:
 					else {}
 				),
 				'vision_disabled': disabled['status'] if disabled else None,
-				'escalations': system1_usage.get('escalations', 0),
-				'escalations_executed': system1_usage.get('escalations_executed', 0),
-				'escalations_by_reason': system1_usage.get('escalations_by_reason', {}),
 				'planner_screenshot_requests': sum(run.screenshot_declared is True for run in runs),
 				'review_delegations': len(reviews),
 				'screenshot_decisions_missing': (
@@ -421,7 +416,6 @@ class BrowserUseRun:
 			jev_config['jev'] = JevSettings(
 				mode=settings.execution_mode,
 				screenshot_policy=settings.screenshot_policy,
-				vision_escalation=settings.vision_escalation is not False,
 				candidate_pipeline=settings.candidate_pipeline,
 				min_read_operation_probability=settings.min_read_operation_probability,
 				jev_base_url=settings.jev.base_url,
@@ -485,11 +479,6 @@ class BrowserUseRun:
 				path.write_bytes(base64.b64decode(images['page-screenshot'], validate=True))
 				image_files['page-screenshot'] = name
 			trigger = executor.current_vision_trigger if images else None
-			escalated_from = None
-			if trigger and trigger.startswith('escalation:') and self._prediction_text_call is not None:
-				first = self._prediction_text_call
-				first.update(outcome='escalated', escalation_from=trigger.removeprefix('escalation:'))
-				escalated_from = first['id']
 			with self.model_call(
 				'jev',
 				role='system1',
@@ -500,10 +489,7 @@ class BrowserUseRun:
 				request_format='multipart/form-data' if images else 'application/json',
 				vision=bool(images),
 				vision_trigger=trigger,
-				**({'escalated_from_call_id': escalated_from} if escalated_from is not None else {}),
 			) as record:
-				if not images:
-					self._prediction_text_call = record
 				try:
 					reply = await ask(state, questions, images=images)
 				except BaseException as error:
@@ -582,8 +568,6 @@ class BrowserUseRun:
 		document['url'] = summary.url
 		self._summary = summary
 		agent.state.last_model_output = agent.state.last_result = None
-		# Only a text call from this prediction can be the first half of an image retry.
-		self._prediction_text_call = None
 		try:
 			await agent._get_next_action(summary)
 		except TimeoutError:

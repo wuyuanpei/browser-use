@@ -7,11 +7,17 @@ from typing import Any, Literal
 from urllib.parse import urlsplit, urlunsplit
 
 from dotenv import dotenv_values
-from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, computed_field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, computed_field, model_validator
 
-from browser_use.agent.jev.views import CandidatePipeline, EffectiveCandidatePipeline, resolve_candidate_pipeline
+from browser_use.agent.jev.views import (
+	CandidatePipeline,
+	EffectiveCandidatePipeline,
+	ignore_legacy_vision_escalation,
+	resolve_candidate_pipeline,
+)
 
 PROVIDER = 'browser_use'
+_LEGACY_SETTING_UNSET = object()
 ExecutionMode = Literal['direct', 'isolated', 'collaborative']
 DEBUG_PROFILE = 'debug'
 FINAL_REPORT_PROFILE = 'final_report'
@@ -60,7 +66,6 @@ class RunSettings(BaseModel):
 	execution_mode: ExecutionMode = 'direct'
 	screenshot_policy: Literal['off', 'always', 'smart'] = 'off'
 	candidate_pipeline: CandidatePipeline | None = None
-	vision_escalation: bool | None = Field(default=None, validate_default=True)
 	min_read_operation_probability: float = Field(default=0.6, ge=0, le=1)
 	jev: ModelEndpoint | None = None
 	execution: ExecutionModel
@@ -68,12 +73,10 @@ class RunSettings(BaseModel):
 	headless: bool
 	user_data_dir: str | None
 
-	@field_validator('vision_escalation', mode='before')
+	@model_validator(mode='before')
 	@classmethod
-	def _smart_escalation(cls, value: Any, info: ValidationInfo) -> Any:
-		if info.data.get('screenshot_policy') != 'smart':
-			return None
-		return True if value is None else value
+	def _ignore_legacy_settings(cls, data: Any) -> Any:
+		return ignore_legacy_vision_escalation(data)
 
 	@computed_field
 	@property
@@ -179,10 +182,12 @@ def runtime_settings(
 	screenshot_mode=False,
 	*,
 	screenshot_policy=None,
-	vision_escalation=None,
+	vision_escalation=_LEGACY_SETTING_UNSET,
 	candidate_pipeline=None,
 	model_profile=None,
 ) -> RunSettings:
+	if vision_escalation is not _LEGACY_SETTING_UNSET:
+		ignore_legacy_vision_escalation({'vision_escalation': vision_escalation})
 	mode = 'direct' if mode is None else mode
 	if mode not in ('direct', 'isolated', 'collaborative'):
 		raise ValueError('execution_mode must be direct, isolated, or collaborative')
@@ -230,7 +235,6 @@ def runtime_settings(
 		execution_mode=mode,
 		screenshot_policy=policy,
 		candidate_pipeline=candidate_pipeline,
-		vision_escalation=vision_escalation,
 		jev=jev,
 		execution=ExecutionModel(
 			model=endpoint.model, base_url=endpoint.base_url, api_key=endpoint.api_key, timeout=timeout, max_tokens=max_tokens

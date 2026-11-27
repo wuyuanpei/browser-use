@@ -64,8 +64,6 @@ class UsageLedger:
 		self.cursor = len(token_cost.usage_history)
 		self.vision_requests = 0
 		self.vision_rejections = 0
-		self.escalations_by_reason: dict[str, int] = {}
-		self.escalations_executed = 0
 		self.vision_disabled: dict[str, int] | None = None
 		self.roles = {name: RoleUsage() for name in ('planner', 'system1', 'text', 'summary', 'answer', 'risk', 'other')}
 
@@ -188,18 +186,12 @@ class UsageLedger:
 		if self.vision_disabled is None:
 			self.vision_disabled = {'status': status, 'step': step}
 
-	def record_escalation(self, reason: str) -> None:
-		self.escalations_by_reason[reason] = self.escalations_by_reason.get(reason, 0) + 1
-
 	def summary(self) -> dict[str, dict]:
 		rows = {role: counters.model_dump() for role, counters in self.roles.items()}
 		rows['system1'].update(
 			vision_requests=self.vision_requests,
 			text_requests=self.roles['system1'].calls - self.vision_requests,
 			vision_rejections=self.vision_rejections,
-			escalations=sum(self.escalations_by_reason.values()),
-			escalations_executed=self.escalations_executed,
-			escalations_by_reason=self.escalations_by_reason.copy(),
 			vision_disabled=self.vision_disabled.copy() if self.vision_disabled else None,
 		)
 		# Native BU does not publish an entry or its latency when no usage is returned.

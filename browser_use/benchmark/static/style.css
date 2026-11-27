@@ -844,8 +844,6 @@ button.trace-row:focus-visible { outline: 2px solid #2f8a60; outline-offset: 1px
 .plan-goal-body { min-width: 0; }
 .screenshot-mode-control { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 13px; }
 .screenshot-mode-options { display: inline-flex; gap: 4px; }
-.vision-escalation-control { display: inline-flex; align-items: center; gap: 4px; margin-left: 6px; }
-.vision-escalation-control input { accent-color: var(--green); }
 .trace-note { font-size: 11px; overflow-wrap: anywhere; }
 .screenshot-mode-options button { padding: 7px 10px; font-size: 12px; }
 .screenshot-mode-options button[aria-pressed="true"] { background: #e7f3ea; border-color: #2f8a60; color: #216c49; }

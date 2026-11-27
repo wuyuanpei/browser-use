@@ -23,14 +23,23 @@ from urllib.parse import urlencode
 from .archive import atomic_json
 from .engine import MAX_STEPS, VIEWPORT, BrowserMode, BrowserUnavailable, BrowserUseRun, RunCancelled, RunEvent
 from .evaluation import attempt_status, build_context, evaluate_frozen, freeze_context, outcome_statistics
-from .models import DEBUG_PROFILE, FINAL_REPORT_PROFILE, PROVIDER, RunSettings, redact_secrets, runtime_settings
+from .models import (
+	_LEGACY_SETTING_UNSET,
+	DEBUG_PROFILE,
+	FINAL_REPORT_PROFILE,
+	PROVIDER,
+	RunSettings,
+	redact_secrets,
+	runtime_settings,
+)
 from .observation import indexed_elements
 from .tasks import VERSION, CaseProbe, EnvironmentBlocked, task_catalog
 from .token_usage import TOKEN_FIELDS, aggregate_token_usage, token_usage
 
 TERMINAL = {'completed', 'cancelled', 'error', 'interrupted'}
 SCREENSHOT_DECISION_COUNTS = ('planner_screenshot_requests', 'review_delegations', 'screenshot_decisions_missing')
-ESCALATION_COUNTS = ('escalations', 'escalations_executed')
+# Preserve the archived counters when reading or exporting older batches.
+_LEGACY_ESCALATION_COUNTS = ('escalations', 'escalations_executed')
 CONFIRMED_SUCCESS = json.loads(Path(__file__).with_name('baseline_success.json').read_text(encoding='utf-8'))
 
 
@@ -155,12 +164,16 @@ class BaselineManager:
 			except (OSError, ValueError, TypeError):
 				continue
 		batch['token_usage'] = aggregate_token_usage(batch['attempts'])
-		for count in (*SCREENSHOT_DECISION_COUNTS, *ESCALATION_COUNTS):
+		for count in SCREENSHOT_DECISION_COUNTS:
 			if all(count in row for row in batch['attempts']):
 				batch[count] = sum(row[count] for row in batch['attempts'])
-		if all('escalations_by_reason' in row for row in batch['attempts']):
+		attempts = batch['attempts']
+		for count in _LEGACY_ESCALATION_COUNTS:
+			if attempts and all(isinstance(row.get(count), int) for row in attempts):
+				batch[count] = sum(row[count] for row in attempts)
+		if attempts and all(isinstance(row.get('escalations_by_reason'), dict) for row in attempts):
 			reasons = Counter()
-			for row in batch['attempts']:
+			for row in attempts:
 				reasons.update(row['escalations_by_reason'])
 			batch['escalations_by_reason'] = dict(sorted(reasons.items()))
 		batch['task_token_usage'] = {
@@ -238,7 +251,8 @@ class BaselineManager:
 		snapshot.setdefault('screenshot_mode', row.get('screenshot_mode', False))
 		snapshot.setdefault('screenshot_policy', row.get('screenshot_policy', 'always' if snapshot['screenshot_mode'] else 'off'))
 		snapshot.setdefault('vision_disabled', row.get('vision_disabled'))
-		snapshot.setdefault('vision_escalation', row.get('vision_escalation'))
+		if 'vision_escalation' in row:
+			snapshot.setdefault('vision_escalation', row['vision_escalation'])
 		# 老归档只在返回对象中补默认值，不迁移或覆写原始文件。
 		snapshot.setdefault('execution_mode', row.get('execution_mode', 'direct'))
 		snapshot.setdefault('model_profile', row.get('model_profile', DEBUG_PROFILE))
@@ -304,7 +318,7 @@ class BaselineManager:
 		*,
 		screenshot_mode=False,
 		screenshot_policy=None,
-		vision_escalation=None,
+		vision_escalation=_LEGACY_SETTING_UNSET,
 		candidate_pipeline=None,
 		model_profile=None,
 		before_start=None,
@@ -315,9 +329,9 @@ class BaselineManager:
 			execution_mode,
 			screenshot_mode,
 			screenshot_policy=screenshot_policy,
-			vision_escalation=vision_escalation,
 			candidate_pipeline=candidate_pipeline,
 			model_profile=model_profile,
+			**({'vision_escalation': vision_escalation} if vision_escalation is not _LEGACY_SETTING_UNSET else {}),
 		)
 		config = settings.system1_config()
 		jev_model = settings.jev.model if settings.jev else None
@@ -364,8 +378,6 @@ class BaselineManager:
 					vision_requests=0,
 					vision_disabled=None,
 					**dict.fromkeys(SCREENSHOT_DECISION_COUNTS, 0),
-					**dict.fromkeys(ESCALATION_COUNTS, 0),
-					escalations_by_reason={},
 					decision_calls=0,
 					decision_rounds=0,
 					system1_provider=config['provider'],
@@ -374,7 +386,6 @@ class BaselineManager:
 					jev_model=jev_model,
 					screenshot_mode=settings.screenshot_policy == 'always',
 					screenshot_policy=settings.screenshot_policy,
-					vision_escalation=settings.vision_escalation,
 					candidate_pipeline=settings.effective_candidate_pipeline,
 					min_read_operation_probability=settings.min_read_operation_probability if settings.jev is not None else None,
 					model_profile=profile,
@@ -410,7 +421,6 @@ class BaselineManager:
 				jev_model=jev_model,
 				screenshot_mode=settings.screenshot_policy == 'always',
 				screenshot_policy=settings.screenshot_policy,
-				vision_escalation=settings.vision_escalation,
 				candidate_pipeline=settings.effective_candidate_pipeline,
 				min_read_operation_probability=settings.min_read_operation_probability if settings.jev is not None else None,
 				model_profile=profile,
@@ -446,7 +456,6 @@ class BaselineManager:
 				'jev_model': jev_model,
 				'screenshot_mode': batch['screenshot_mode'],
 				'screenshot_policy': settings.screenshot_policy,
-				'vision_escalation': settings.vision_escalation,
 				'candidate_pipeline': settings.effective_candidate_pipeline,
 				'candidate_pipeline_requested': settings.candidate_pipeline,
 				'min_read_operation_probability': batch['min_read_operation_probability'],
@@ -494,6 +503,11 @@ class BaselineManager:
 		batch['success_rate'] = batch['outcome_statistics']['success_rate']
 		self.add_token_usage(batch)
 		atomic_json(folder / 'summary.json', self.clean(batch))
+		legacy_escalation_fields = [
+			field
+			for field in (*_LEGACY_ESCALATION_COUNTS, 'escalations_by_reason')
+			if any(field in row for row in batch['attempts'])
+		]
 		fields = [
 			'task_id',
 			'repeat',
@@ -510,7 +524,7 @@ class BaselineManager:
 			'model_profile',
 			'text_model',
 			'screenshot_policy',
-			'vision_escalation',
+			*(['vision_escalation'] if any('vision_escalation' in row for row in batch['attempts']) else []),
 			'candidate_pipeline',
 			'min_read_operation_probability',
 			'screenshot_mode',
@@ -525,8 +539,7 @@ class BaselineManager:
 			'vision_requests',
 			'vision_disabled',
 			*SCREENSHOT_DECISION_COUNTS,
-			*ESCALATION_COUNTS,
-			'escalations_by_reason',
+			*legacy_escalation_fields,
 			'text_calls',
 			'planner_calls',
 			'replans',
@@ -549,7 +562,7 @@ class BaselineManager:
 				[
 					{
 						**row,
-						'escalations_by_reason': _reason_counts(row.get('escalations_by_reason', {})),
+						'escalations_by_reason': _reason_counts(row.get('escalations_by_reason') or {}),
 						'verdict': (row.get('evaluation') or {}).get('final', {}).get('verdict'),
 						'evaluation_reason': (row.get('evaluation') or {}).get('final', {}).get('reason'),
 						**{k: v for k, v in row.get('token_usage', {}).items() if k != 'complete'},
@@ -594,8 +607,12 @@ class BaselineManager:
 			'',
 			'| 任务 | 轮次 | 执行状态 / 评估状态 / 模型判决 | 动作 | '
 			'决策轮 / System1 / 文本 / Planner / 收集 / 总结 / 复核 '
-			'| 带图请求 | 拒图禁用（HTTP） | Planner 请求截图 | 复盘委托 | 复盘漏填 | 运行时升级 | 升级后执行 | 升级原因 | 交回后再委派 | 耗时(ms) |',
-			'|---|---:|---|---:|---:|---:|---|---:|---:|---:|---:|---:|---|---:|---:|',
+			'| 带图请求 | 拒图禁用（HTTP） | Planner 请求截图 | 复盘委托 | 复盘漏填 | '
+			+ ('运行时升级 | 升级后执行 | 升级原因 | ' if legacy_escalation_fields else '')
+			+ '交回后再委派 | 耗时(ms) |',
+			'|---|---:|---|---:|---:|---:|---|---:|---:|---:|'
+			+ ('---:|---:|---|' if legacy_escalation_fields else '')
+			+ '---:|---:|',
 		]
 		for row in batch['attempts']:
 			final = (row.get('evaluation') or {}).get('final', {})
@@ -612,9 +629,14 @@ class BaselineManager:
 				f'{row.get("summarize_calls", 0)} / {row.get("verify_calls", 0)} | '
 				f'{row.get("vision_requests", "—")} | {row.get("vision_disabled") or ""} | '
 				f'{row.get("planner_screenshot_requests", "—")} | {row.get("review_delegations", "—")} | '
-				f'{row.get("screenshot_decisions_missing", "—")} | {row.get("escalations", "—")} | '
-				f'{row.get("escalations_executed", "—")} | {_reason_counts(row.get("escalations_by_reason", {}))} | {row.get("replans", 0)} | '
-				f'{row["elapsed_ms"]} |'
+				f'{row.get("screenshot_decisions_missing", "—")} | '
+				+ (
+					f'{row.get("escalations", "—")} | {row.get("escalations_executed", "—")} | '
+					f'{_reason_counts(row.get("escalations_by_reason") or {})} | '
+					if legacy_escalation_fields
+					else ''
+				)
+				+ f'{row.get("replans", 0)} | {row["elapsed_ms"]} |'
 			)
 		report += [
 			'',
@@ -842,8 +864,6 @@ class BaselineManager:
 						vision_requests=roles['system1']['vision_requests'],
 						vision_disabled=snapshot.get('vision_disabled'),
 						**{count: snapshot[count] for count in SCREENSHOT_DECISION_COUNTS},
-						**{count: snapshot[count] for count in ESCALATION_COUNTS},
-						escalations_by_reason=snapshot['escalations_by_reason'],
 						decision_calls=roles['system1']['calls'],
 						planner_calls=roles['planner']['calls'],
 						replans=snapshot.get('replans', 0),

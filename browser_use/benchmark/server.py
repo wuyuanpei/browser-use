@@ -14,6 +14,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+from browser_use.agent.jev.views import ignore_legacy_vision_escalation
+
 from .baseline import BaselineConflict, BaselineManager
 from .chrome_attachment import ChromeAttachment
 from .engine import MAX_STEPS, BrowserUnavailable, BrowserUseRun, RunCancelled
@@ -116,6 +118,8 @@ def public_error(error):
 def command(name, body):
 	"""路由自由任务和基线命令，浏览器所有权不跨模式抢占。"""
 	global AGENT
+	if name in ('reset', 'baseline/start'):
+		body = ignore_legacy_vision_escalation(body)
 	if name in ('chrome/connect', 'chrome/disconnect'):
 		if CHROME is None:
 			raise ValueError('本机 Chrome 附着模式未配置。')
@@ -144,7 +148,6 @@ def command(name, body):
 				body.get('execution_mode'),
 				screenshot_mode=body.get('screenshot_mode', False),
 				screenshot_policy=body.get('screenshot_policy'),
-				vision_escalation=body.get('vision_escalation'),
 				candidate_pipeline=body.get('candidate_pipeline'),
 				model_profile=body.get('model_profile'),
 				before_start=close_browser,
@@ -212,7 +215,6 @@ def command(name, body):
 			body.get('execution_mode'),
 			body.get('screenshot_mode', False),
 			screenshot_policy=body.get('screenshot_policy'),
-			vision_escalation=body.get('vision_escalation'),
 			candidate_pipeline=body.get('candidate_pipeline'),
 			model_profile=body.get('model_profile'),
 		)

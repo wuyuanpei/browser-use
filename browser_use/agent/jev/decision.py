@@ -156,7 +156,7 @@ def build_state(
 	state['original_goal'] = task
 	params = run.params
 	subgoal: dict[str, Any] = {'id': run.id, 'objective': params.objective, 'completion': params.completion}
-	if vision is not None and run.vision_source in ('planner', 'escalation'):
+	if vision is not None and run.vision_source == 'planner':
 		subgoal['screenshot_guidance'] = {
 			'required': True,
 			'reason': (run.vision_reason or '').strip() or DEFAULT_SCREENSHOT_REASON,

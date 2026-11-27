@@ -23,8 +23,7 @@ System1 can receive the current viewport image. You never see it yourself.
   shows System1 chose wrong or ambiguous targets (same-named rows/cards, icon-only buttons), actions had no
   effect, it could not interpret the layout, overlays or visual-only state (selected tabs, toggles, highlights),
   or it stopped as uncertain while the needed target is plausibly on the page.
-- Keep screenshot_required=true when re-delegating a stage whose visual difficulty is not resolved,
-  including when the handback says System1 already switched to images.
+- Keep screenshot_required=true when re-delegating a stage whose visual difficulty is not resolved.
 - Do not request images for normal stages where text is enough, for an action budget that ended while progress
   was normal, or for access barriers (login, captcha, missing permission); images do not fix those.
 - Images never give System1 new targets or coordinates; they only help it choose among listed elements.
@@ -134,14 +133,6 @@ def render_handback(
 			else:
 				count += ' (text-only stage)'
 		lines.append(f'Screenshots: {count}.')
-		if screenshot_policy == 'smart' and run.escalations:
-			entries = '; '.join(f'{entry["reason"]} at step {entry["step"]} -> {entry["outcome"]}' for entry in run.escalations)
-			lines.append(f'System1 switched to images after: {entries}.')
-			last = run.escalations[-1]
-			if last['outcome'] == 'handed_back' and last['step'] == handback.step and last['reason'] != 'no_effect':
-				lines.append(
-					f'System1 retried with the viewport image after {last["reason"]}; it still stopped: {handback.reason}.'
-				)
 	discarded = sum(a.status == 'discarded' for a in run.actions)
 	if discarded:
 		lines.append(f'{discarded} decided action(s) were discarded before execution (pause or interruption); they did not run.')

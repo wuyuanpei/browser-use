@@ -49,7 +49,7 @@ function consumeModelProfile() {
 }
 const screenshotPolicy = record => record?.screenshot_policy || (record?.screenshot_mode ? 'always' : 'off');
 function screenshotSettings() {
-  return { screenshot_policy: screenshotChoice, vision_escalation: screenshotChoice === 'smart' ? $('vision-escalation').checked : null };
+  return { screenshot_policy: screenshotChoice };
 }
 const screenshotLabel = policy => ({ off: '始终关闭', always: '始终开启', smart: '智能截图' })[policy] || '始终关闭';
 const modeLabel = mode => ({ direct: 'BU 直接执行', isolated: 'Jev 隔离模式', collaborative: 'Jev 协作模式', planned: 'Planner 子任务' })[mode] || '直接执行';
@@ -277,9 +277,14 @@ function jevScreenshot(call) {
   return call?.kind === 'jev' && (call.vision || call.request_format === 'multipart/form-data'
     || Object.keys(call.request_images || {}).length > 0);
 }
+function archivedEscalationReason(call) {
+  // Older traces recorded the reason on the text call and in the screenshot trigger.
+  const prefix = 'escalation:';
+  return call.escalation_from || (call.vision_trigger?.startsWith(prefix) ? call.vision_trigger.slice(prefix.length) : '');
+}
 function jevCallLabel(call) {
   if (call.outcome === 'escalated') return 'Jev（文本→升级）';
-  if (call.vision_trigger?.startsWith('escalation:')) return call.vision_rejected ? 'Jev（截图·升级，被拒）' : 'Jev（截图·升级）';
+  if (archivedEscalationReason(call)) return call.vision_rejected ? 'Jev（截图·升级，被拒）' : 'Jev（截图·升级）';
   if (call.vision_rejected) return call.vision_trigger === 'planner' ? 'Jev（截图·Planner，被拒）' : 'Jev（截图，被拒）';
   if (!jevScreenshot(call)) return 'Jev';
   return call.vision_trigger === 'planner' ? 'Jev（截图·Planner）' : 'Jev（截图）';
@@ -298,7 +303,7 @@ function traceCard(call, index, active) {
   const decision = declaration ? `screenshot_required: ${declaration.screenshot_required ?? '未填'}` : '';
   const reason = declaration ? declaration.screenshot_reason?.trim() || '理由未填' : '';
   const detail = declaration ? `<span class="screenshot-declaration"><strong>${escape(decision)}</strong><span>${escape(reason)}</span></span>` : '';
-  const trigger = call.escalation_from || (call.vision_trigger?.startsWith('escalation:') ? call.vision_trigger.slice('escalation:'.length) : '');
+  const trigger = archivedEscalationReason(call);
   const failures = call.parse_failures || [];
   const parseNote = !failures.length ? '' : (failures.at(-1).planner_feedback_retry ?? failures.at(-1).retried) ? `解析失败 ${failures.length} 次，已重试` : '解析失败，已放弃';
   const note = trigger ? `升级原因：${trigger}` : parseNote;
@@ -382,7 +387,6 @@ function controls() {
     button.disabled = !configuring || !jevMode;
     button.setAttribute('aria-pressed', String(screenshotChoice === policy));
   }
-  $('vision-escalation').disabled = !configuring || !jevMode || screenshotChoice !== 'smart';
   const inspecting = selectedCallId !== null || selectedFrame !== null || (view === 'baseline' && (pinnedRun || pinnedAttempt));
   const running = view === 'free' ? live : state?.baseline_attempt?.execution_status === 'running';
   const disabledStatus = (inspecting || running) && !(configuring && editingRunSettings) ? state?.vision_disabled : null;
@@ -720,9 +724,10 @@ function selectBaselineGroup(group) {
 function screenshotDecisionCounts(record) {
   if (screenshotPolicy(record) !== 'smart' || !Number.isInteger(record.screenshot_decisions_missing)) return '';
   const planner = `Planner 请求截图 ${record.planner_screenshot_requests} · 复盘委托 ${record.review_delegations} · 复盘漏填 ${record.screenshot_decisions_missing}`;
+  // These counters are present only on archived batches and attempts.
   if (!Number.isInteger(record.escalations)) return planner;
   const reasons = Object.entries(record.escalations_by_reason || {}).map(([reason, count]) => `${reason}:${count}`).join(';');
-  return `${planner} · 运行时升级 ${record.escalations} · 升级后执行 ${record.escalations_executed}${reasons ? ' · '+reasons : ''}`;
+  return `${planner} · 运行时升级 ${record.escalations} · 升级后执行 ${record.escalations_executed ?? '—'}${reasons ? ' · '+reasons : ''}`;
 }
 function renderBaseline() {
   const batch = baseline.batch;
@@ -1219,7 +1224,6 @@ $('execution-mode').addEventListener('change', () => {
 for (const policy of ['off', 'always', 'smart']) {
   $(`screenshot-${policy}`).addEventListener('click', () => { editingRunSettings = true; screenshotChoice = policy; controls(); });
 }
-$('vision-escalation').addEventListener('change', () => { editingRunSettings = true; controls(); });
 fetch("/api/state")
   .then((r) => r.json())
   .then((s) => {

@@ -455,7 +455,6 @@ async def start_stage(
 	body=None,
 	requires=False,
 	screenshot_policy: Literal['off', 'always', 'smart'] = 'off',
-	vision_escalation=True,
 	min_read_operation_probability=0.6,
 	screenshot_fields=None,
 	save_conversation_path=None,
@@ -476,7 +475,6 @@ async def start_stage(
 		trace_path=tmp_path / 'trace.jsonl',
 		max_candidates=max_candidates,
 		screenshot_policy=screenshot_policy,
-		vision_escalation=vision_escalation,
 		min_read_operation_probability=min_read_operation_probability,
 		checks=checks or JevChecks(),
 	)
@@ -607,7 +605,7 @@ async def test_cancelled_region_wheels_still_trigger_no_effect(jev_browser, http
 		await close_driver(agent)
 
 
-async def test_page_scroll_after_root_locks_counts_no_effect_and_escalates(jev_browser, httpserver, tmp_path):
+async def test_page_scroll_after_root_locks_counts_no_effect_and_hands_back(jev_browser, httpserver, tmp_path):
 	fake = _VisionJev(httpserver, [{'operation': 'SCROLL_DOWN', 'target': 'the whole page'}] * 2 + [{'operation': 'STEP_DONE'}])
 	agent, executor, _ = await start_stage(
 		jev_browser,
@@ -641,12 +639,19 @@ async def test_page_scroll_after_root_locks_counts_no_effect_and_escalates(jev_b
 				await browser_eval(jev_browser, "document.documentElement.style.overflowY=''")
 
 		assert (await routed(agent)).model_output is None
-		assert run.no_effect_escalated and run.vision_source == 'escalation'
-		assert run.handback and run.handback.reason == 'step_done'
-		assert (
-			len(fake.requests) == 3
-			and fake.requests[-1]['state']['current_subgoal']['screenshot_guidance']['source'] == 'escalation'
+		assert run.handback and run.handback.reason == 'no_effect'
+		assert run.no_effect_streak == 2 and len(fake.requests) == 2
+		next_stage = DelegateSubgoalParamsSmart(
+			objective='Inspect the scrollable side panel',
+			completion='Panel content identified',
+			reason='Page scroll stopped',
+			screenshot_required=False,
+			screenshot_reason='The panel has a visible label.',
 		)
+		assert not (await executor.delegate(next_stage, jev_browser)).error
+		assert (await routed(agent)).model_output is None
+		assert len(fake.requests) == 3 and not fake.errors
+		assert all('assets' not in request for request in fake.requests)
 		for request, expected in zip(
 			fake.requests, ('Initial content', 'New viewport text 0', 'New viewport text 1'), strict=True
 		):
@@ -725,108 +730,18 @@ def image_requests(server):
 LOW_CLICK = {'operation': 'CLICK', 'target': 'Plain', 'p': 0.62, 'target_p': 0.68}
 
 
-@pytest.mark.parametrize(
-	('reason', 'first'),
-	[
-		('low_confidence', LOW_CLICK),
-		('unable_probability', {'operation': 'UNABLE'}),
-		('unable', {'operation': 'UNABLE'}),
-		('repeated_action', {'operation': 'CLICK', 'target': 'Plain'}),
-	],
-)
-async def test_runtime_image_retry_uses_same_observation(reason, first, jev_browser, httpserver, tmp_path, monkeypatch):
-	fake = _VisionJev(
-		httpserver, [first, {'operation': 'CLICK', 'target': 'Enable'}, {'operation': 'STEP_DONE'}, {'operation': 'STEP_DONE'}]
-	)
-	conversations = tmp_path / 'conversations'
+async def test_planner_image_request_uses_candidate_budget(jev_browser, httpserver, tmp_path, monkeypatch):
+	fake = _VisionJev(httpserver, [{'operation': 'CLICK', 'target': 'Enable'}])
+	fillers = ''.join(f'<button aria-label="{i} {"x" * 115}">Other</button>' for i in range(48))
+	body = "<button>Plain</button><button onclick=\"document.querySelector('output').value='Enabled'\">Enable</button>"
 	agent, executor, _ = await start_stage(
 		jev_browser,
 		httpserver,
 		tmp_path,
 		screenshot_policy='smart',
-		screenshot_fields={'screenshot_required': False, 'screenshot_reason': 'Labels should suffice.'},
-		checks=JevChecks(confidence='off') if reason == 'unable' else JevChecks(),
-		save_conversation_path=conversations,
-	)
-	try:
-		summary = await agent._prepare_context(AgentStepInfo(0, 10))
-		run = executor.runs[-1]
-		if reason == 'repeated_action':
-			obs = await service.state.observe(jev_browser, summary, executor.settings, executor.step)
-			button = next(c for c in obs.candidates['CLICK'] if c.name == 'Plain')
-			for n in (1, 2):
-				run.actions.append(
-					ActionRecord(
-						n=n,
-						step=1,
-						run_id=run.id,
-						operation='CLICK',
-						target_key=button.key,
-						bu_action={'click': {'index': button.index}},
-						fingerprint_before=obs.fingerprint,
-						url_before=obs.url,
-						status='executed_ok',
-					)
-				)
-		observe = AsyncMock(wraps=service.state.observe)
-		prepare = Mock(wraps=service.prepare_screenshot)
-		monkeypatch.setattr(service.state, 'observe', observe)
-		monkeypatch.setattr(service, 'prepare_screenshot', prepare)
-		assert (await routed(agent, summary=summary)).model_output is not None
-		assert observe.await_count == prepare.call_count == 1
-		assert await browser_eval(jev_browser, 'document.querySelector("output").textContent') == 'Enabled'
-		assert len(fake.requests) == 2 and not fake.errors
-		text_packet, image_packet = fake.requests
-		image_state = json.loads(json.dumps(image_packet['state']))
-		assert image_state['page'].pop('screenshot') in image_packet['assets']
-		assert image_state['page'].pop('viewport')
-		guidance = image_state['current_subgoal'].pop('screenshot_guidance')
-		assert guidance == {'required': True, 'source': 'escalation', 'reason': run.vision_reason}
-		assert image_state == text_packet['state'] and 'assets' not in text_packet
-		assert {k: list(q['criteria']) for k, q in text_packet['questions'].items()} == {
-			k: list(q['criteria']) for k, q in image_packet['questions'].items()
-		}
-		assert run.vision and not run.vision_at_start and run.screenshot_declared is False and run.vision_source == 'escalation'
-		assert run.decisions == run.vision_decisions == 1
-		assert run.escalations == [{'step': run.started_step, 'reason': reason, 'outcome': 'executed'}]
-		events = _events(tmp_path / 'trace.jsonl')
-		rows = [r for r in events if r['event'] == 'system1_decision']
-		assert [(r['outcome'], r['vision_trigger'], r['escalation_from'], r['planner_declared']) for r in rows] == [
-			('escalated', None, reason, False),
-			('execute', f'escalation:{reason}', reason, False),
-		]
-		assert next(r for r in events if r['event'] == 'run_config')['vision_escalation'] is True
-		assert len(list(conversations.glob('*_escalated.json'))) == 1
-		normal = [f for f in conversations.glob('system1_*.json') if not f.stem.endswith('_escalated')]
-		assert (
-			len(normal) == 1
-			and (conversations / json.loads(normal[0].read_text(encoding='utf-8'))['request_images']['page-screenshot']).is_file()
-		)
-		assert 'System1 switched to images after:' in str((await routed(agent)).context_messages[-1].content)
-		assert executor.usage_by_role()['system1']['escalations_executed'] == 1
-		assert not (
-			await executor.delegate(
-				DelegateSubgoalParams(objective='Next', completion='New stage', reason='Advance'), jev_browser
-			)
-		).error
-		await routed(agent)
-		assert [r['vision_trigger'] for r in _events(tmp_path / 'trace.jsonl') if r['event'] == 'system1_decision'] == [
-			None,
-			f'escalation:{reason}',
-			f'escalation:{reason}',
-			None,
-		]
-		assert not executor.runs[-1].vision and not executor.runs[-1].escalations
-	finally:
-		await close_driver(agent)
-
-
-async def test_image_retry_reuses_targets_after_request_size_halving(jev_browser, httpserver, tmp_path, monkeypatch):
-	fake = _VisionJev(httpserver, [LOW_CLICK, {'operation': 'CLICK', 'target': 'Enable'}])
-	fillers = ''.join(f'<button aria-label="{i} {"x" * 115}">Other</button>' for i in range(48))
-	body = "<button>Plain</button><button onclick=\"document.querySelector('output').value='Enabled'\">Enable</button>"
-	agent, executor, _ = await start_stage(
-		jev_browser, httpserver, tmp_path, screenshot_policy='smart', max_candidates=32, body=body + fillers + '<output></output>'
+		screenshot_fields={'screenshot_required': True, 'screenshot_reason': 'Check the targets from the viewport.'},
+		max_candidates=32,
+		body=body + fillers + '<output></output>',
 	)
 	try:
 		measured_sizes = []
@@ -845,15 +760,15 @@ async def test_image_retry_reuses_targets_after_request_size_halving(jev_browser
 		monkeypatch.setattr(service.decision, 'select_targets', select_targets)
 		assert (await routed(agent)).model_output is not None
 		assert await browser_eval(jev_browser, 'document.querySelector("output").value') == 'Enabled'
-		text, image = fake.requests
-		keys = list(text['questions']['click_target']['criteria'])
+		(image,) = fake.requests
+		assert 'assets' in image
+		keys = list(image['questions']['click_target']['criteria'])
 		assert 1 < len(keys) < executor.settings.max_candidates
-		assert list(image['questions']['click_target']['criteria']) == keys
 		limits = [call.args[-1] for call in select_targets.call_args_list]
 		assert limits == [32 >> i for i in range(len(limits))] and limits[-1] == len(keys)
-		full_text_size, limited_text_size, image_size = measured_sizes
+		full_size, limited_size = measured_sizes
 		assert limits == [32, 16]
-		assert max(limited_text_size, image_size) <= service.MAX_REQUEST_CHARS < full_text_size
+		assert limited_size <= service.MAX_REQUEST_CHARS < full_size
 		rows = [r for r in _events(tmp_path / 'trace.jsonl') if r['event'] == 'system1_decision']
 		for row, packet in zip(rows, fake.requests, strict=True):
 			assert row['request_chars'] == len(json.dumps(packet, ensure_ascii=False)) <= service.MAX_REQUEST_CHARS
@@ -863,42 +778,25 @@ async def test_image_retry_reuses_targets_after_request_size_halving(jev_browser
 		await close_driver(agent)
 
 
-async def test_failed_image_choice_uses_second_stop_and_logs_both_checks(jev_browser, httpserver, tmp_path):
-	fake = _VisionJev(httpserver, [LOW_CLICK, {'operation': 'UNABLE'}])
-	agent, executor, _ = await start_stage(jev_browser, httpserver, tmp_path, screenshot_policy='smart')
-	try:
-		out = await routed(agent)
-		run = executor.runs[-1]
-		assert len(fake.requests) == 2 and run.handback and run.handback.reason == 'unable_probability'
-		assert 'System1 retried with the viewport image after low_confidence; it still stopped: unable_probability.' in str(
-			out.context_messages[-1].content
-		)
-		assert run.escalations[-1]['outcome'] == 'handed_back' and not run.vision and executor.pending_record is None
-		assert [
-			r['request_vision'] for r in _events(tmp_path / 'trace.jsonl') if r['event'] == 'check' and r['name'] == 'confidence'
-		] == [False, True]
-	finally:
-		await close_driver(agent)
-
-
 @pytest.mark.parametrize(
-	('policy', 'enabled', 'declared', 'disabled', 'expected_vision'),
+	('policy', 'declared', 'disabled', 'expected_vision'),
 	[
-		('off', True, None, False, False),
-		('always', True, None, False, True),
-		('smart', False, False, False, False),
-		('smart', True, True, False, True),
-		('smart', True, False, True, False),
+		('off', None, False, False),
+		('always', None, False, True),
+		('smart', False, False, False),
+		('smart', True, False, True),
+		('smart', True, True, False),
 	],
 )
-async def test_image_retry_policy_gates(policy, enabled, declared, disabled, expected_vision, jev_browser, httpserver, tmp_path):
+async def test_low_confidence_request_uses_only_policy_image(
+	policy, declared, disabled, expected_vision, jev_browser, httpserver, tmp_path
+):
 	fake = _VisionJev(httpserver, [LOW_CLICK])
 	agent, executor, _ = await start_stage(
 		jev_browser,
 		httpserver,
 		tmp_path,
 		screenshot_policy=policy,
-		vision_escalation=enabled,
 		screenshot_fields={'screenshot_required': declared, 'screenshot_reason': 'Review the target.'},
 	)
 	try:
@@ -907,42 +805,13 @@ async def test_image_retry_policy_gates(policy, enabled, declared, disabled, exp
 			executor._disable_vision(run, 415)
 		await routed(agent)
 		assert run.handback and run.handback.reason == 'low_confidence'
-		assert len(fake.requests) == 1 and ('assets' in fake.requests[0]) is expected_vision and not run.escalations
-		assert next(r for r in _events(tmp_path / 'trace.jsonl') if r['event'] == 'run_config')['vision_escalation'] is enabled
+		assert len(fake.requests) == 1 and not fake.errors
+		assert all(('assets' in packet) is expected_vision for packet in fake.requests)
 	finally:
 		await close_driver(agent)
 
 
-@pytest.mark.parametrize(
-	'reason',
-	[
-		'invalid_answer',
-		'action_error',
-		'step_error',
-		'submit_not_allowed',
-		'risk_not_allowed',
-		'risk_denied',
-		'out_of_scope',
-		'action_budget',
-		'text_unavailable',
-		'system1_error',
-		'too_many_candidates',
-		'state_too_large',
-		'unsupported_page',
-		'wait_limit',
-		'step_limit',
-		'step_done',
-		'repeated_action',
-	],
-)
-def test_non_visual_stops_and_repeated_typing_never_escalate(reason):
-	choice = service.decision.Decision(
-		operation='TYPE_TEXT', operation_probability=0.95, target_probability=0.95, unable_probability=0.02
-	)
-	assert service._escalation_reason((reason, 'stop'), choice) is None
-
-
-async def test_cancelled_image_retry_archives_actual_attempts(jev_browser, httpserver, tmp_path):
+async def test_cancelled_planner_image_request_archives_actual_attempt(jev_browser, httpserver, tmp_path):
 	arrived = asyncio.Event()
 	release = threading.Event()
 	loop = asyncio.get_running_loop()
@@ -954,10 +823,14 @@ async def test_cancelled_image_retry_archives_actual_attempts(jev_browser, https
 		return Response('{}', mimetype='application/json')
 
 	image_requests(httpserver).respond_with_handler(block)
-	FakeJev(httpserver, [LOW_CLICK])
 	conversations = tmp_path / 'conversations'
 	agent, executor, _ = await start_stage(
-		jev_browser, httpserver, tmp_path, screenshot_policy='smart', save_conversation_path=conversations
+		jev_browser,
+		httpserver,
+		tmp_path,
+		screenshot_policy='smart',
+		screenshot_fields={'screenshot_required': True, 'screenshot_reason': 'Check the selected control.'},
+		save_conversation_path=conversations,
 	)
 	task = asyncio.create_task(routed(agent, execute=False))
 	try:
@@ -966,21 +839,16 @@ async def test_cancelled_image_retry_archives_actual_attempts(jev_browser, https
 		with pytest.raises(asyncio.CancelledError):
 			await task
 		assert executor.pending_record is None
-		assert [r['outcome'] for r in _events(tmp_path / 'trace.jsonl') if r['event'] == 'system1_decision'] == [
-			'escalated',
-			'interrupted',
-		]
-		assert len(list(conversations.glob('system1_*.json'))) == 2 and len(list(conversations.glob('system1_*.jpg'))) == 1
-		assert executor.runs[-1].escalations[-1]['outcome'] == 'retry_failed'
+		(interrupted,) = [r for r in _events(tmp_path / 'trace.jsonl') if r['event'] == 'system1_decision']
+		assert interrupted['outcome'] == 'interrupted' and interrupted['vision_trigger'] == 'planner'
+		assert [a['error_type'] for a in interrupted['attempts']] == ['CancelledError']
+		assert len(list(conversations.glob('system1_*.json'))) == 1 and len(list(conversations.glob('system1_*.jpg'))) == 1
 		usage = executor.usage_by_role()['system1']
-		assert (usage['decisions'], usage['vision_requests'], usage['text_requests'], usage['escalations_executed']) == (
-			1,
-			1,
-			1,
-			0,
-		)
+		assert (usage['decisions'], usage['vision_requests'], usage['text_requests']) == (1, 1, 0)
 	finally:
 		release.set()
+		task.cancel()
+		await asyncio.gather(task, return_exceptions=True)
 		await close_driver(agent)
 
 
@@ -1012,30 +880,36 @@ async def test_repeated_type_text_uses_one_text_helper_and_one_jev_request(jev_b
 		helper = AsyncMock(return_value='Luzern')
 		monkeypatch.setattr(executor.helpers, 'text', helper)
 		await routed(agent, summary=summary)
-		assert len(fake.requests) == 1 and helper.await_count == 1 and not run.escalations
+		assert len(fake.requests) == 1 and helper.await_count == 1 and 'assets' not in fake.requests[0]
 		assert run.handback and run.handback.reason == 'repeated_action'
 	finally:
 		await close_driver(agent)
 
 
-async def test_discarded_upgraded_prediction_is_not_an_execution(jev_browser, httpserver, tmp_path):
-	fake = _VisionJev(httpserver, [LOW_CLICK, {'operation': 'CLICK', 'target': 'Enable'}])
-	agent, executor, _ = await start_stage(jev_browser, httpserver, tmp_path, screenshot_policy='smart')
+async def test_discarded_planner_image_prediction_is_not_an_execution(jev_browser, httpserver, tmp_path):
+	fake = _VisionJev(httpserver, [{'operation': 'CLICK', 'target': 'Enable'}])
+	agent, executor, _ = await start_stage(
+		jev_browser,
+		httpserver,
+		tmp_path,
+		screenshot_policy='smart',
+		screenshot_fields={'screenshot_required': True, 'screenshot_reason': 'Check the selected control.'},
+	)
 	try:
 		assert (await routed(agent, execute=False)).model_output is not None
-		assert len(fake.requests) == 2 and executor.usage_by_role()['system1']['escalations_executed'] == 0
+		assert len(fake.requests) == 1 and 'assets' in fake.requests[0]
 		await executor.aclose()
 		run = executor.runs[-1]
-		assert not run.vision_at_start and run.vision
-		assert _is_repeated_empty([run, run], run.identity, False) and not _is_repeated_empty([run, run], run.identity, True)
-		assert run.escalations[-1]['outcome'] == 'retry_failed'
+		assert run.vision_at_start and run.vision and not run.executed_actions
+		assert run.actions[-1].status == 'discarded'
+		assert _is_repeated_empty([run, run], run.identity, True) and not _is_repeated_empty([run, run], run.identity, False)
 		assert await browser_eval(jev_browser, 'document.querySelector("output").textContent') == 'Default'
 	finally:
 		await close_driver(agent)
 
 
 @pytest.mark.parametrize('budget_exhausted', [False, True])
-async def test_no_effect_once_checks_remaining_budget(budget_exhausted, jev_browser, httpserver, tmp_path):
+async def test_no_effect_hands_back_before_another_request(budget_exhausted, jev_browser, httpserver, tmp_path):
 	fake = _VisionJev(httpserver, [{'operation': 'CLICK', 'target': 'Plain'}])
 	agent, executor, _ = await start_stage(jev_browser, httpserver, tmp_path, screenshot_policy='smart')
 	try:
@@ -1055,51 +929,9 @@ async def test_no_effect_once_checks_remaining_budget(budget_exhausted, jev_brow
 				)
 			)
 			run.max_actions = 1
-		await routed(agent)
-		assert run.no_effect_escalated and run.vision and run.vision_source == 'escalation'
-		assert executor.usage_by_role()['system1']['escalations_by_reason'] == {'no_effect': 1}
-		if budget_exhausted:
-			assert run.handback and run.handback.reason == 'action_budget' and not fake.requests
-			assert run.escalations[-1]['outcome'] == 'handed_back'
-		else:
-			assert (
-				len(fake.requests) == 1
-				and fake.requests[0]['state']['current_subgoal']['screenshot_guidance']['source'] == 'escalation'
-			)
-			assert run.escalations[-1]['outcome'] == 'executed'
-			run.no_effect_streak = 2
-			await routed(agent)
-			assert run.handback and run.handback.reason == 'no_effect' and len(fake.requests) == 1 and len(run.escalations) == 1
-	finally:
-		await close_driver(agent)
-
-
-@pytest.mark.parametrize('failure', ['missing', 415, 503])
-async def test_image_retry_fails_without_third_request(failure, jev_browser, httpserver, tmp_path, monkeypatch):
-	monkeypatch.setattr(backends, 'JEV_RETRY_DELAYS', (0, 0))
-	if isinstance(failure, int):
-		image_requests(httpserver).respond_with_data(status=failure)
-	else:
-		monkeypatch.setattr(service, 'prepare_screenshot', Mock(return_value=None))
-	FakeJev(httpserver, [LOW_CLICK])
-	agent, executor, _ = await start_stage(jev_browser, httpserver, tmp_path, screenshot_policy='smart')
-	try:
-		await routed(agent)
-		run = executor.runs[-1]
-		assert run.handback and run.handback.reason == 'low_confidence' and run.decisions == 1 and not run.vision_decisions
-		types = [r.mimetype for r, _ in httpserver.log if r.path == '/v1/systemone']
-		count = {'missing': 0, 415: 1, 503: 3}[failure]
-		assert types == ['application/json'] + ['multipart/form-data'] * count
-		outcome = {'missing': 'vision_unavailable', 415: 'vision_rejected', 503: 'retry_failed'}[failure]
-		assert run.escalations[0]['outcome'] == outcome
-		assert (executor._vision_disabled is not None) == (failure == 415)
-		if failure == 503:
-			assert 'Retrying with the image failed:' in run.handback.detail
-		if failure == 'missing':
-			assert any(
-				r['event'] == 'vision_unavailable' and r['vision_trigger'] == 'escalation:low_confidence'
-				for r in _events(tmp_path / 'trace.jsonl')
-			)
+		assert (await routed(agent)).model_output is None
+		assert run.handback and run.handback.reason == 'no_effect'
+		assert run.no_effect_streak == 2 and not fake.requests
 	finally:
 		await close_driver(agent)
 
@@ -1191,7 +1023,7 @@ async def test_smart_sends_each_stage_its_declared_input(jev_browser, httpserver
 async def test_smart_review_missing_fields_and_changed_vision(jev_browser, httpserver, tmp_path):
 	fake = _VisionJev(httpserver, [{'operation': op} for op in ('UNABLE', 'UNABLE', 'STEP_DONE', 'UNABLE')])
 	agent, executor, params = await start_stage(
-		jev_browser, httpserver, tmp_path, screenshot_policy='smart', vision_escalation=False, checks=JevChecks(confidence='off')
+		jev_browser, httpserver, tmp_path, screenshot_policy='smart', checks=JevChecks(confidence='off')
 	)
 	try:
 		first = await routed(agent)

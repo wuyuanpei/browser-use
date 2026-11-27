@@ -1,5 +1,6 @@
 import base64
 import json
+import logging
 from datetime import datetime, timedelta
 from io import BytesIO
 from pathlib import Path
@@ -43,7 +44,6 @@ def test_configuration():
 
 def test_screenshot_configuration():
 	settings = JevSettings()
-	assert settings.vision_escalation is True
 	assert (settings.screenshot_policy, settings.vision_max_side, settings.vision_jpeg_quality) == ('off', 1600, 72)
 	assert JevSettings(screenshot_policy='always').screenshot_policy == 'always'
 	assert JevSettings(screenshot_policy='smart').screenshot_policy == 'smart'
@@ -51,6 +51,19 @@ def test_screenshot_configuration():
 		JevSettings(system1='llm', system1_llm=create_mock_llm([]), screenshot_policy='always')
 	with pytest.raises(ValidationError, match='requires the Jev backend'):
 		JevSettings(system1='llm', system1_llm=create_mock_llm([]), screenshot_policy='smart')
+
+
+@pytest.mark.parametrize('legacy_value', [True, False])
+def test_legacy_screenshot_setting_is_ignored(legacy_value, caplog, monkeypatch):
+	monkeypatch.setattr(logging.getLogger('browser_use'), 'propagate', True)
+	config = {'screenshot_policy': 'smart', 'vision_escalation': legacy_value}
+	settings = JevSettings.model_validate(config)
+	assert settings == JevSettings(screenshot_policy='smart')
+	assert 'vision_escalation' not in settings.model_dump()
+	assert config['vision_escalation'] is legacy_value
+	assert [(record.levelno, record.getMessage()) for record in caplog.records] == [
+		(logging.WARNING, 'Ignoring removed vision_escalation setting.')
+	]
 
 
 async def fixture_request(httpserver, policy, tmp_path, monkeypatch, *, planner_vision=False):

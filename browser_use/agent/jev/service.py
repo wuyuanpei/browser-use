@@ -76,40 +76,6 @@ class _System1Request:
 	stats: dict[str, Any]
 
 
-def _escalation_reason(stop: Stop | None, choice: decision.Decision | None) -> str | None:
-	if stop is None:
-		return None
-	reason = stop[0]
-	if reason in ('low_confidence', 'unable_probability', 'unable', 'no_effect'):
-		return reason
-	if reason == 'repeated_action' and choice is not None and choice.operation != 'TYPE_TEXT':
-		return reason
-	return None
-
-
-def _escalation_guidance(reason: str, choice: decision.Decision | None) -> str:
-	if reason == 'no_effect':
-		return 'Recent actions did not change the page; use the image to locate a different listed target that advances the objective.'
-	if reason == 'repeated_action':
-		return 'The same action was about to repeat on an unchanged page; use the image to find a different listed target.'
-	if reason == 'low_confidence' and choice is not None:
-		probabilities = ', '.join(
-			f'{name} p={p:.2f}'
-			for name, p in (('operation', choice.operation_probability), ('target', choice.target_probability))
-			if p is not None
-		)
-		return f'Text-only choice was low confidence ({probabilities}); use the image to decide which listed target matches.'
-	if reason == 'unable_probability' and choice is not None and choice.unable_probability is not None:
-		return f'Text-only UNABLE probability was {choice.unable_probability:.2f}; use the image to check whether a listed target can advance the completion condition.'
-	return 'Text-only choice was UNABLE; use the image to check whether a listed target can advance the completion condition.'
-
-
-def _vision_trigger(run: SubgoalRun) -> str | None:
-	if run.vision_source == 'escalation':
-		return f'escalation:{run.escalations[-1]["reason"]}'
-	return run.vision_source
-
-
 def _is_review_delegation(previous: SubgoalRun | None, rejected: bool) -> bool:
 	return previous is not None and (rejected or (previous.handback is not None and previous.handback.reason != 'step_done'))
 
@@ -141,7 +107,6 @@ class JevExecutor:
 		self._planner_page_action = False
 		self._vision_disabled: dict[str, Any] | None = None
 		self.current_vision_trigger: str | None = None
-		self._pending_escalation: tuple[SubgoalRun, dict[str, Any]] | None = None
 		self._closed = False
 		self.finish_only = False
 		self.defer_final_answer = False
@@ -179,7 +144,6 @@ class JevExecutor:
 					'answer_timeout',
 					'jev_timeout',
 					'screenshot_policy',
-					'vision_escalation',
 					'vision_max_side',
 					'vision_jpeg_quality',
 				}
@@ -482,7 +446,6 @@ class JevExecutor:
 		alignment_attempts: list[dict[str, Any]] | None = None,
 	) -> RouteResult:
 		reason, detail = stop
-		self._finish_escalation('handed_back')
 		result = Handback(
 			reason=reason,
 			detail=detail,
@@ -698,54 +661,17 @@ class JevExecutor:
 		policy = self.settings.screenshot_policy
 		return self._vision_disabled is None and (policy == 'always' or (policy == 'smart' and run.vision))
 
-	def _can_escalate(self, run: SubgoalRun) -> bool:
-		return (
-			self.settings.screenshot_policy == 'smart'
-			and self.settings.vision_escalation
-			and not run.vision
-			and self._vision_disabled is None
+	async def _prepare_image(self, summary: BrowserStateSummary, obs: Observation, run: SubgoalRun) -> PreparedImage | None:
+		image = await asyncio.to_thread(
+			prepare_screenshot,
+			summary.screenshot,
+			obs.viewport_width,
+			obs.viewport_height,
+			max_side=self.settings.vision_max_side,
+			quality=self.settings.vision_jpeg_quality,
 		)
-
-	def _start_escalation(self, run: SubgoalRun, reason: str) -> None:
-		entry = {'step': self.step, 'reason': reason, 'outcome': None}
-		run.escalations.append(entry)
-		self._pending_escalation = (run, entry)
-		self.usage.record_escalation(reason)
-
-	def _finish_escalation(self, outcome: str, *, detail: str | None = None) -> None:
-		if self._pending_escalation is None:
-			return
-		run, entry = self._pending_escalation
-		self._pending_escalation = None
-		entry['outcome'] = outcome
-		if outcome == 'executed':
-			self.usage.escalations_executed += 1
-		self.trace.write(
-			'vision_escalation',
-			run_id=run.id,
-			planner_declared=run.screenshot_declared,
-			**entry,
-			detail=detail,
-		)
-
-	async def _prepare_image(
-		self, summary: BrowserStateSummary, obs: Observation, run: SubgoalRun, trigger: str | None
-	) -> PreparedImage | None:
-		try:
-			image = await asyncio.to_thread(
-				prepare_screenshot,
-				summary.screenshot,
-				obs.viewport_width,
-				obs.viewport_height,
-				max_side=self.settings.vision_max_side,
-				quality=self.settings.vision_jpeg_quality,
-			)
-		except asyncio.CancelledError:
-			self._finish_escalation('retry_failed', detail='CancelledError')
-			raise
 		if image is None:
-			self.trace.write('vision_unavailable', self.step, run_id=run.id, vision_trigger=trigger)
-			self._finish_escalation('vision_unavailable')
+			self.trace.write('vision_unavailable', self.step, run_id=run.id, vision_trigger=run.vision_source)
 		return image
 
 	def _system1_request(
@@ -782,7 +708,7 @@ class JevExecutor:
 			'observation_fingerprint': obs.fingerprint,
 			'observed_candidate_counts': observed_counts,
 			'vision': image is not None,
-			'vision_trigger': _vision_trigger(run) if image else None,
+			'vision_trigger': run.vision_source if image else None,
 			'image_bytes': image.bytes if image else 0,
 			'image_size': [image.width, image.height] if image else None,
 			'dpr': image.scale if image else None,
@@ -808,8 +734,6 @@ class JevExecutor:
 		}
 		if self._vision_disabled is not None:
 			stats['vision_disabled'] = True
-		if image is not None and run.vision_source == 'escalation' and self._pending_escalation is not None:
-			stats.update(escalation_from=run.escalations[-1]['reason'], planner_declared=run.screenshot_declared)
 		return _System1Request(system_state, questions, model, image, stats)
 
 	async def _ask_once(self, request: _System1Request) -> System1Reply | None:
@@ -825,7 +749,6 @@ class JevExecutor:
 					request.state, request.questions, images={'page-screenshot': request.image.jpeg_b64}
 				)
 		except asyncio.CancelledError:
-			self._finish_escalation('retry_failed', detail='CancelledError')
 			elapsed_ms = round((monotonic() - start) * 1000)
 			attempts = self.backend.last_attempts if isinstance(self.backend, JevBackend) else []
 			if attempts:
@@ -887,7 +810,6 @@ class JevExecutor:
 			try:
 				stop, text = await self._action_check(run, obs, choice)
 			except asyncio.CancelledError:
-				self._finish_escalation('retry_failed', detail='cancelled before dispatch')
 				request.stats.update(outcome='interrupted', error='CancelledError')
 				self._record_decision(request, reply)
 				raise
@@ -933,17 +855,9 @@ class JevExecutor:
 				root_y=scroll.root_y,
 			)
 		stop = self._precheck(run, obs)
-		if stop and stop[0] == 'no_effect' and self._can_escalate(run) and not run.no_effect_escalated:
-			self._start_escalation(run, 'no_effect')
-			run.vision = True
-			run.vision_source = 'escalation'
-			run.vision_reason = _escalation_guidance('no_effect', None)
-			run.no_effect_streak = 0
-			run.no_effect_escalated = True
-			stop = self._precheck(run, obs)
 		if stop:
 			if stop[0] == 'unsupported_page' and browser_state_summary.screenshot is None and self._vision_wanted(run):
-				self.trace.write('vision_unavailable', self.step, run_id=run.id, vision_trigger=_vision_trigger(run))
+				self.trace.write('vision_unavailable', self.step, run_id=run.id, vision_trigger=run.vision_source)
 			attempts = (
 				browser_state_summary.alignment_attempts
 				if stop[0] == 'unsupported_page' and isinstance(browser_state_summary, state.UnalignedState)
@@ -973,7 +887,7 @@ class JevExecutor:
 		)
 		image = None
 		if self._vision_wanted(run):
-			image = await self._prepare_image(browser_state_summary, obs, run, _vision_trigger(run))
+			image = await self._prepare_image(browser_state_summary, obs, run)
 		size_error: Stop = ('state_too_large', 'The page is too large for one System1 request.')
 		maximum = self.settings.max_candidates
 		while True:
@@ -993,7 +907,6 @@ class JevExecutor:
 		rejected = image_rejection_status(request.stats['attempts']) if reply is None and image is not None else None
 		if rejected is not None:
 			self._disable_vision(run, rejected)
-			self._finish_escalation('vision_rejected')
 			request.stats['outcome'] = 'vision_rejected'
 			self._record_decision(request, None)
 			request = self._system1_request(
@@ -1012,51 +925,6 @@ class JevExecutor:
 			self._record_decision(request, None)
 			return self._handback(run, ('system1_error', detail), obs)
 		choice, text, stop = await self._assess_reply(run, obs, request, reply)
-		reason = _escalation_reason(stop, choice) if request.image is None and self._can_escalate(run) else None
-		if stop and reason:
-			self._start_escalation(run, reason)
-			guidance = _escalation_guidance(reason, choice)
-			try:
-				await agent._check_stop_or_pause()
-				image = await self._prepare_image(browser_state_summary, obs, run, f'escalation:{reason}')
-			except (asyncio.CancelledError, Exception) as error:
-				self._finish_escalation('retry_failed', detail=type(error).__name__)
-				stats.update(outcome='interrupted', error=type(error).__name__)
-				self._record_decision(request, reply)
-				raise
-			if image is None:
-				self._record_decision(request, reply)
-				return self._handback(run, stop, obs, choice)
-			# Add the trial guidance without committing the run to images until the choice passes all checks.
-			trial = run.model_copy(update={'vision_source': 'escalation', 'vision_reason': guidance})
-			retry = self._system1_request(
-				trial, obs, agent.task, registered, offered, research, image, selected_targets, pruning_stats
-			)
-			if retry.stats['request_chars'] > MAX_REQUEST_CHARS:
-				self._finish_escalation('retry_failed', detail=size_error[1])
-				self._record_decision(request, reply)
-				return self._handback(run, (stop[0], f'{stop[1]} Retrying with the image failed: {size_error[1]}'), obs, choice)
-			stats.update(outcome='escalated', escalation_from=reason, planner_declared=run.screenshot_declared)
-			self._record_decision(request, reply)
-			request = retry
-			stats = request.stats
-			reply = await self._ask_once(request)
-			if reply is None:
-				rejected = image_rejection_status(stats['attempts'])
-				if rejected is not None:
-					self._disable_vision(run, rejected)
-					stats['outcome'] = 'vision_rejected'
-					self._finish_escalation('vision_rejected')
-				else:
-					self._finish_escalation('retry_failed', detail=stats['error'])
-					stop = (stop[0], f'{stop[1]} Retrying with the image failed: {stats["error"]}.')
-				self._record_decision(request, None)
-				return self._handback(run, stop, obs, choice)
-			choice, text, stop = await self._assess_reply(run, obs, request, reply)
-			if stop is None:
-				run.vision = True
-				run.vision_source = 'escalation'
-				run.vision_reason = guidance
 		if stop:
 			self._record_decision(request, reply)
 			return self._handback(run, stop, obs, choice)
@@ -1101,7 +969,7 @@ class JevExecutor:
 		directory = self.agent.settings.save_conversation_path
 		if not directory:
 			return
-		suffix = f'_{stats["outcome"]}' if stats['outcome'] in ('escalated', 'vision_rejected') else ''
+		suffix = '_vision_rejected' if stats['outcome'] == 'vision_rejected' else ''
 		path = Path(directory) / f'system1_{self.agent.id}_{self.step}{suffix}.json'
 		path.parent.mkdir(parents=True, exist_ok=True)
 		record = {
@@ -1121,7 +989,6 @@ class JevExecutor:
 		record = self.pending_record
 		if self._source == 'system1' and record and record.step == self.step and record.status == 'predicted':
 			record.status = 'dispatched'
-			self._finish_escalation('executed')
 
 	def on_dispatch_error(self, agent: 'Agent', error: BaseException):
 		record = self.pending_record
@@ -1210,8 +1077,6 @@ class JevExecutor:
 	def _emit_result(self):
 		record = self.pending_record
 		if record:
-			if record.status == 'discarded':
-				self._finish_escalation('retry_failed', detail='prediction discarded before dispatch')
 			fields = record.model_dump(
 				include={
 					'run_id',
@@ -1317,7 +1182,6 @@ class JevExecutor:
 				elif self.pending_record.status == 'dispatched':
 					self.pending_record.status = 'unknown'
 				self._emit_result()
-			self._finish_escalation('retry_failed', detail='executor closed before dispatch')
 			await self.usage.sync_other(self.step)
 			roles = self.usage_by_role()
 			costs = [r['cost_usd'] for r in roles.values()]

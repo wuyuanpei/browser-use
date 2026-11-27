@@ -131,7 +131,6 @@ async def test_dense_policy_preserves_pr5_off_wire_and_prunes_visual_policies(je
 			screenshot_policy=policy,
 			candidate_pipeline=pipeline,
 			pruning_budget_ms=budget,
-			vision_escalation=False,
 			trace_path=path,
 		)
 		agent = Agent(task=goal, llm=create_mock_llm(), browser_session=jev_browser, use_judge=False, jev=settings)

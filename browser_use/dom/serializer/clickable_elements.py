@@ -32,8 +32,16 @@ class ClickableElementDetector:
 		# if node.ax_node and node.ax_node.ignored:
 		# 	return False
 
-		# remove html and body nodes
-		if node.tag_name in {'html', 'body'}:
+		# An editable document root is the input target for rich-text iframe editors.
+		if node.tag_name in {'html', 'body'} and not (
+			'contenteditable' in node.attributes
+			and node.attributes['contenteditable'].lower() != 'false'
+			or node.ax_node
+			and any(
+				prop.name == 'editable' and str(prop.value).lower() in {'true', 'richtext', 'plaintext'}
+				for prop in node.ax_node.properties or []
+			)
+		):
 			return False
 
 		# Check for JavaScript click event listeners detected via CDP (without DOM mutation)

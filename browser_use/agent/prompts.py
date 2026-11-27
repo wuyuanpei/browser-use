@@ -1,6 +1,6 @@
 import importlib.resources
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Literal, Optional
 
 from browser_use.browser.views import PLACEHOLDER_4PX_SCREENSHOT
@@ -396,7 +396,13 @@ Available tabs:
 			step_info_description = f'Step{self.step_info.step_number + 1} maximum:{self.step_info.max_steps}\n'
 		else:
 			step_info_description = ''
-		step_info_description += f'Today:{datetime.now().strftime("%Y-%m-%d")}'
+		today = datetime.now().date()
+		weekdays = ('Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun')
+		calendar = [f'today {today.isoformat()} {weekdays[today.weekday()]}']
+		for offset in range(1, 8):
+			day = today + timedelta(days=offset)
+			calendar.append(f'+{offset}d {day.isoformat()} {weekdays[day.weekday()]}')
+		step_info_description += f'Today:{today.isoformat()}\nCalendar: {"; ".join(calendar)}'
 		return f'<step_info>{step_info_description}</step_info>\n'
 
 	def _resize_screenshot(self, screenshot_b64: str) -> str:

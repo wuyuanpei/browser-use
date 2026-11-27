@@ -20,6 +20,8 @@ Jev 的操作和目标置信门限默认都是 `0.8`。把对应参数设置为 
 .venv\Scripts\python.exe -m browser_use.benchmark --jev-min-operation-probability 0 --jev-min-target-probability 0
 ```
 
+每条基线用例的执行上限和评分口径均为 345 秒。计时从用例启动开始，包含浏览器准备、首次导航和生成答复。Jev Planner 会看到剩余时间，进入最后 60 秒时开始收尾。答复辅助模型耗尽剩余时间时，保留 Planner 已给出的结论和证据缺口。执行结束后的独立终验单独计时。
+
 ## 复用正在运行的 Chrome
 
 在 Chrome 打开 `chrome://inspect/#remote-debugging` 并开启远程调试。`DevToolsActivePort` 位于 Chrome 用户数据目录，可在 `chrome://version` 查看 `Profile Path` 并取其上一级目录。启动测试台时用 `--chrome-active-port-file` 传入该文件，或配置 `BROWSER_USE_BENCHMARK_CHROME_ACTIVE_PORT_FILE`。

@@ -73,6 +73,8 @@ class RunSettings(BaseModel):
 	evaluation: EvaluationModel
 	headless: bool
 	user_data_dir: str | None
+	time_limit_seconds: int | None = Field(default=None, gt=0)
+	deadline_monotonic: float | None = Field(default=None, exclude=True, repr=False)
 
 	def jev_probability_options(self) -> dict[str, float]:
 		return self.model_dump(include=set(JEV_PROBABILITY_ENV), exclude_none=True)

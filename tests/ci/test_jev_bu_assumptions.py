@@ -102,9 +102,8 @@ async def test_visible_text_and_screenshot_time(jev_browser: BrowserSession, htt
 	await jev_browser.navigate_to(url)
 	text = (await read_visible_text(jev_browser))['text']
 	assert 'Visible paragraph' in text
-	assert all(
-		label not in text for label in ['Display hidden', 'Visibility hidden', 'Offscreen paragraph', 'Nested frame paragraph']
-	)
+	assert all(label not in text for label in ['Display hidden', 'Visibility hidden', 'Offscreen paragraph'])
+	assert '[iframe] Nested frame paragraph' in text
 	durations = []
 	for _ in range(5):
 		started = time.monotonic()

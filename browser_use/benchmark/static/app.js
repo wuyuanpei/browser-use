@@ -791,7 +791,7 @@ function renderBaseline() {
   const blocked = attempts.filter(a => resultName(a) === '环境阻塞' || a.status === 'environment_blocked').length;
   const stats = batch?.outcome_statistics;
   $('baseline-summary').textContent = stats
-    ? `${stats.met} / ${stats.attempts} 目标达成 · ${stats.not_met} 未达成 · ${stats.unknown} 证据不足 · ${stats.evaluation_errors} 评估调用失败 · ${stats.not_run} 未评估 · ${stats.legacy_unknown} 旧档案未判定 · 未判决 ${(100 * (stats.unjudged_rate || 0)).toFixed(1)}%`
+    ? `${stats.met_within_limit ?? stats.met} / ${stats.attempts} 限时内达成 · 终验判为达成 ${stats.met} · ${stats.not_met} 未达成 · ${stats.unknown} 证据不足 · ${stats.evaluation_errors} 评估调用失败 · ${stats.not_run} 未评估 · ${stats.legacy_unknown} 旧档案未判定 · 未判决 ${(100 * (stats.unjudged_rate || 0)).toFixed(1)}%`
     : attempts.length ? `${passed} / ${attempts.length} 通过 · ${blocked} 环境阻塞（旧方法）` : '';
   stableHTML('baseline-token-summary', batch ? tokenPanel(batch.token_usage, '批次累计 Token') : '', selectedRunId);
   const screenshotCounts = screenshotDecisionCounts(batch);

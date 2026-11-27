@@ -12,6 +12,7 @@ import time
 from collections.abc import Callable, Coroutine, Iterator
 from contextlib import contextmanager, suppress
 from contextvars import ContextVar
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -22,7 +23,7 @@ from .decision_guard import decision_validity, read_document, same_document, sta
 from .models import PROVIDER, RunSettings, redact_secrets
 from .observation import READ_STATE, document_key, fingerprint, indexed_elements
 from .tasks import EnvironmentBlocked
-from .token_usage import token_usage
+from .token_usage import TOKEN_FIELDS, token_usage
 
 if TYPE_CHECKING:
 	from browser_use.agent.service import Agent
@@ -33,8 +34,12 @@ if TYPE_CHECKING:
 	from .tasks import CaseProbe
 
 MAX_STEPS = 100
-DOCUMENT_READY_TIMEOUT = 1.0
+DOCUMENT_READY_TIMEOUT = 5.0
 DOCUMENT_READY_POLL = 0.05
+OBSERVATION_RETRIES = 3
+OBSERVATION_RETRY_DELAY = 1.0
+OBSERVATION_FAILURE_LIMIT = 5
+OBSERVATION_RECOVERY_TIMEOUT = 20.0
 VIEWPORT = {'width': 1366, 'height': 780}
 BrowserMode = Literal['isolated', 'attached_chrome']
 _Result = TypeVar('_Result')
@@ -240,13 +245,15 @@ class _BoundBrowser:
 		except TimeoutError as error:
 			raise PageObservationUnavailable('Browser document is unavailable', target) from error
 
-	def observe(self, *, cancel: Callable[[], str | None] | None = None) -> dict[str, Any]:
+	def observe(
+		self, *, cancel: Callable[[], str | None] | None = None, timeout: float = OBSERVATION_RECOVERY_TIMEOUT
+	) -> dict[str, Any]:
 		async def read():
 			target = await self.bind()
 			return target, await self._read_page(target)
 
 		try:
-			target, page = self.bridge.run(read(), cancel=cancel, timeout=20)
+			target, page = self.bridge.run(read(), cancel=cancel, timeout=timeout)
 		except TimeoutError as error:
 			raise PageObservationUnavailable(
 				'Browser observation timed out', self.bound.target_id if self.bound else None
@@ -278,18 +285,27 @@ class BrowserUseRun:
 		jev_artifact_dir: Path | None = None,
 		chrome: ChromeAttachment | None = None,
 	):
+		self._started = time.monotonic()
+		self._deadline = settings.deadline_monotonic
+		if self._deadline is None and settings.time_limit_seconds is not None:
+			self._deadline = self._started + settings.time_limit_seconds
 		self._secrets = (settings.execution.api_key, settings.evaluation.api_key, settings.jev.api_key if settings.jev else None)
 		self._on_event, self._should_cancel, self._probe = on_event, should_cancel, probe
 		self._record_dir = record_dir
 		self._chrome = chrome
 		self._stale_streak: list[str] = []
 		self._pending_observation: tuple[str, str | None] | None = None
+		self._observe_failures = 0
+		self._observe_failed_since: float | None = None
 		self._jev_dir = None
 		if settings.jev is not None:
 			self._jev_dir = jev_artifact_dir or Path.cwd() / 'artifacts' / 'jev-runs' / uuid4().hex
 			self._jev_dir.mkdir(parents=True, exist_ok=True)
 		self._model_role: ContextVar[str | None] = ContextVar('benchmark_jev_model_role', default=None)
 		self._prediction_text_call: dict[str, Any] | None = None
+		self._model_call_lock = threading.RLock()
+		self._planner_parse_feedback: tuple[int, dict[str, Any]] | None = None
+		self._model_token_usage = dict.fromkeys((*TOKEN_FIELDS, 'missing_usage_calls'), 0)
 		config = settings.system1_config()
 		self._state: dict[str, Any] = dict(
 			goal=goal,
@@ -329,7 +345,6 @@ class BrowserUseRun:
 			self._state.update(jev_trace_path=str(self._jev_dir / 'jev_trace.jsonl'), planner=settings.execution.public())
 		if scenario is not None:
 			self._state['scenario'] = scenario
-		self._started = time.monotonic()
 		self._closed = False
 		self._browser_start_dispatched = False
 		self._check_cancelled()
@@ -367,6 +382,7 @@ class BrowserUseRun:
 			self._on_event(RunEvent(name, payload, self.snapshot(), preview))
 
 	def snapshot(self) -> dict[str, Any]:
+		self._sync_planner_parse_feedback()
 		executor = getattr(self._native, '_jev', None)
 		final_observation = executor.final_browser_observation if executor is not None else None
 		roles = executor.usage_by_role() if executor is not None else {}
@@ -374,9 +390,13 @@ class BrowserUseRun:
 		disabled = system1_usage.get('vision_disabled')
 		runs = executor.runs if executor is not None else []
 		reviews = [run for run in runs if run.review_delegation]
-		return redact_secrets(
+		with self._model_call_lock:
+			public_state = self._state.copy()
+			calls = public_state.pop('model_calls').copy()
+			usage = self._model_token_usage.copy()
+		snapshot = redact_secrets(
 			{
-				**self._state,
+				**public_state,
 				**(
 					{
 						'jev_usage_by_role': roles,
@@ -396,26 +416,56 @@ class BrowserUseRun:
 				'screenshot_decisions_missing': (
 					sum(run.screenshot_declared is None for run in reviews) if self._state['screenshot_policy'] == 'smart' else 0
 				),
-				'token_usage': token_usage(self._state['model_calls']),
+				'token_usage': {**usage, 'complete': usage['missing_usage_calls'] == 0},
 				'elements': indexed_elements(self._state['page'].get('actions', [])),
 			},
 			*self._secrets,
 		)
+		snapshot['model_calls'] = calls
+		return snapshot
+
+	def _public_call(self, record: dict[str, Any]) -> dict[str, Any]:
+		cleaned = redact_secrets(record, *self._secrets)
+		return deepcopy(record) if cleaned is record else cleaned
+
+	def _account_model_call(self, record: dict[str, Any], sign: int) -> None:
+		usage = token_usage([record])
+		for key in self._model_token_usage:
+			self._model_token_usage[key] += sign * usage[key]
+
+	def _update_model_call(self, call_id: int, **metadata: Any) -> None:
+		# A previously published snapshot can still reference the old record.
+		with self._model_call_lock:
+			calls = self._state['model_calls']
+			calls[call_id - 1] = {**calls[call_id - 1], **self._public_call(metadata)}
+
+	def _sync_planner_parse_feedback(self) -> None:
+		# Planner marks this error after the provider call has already ended.
+		with self._model_call_lock:
+			if self._planner_parse_feedback is not None:
+				call_id, failure = self._planner_parse_feedback
+				if failure['planner_feedback_retry']:
+					self._update_model_call(call_id, parse_failures=[failure])
+					self._planner_parse_feedback = None
 
 	@contextmanager
 	def model_call(self, kind: str, **metadata: Any) -> Iterator[dict[str, Any]]:
 		"""Record one real execution or verification request with the same sequencing."""
-		calls = self._state['model_calls']
-		record = dict(
-			id=len(calls) + 1,
-			kind=kind,
-			status='pending',
-			observation_index=self._state['observation_index'],
-			event_seq=self._state['event_seq'] + 1,
-			**metadata,
-		)
-		calls.append(record)
-		self._emit('model_start', call=record)
+		with self._model_call_lock:
+			calls = self._state['model_calls']
+			call_id = len(calls) + 1
+			record: dict[str, Any] = dict(
+				id=call_id,
+				kind=kind,
+				status='pending',
+				observation_index=self._state['observation_index'],
+				event_seq=self._state['event_seq'] + 1,
+				**metadata,
+			)
+			pending = self._public_call(record)
+			calls.append(pending)
+			self._account_model_call(pending, 1)
+		self._emit('model_start', call=pending)
 		started = time.perf_counter()
 		try:
 			yield record
@@ -425,7 +475,12 @@ class BrowserUseRun:
 			raise
 		finally:
 			record['latency_ms'] = round((time.perf_counter() - started) * 1000)
-			self._emit('model_end', call=record)
+			completed = self._public_call(record)
+			with self._model_call_lock:
+				calls[call_id - 1] = completed
+				self._account_model_call(pending, -1)
+				self._account_model_call(completed, 1)
+			self._emit('model_end', call=completed)
 
 	async def _start(self, url: str, settings: RunSettings):
 		self._check_cancelled()
@@ -464,6 +519,7 @@ class BrowserUseRun:
 		original = llm.ainvoke
 
 		async def traced(messages, output_format=None, **kwargs):
+			self._sync_planner_parse_feedback()
 			request = dict(model=execution.model, messages=[message.model_dump(mode='json') for message in messages])
 			role = self._model_role.get()
 			kind = role or PROVIDER
@@ -471,7 +527,11 @@ class BrowserUseRun:
 				try:
 					reply = await original(messages, output_format=output_format, **kwargs)
 				except ModelOutputFormatError as error:
-					record['parse_failures'] = [error.trace_record(role=role or 'planner', model=execution.model)]
+					failure = error.trace_record(role=role or 'planner', model=execution.model)
+					record['parse_failures'] = [failure]
+					if role == 'planner':
+						with self._model_call_lock:
+							self._planner_parse_feedback = (record['id'], failure)
 					if error.usage is not None:
 						record['response'] = {'usage': error.usage.model_dump(mode='json', exclude_none=True)}
 					raise
@@ -488,6 +548,10 @@ class BrowserUseRun:
 			from browser_use.agent.jev import JevSettings
 
 			assert settings.execution_mode in ('isolated', 'collaborative')
+			# The baseline deadline started before this constructor and includes browser setup.
+			budget = None if self._deadline is None else self._deadline - time.monotonic()
+			if budget is not None and budget <= 0:
+				raise RunCancelled('timeout')
 			jev_config['jev'] = JevSettings.model_validate(
 				{
 					'mode': settings.execution_mode,
@@ -500,6 +564,7 @@ class BrowserUseRun:
 					'jev_api_key': settings.jev.api_key,
 					'trace_path': self._jev_dir / 'jev_trace.jsonl',
 					'capture_dir': self._jev_dir / 'jev_captures',
+					'time_budget_seconds': budget,
 					**settings.jev_probability_options(),
 				}
 			)
@@ -561,7 +626,7 @@ class BrowserUseRun:
 			escalated_from = None
 			if trigger and trigger.startswith('escalation:') and self._prediction_text_call is not None:
 				first = self._prediction_text_call
-				first.update(outcome='escalated', escalation_from=trigger.removeprefix('escalation:'))
+				self._update_model_call(first['id'], outcome='escalated', escalation_from=trigger.removeprefix('escalation:'))
 				escalated_from = first['id']
 			with self.model_call(
 				'jev',
@@ -603,15 +668,48 @@ class BrowserUseRun:
 					return (self._jev_dir / name).read_bytes()
 		raise ValueError('Unknown Jev screenshot')
 
+	def _observation_recovery_exhausted(self) -> bool:
+		return self._observe_failures >= OBSERVATION_FAILURE_LIMIT or (
+			self._observe_failed_since is not None
+			and time.monotonic() - self._observe_failed_since >= OBSERVATION_RECOVERY_TIMEOUT
+		)
+
+	def _sample_with_retries(self, phase: str, cancel: Callable[[], str | None] | None):
+		started = self._observe_failed_since if self._observe_failed_since is not None else time.monotonic()
+		deadline = started + OBSERVATION_RECOVERY_TIMEOUT
+		for retry in range(OBSERVATION_RETRIES + 1):
+			try:
+				# Each attempt binds to the currently focused tab before reading its document.
+				page = self._browser.observe(cancel=cancel, timeout=max(0, deadline - time.monotonic()))
+				sample = self._probe.inspect(self._browser.evaluate, page) if self._on_event and self._probe else {}
+			except PageObservationUnavailable as error:
+				self._observe_failures += 1
+				self._observe_failed_since = started
+				if self._observation_recovery_exhausted() or retry == OBSERVATION_RETRIES:
+					raise
+				delay = min(OBSERVATION_RETRY_DELAY, max(0, deadline - time.monotonic()))
+				self._emit(
+					'observation_retry',
+					phase=phase,
+					attempt=self._observe_failures,
+					target_id=error.target_id,
+					reason=str(error),
+				)
+				self._bridge.run(asyncio.sleep(delay), cancel=cancel, timeout=OBSERVATION_RETRY_DELAY + 1)
+			else:
+				self._observe_failures = 0
+				self._observe_failed_since = None
+				return page, sample
+		raise AssertionError('Observation retry loop must return a sample or raise its last error')
+
 	def observe(self, phase: str = 'step', reason: str | None = None):
 		cancel = self._should_cancel if phase != 'final' and self._state['status'] == 'ready' else None
-		page = self._browser.observe(cancel=cancel)
+		page, sample = self._sample_with_retries(phase, cancel)
 		self._state.pop('observation_error', None)
 		metadata: dict[str, Any] = {'stale_reason': reason} if reason else {}
 		self._state['page'] = page
 		self._state['observation_index'] += 1
 		if self._on_event:
-			sample = self._probe.inspect(self._browser.evaluate, page) if self._probe else {}
 			try:
 				preview = Preview(self._browser.screenshot(timeout=15), None, sample)
 			except Exception as error:
@@ -719,8 +817,13 @@ class BrowserUseRun:
 			if self._state['status'] in {'done', 'blocked'}:
 				return self.snapshot()
 			if self._pending_observation is not None:
-				self.observe(*self._pending_observation)
-				self._pending_observation = None
+				try:
+					self.observe(*self._pending_observation)
+				except PageObservationUnavailable:
+					if self._observation_recovery_exhausted():
+						raise
+				else:
+					self._pending_observation = None
 				return self.snapshot()
 			if name in {'predict', 'tick'} and self._state['decision'] is None:
 				self._choose()
@@ -743,6 +846,8 @@ class BrowserUseRun:
 			self._state['observation_error'] = failure
 			self._emit('observation_error', **failure)
 			if self._state['status'] == 'ready':
+				if self._observation_recovery_exhausted():
+					raise
 				self._pending_observation = (phase, reason)
 
 	def _choose(self):
@@ -807,7 +912,7 @@ class BrowserUseRun:
 							(c['id'] for c in reversed(calls) if c.get('role') == 'planner' and c['status'] == 'success'), None
 						),
 					)
-			call.update(decision=decision, operation=operation, target=target)
+			self._update_model_call(call['id'], decision=decision, operation=operation, target=target)
 		self._emit('decision', decision=decision)
 
 	def _execute(self, expected_fingerprint):
@@ -841,6 +946,8 @@ class BrowserUseRun:
 			if disposition == 'retry':
 				self._state['stale_retries'] += 1
 			decision['stale_reason'] = reason
+			if (call_id := decision.get('model_call_id')) is not None:
+				self._update_model_call(call_id, decision=decision)
 			self._state.update(decision=None, status='ready')
 			self._observe_after_change('stale_retry', reason=reason)
 			return
@@ -877,7 +984,6 @@ class BrowserUseRun:
 			self._state['history'].append(action)
 		self._emit('action_executed', action=action)
 		if result.get('is_done'):
-			self.finish_execution()
 			answer = result.get('extracted_content') or result.get('long_term_memory') or ''
 			self._state.update(
 				status='blocked' if result.get('success') is False else 'done', plan_index=1, result={'markdown': answer}
@@ -885,6 +991,8 @@ class BrowserUseRun:
 		elif not results:
 			self._state.update(status='blocked', stop_reason='Browser Use returned no action result')
 		self._emit('action_result', action=action, result=results)
+		if result.get('is_done'):
+			self.finish_execution()
 		self._observe_after_change('step')
 
 	def close(self):

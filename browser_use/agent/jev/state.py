@@ -14,69 +14,111 @@ from difflib import SequenceMatcher
 from functools import partial
 from math import isfinite
 from typing import Any
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit
 
 from browser_use.agent.jev import rules, scroll_regions
-from browser_use.agent.jev.views import Candidate, JevSettings, Observation, ScrollEffect, ScrollObservation, ScrollRegion
+from browser_use.agent.jev.views import (
+	VISIBLE_TEXT_LIMIT,
+	Candidate,
+	CandidateOmission,
+	JevSettings,
+	Observation,
+	OmissionReason,
+	Operation,
+	ScrollEffect,
+	ScrollObservation,
+	ScrollRegion,
+)
 from browser_use.browser.session import BrowserSession
 from browser_use.browser.views import BrowserStateSummary
 from browser_use.dom.views import EnhancedDOMTreeNode, SerializedDOMState
 
 logger = logging.getLogger(__name__)
 
-_VIEWPORT_BODY = r"""(() => {
-	const LIMIT = 50000;
+_VIEWPORT_TEXT_BODY = r"""((clip, limit = 50000, includeFrames = true) => {
+	const LIMIT = limit;
 	const vw = window.innerWidth || document.documentElement.clientWidth;
 	const vh = window.innerHeight || document.documentElement.clientHeight;
 	const SKIP = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'TEMPLATE', 'SVG']);
-	const inViewport = (rects) => {
+	const intersects = (rects, clip) => {
 		for (const r of rects) {
-			if (r.width > 0 && r.height > 0 && r.bottom > 0 && r.right > 0 && r.top < vh && r.left < vw) return true;
+			if (r.width > 0 && r.height > 0 && r.bottom > clip.top && r.right > clip.left
+				&& r.top < clip.bottom && r.left < clip.right) return true;
 		}
 		return false;
 	};
-	const blockCache = new Map();
-	const isBlock = (el) => {
-		if (!blockCache.has(el)) {
-			const d = getComputedStyle(el).display;
-			blockCache.set(el, !['inline', 'inline-block', 'inline-flex', 'inline-grid', 'contents'].includes(d));
-		}
-		return blockCache.get(el);
-	};
-	const blockOf = (el) => {
-		let cur = el;
-		while (cur && cur !== document.body && !isBlock(cur)) cur = cur.parentElement;
-		return cur || document.body;
-	};
+	const visibleTextStyle = (style) => style.visibility !== 'hidden' && style.visibility !== 'collapse';
+	const topClip = clip || {left: 0, top: 0, right: vw, bottom: vh};
+	const inViewport = (rects) => intersects(rects, topClip);
 	const lines = [];
-	let current = null;
-	let currentBlock = null;
 	let total = 0;
-	const root = document.body || document.documentElement;
-	const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
-	let node;
-	while ((node = walker.nextNode()) && total < LIMIT) {
-		const raw = node.nodeValue;
-		if (!raw || !raw.trim()) continue;
-		const el = node.parentElement;
-		if (!el || SKIP.has(el.tagName.toUpperCase())) continue;
-		const range = document.createRange();
-		range.selectNodeContents(node);
-		if (!inViewport(range.getClientRects())) continue;
-		const style = getComputedStyle(el);
-		if (style.visibility === 'hidden' || style.visibility === 'collapse') continue;
-		const text = raw.replace(/\s+/g, ' ').trim();
-		const block = blockOf(el);
-		if (block !== currentBlock) {
-			if (current) lines.push(current);
-			current = text;
-			currentBlock = block;
-		} else {
-			current += ' ' + text;
+	const readDocument = (doc, clip, prefix) => {
+		const root = doc.body || doc.documentElement;
+		if (!root || total >= LIMIT) return;
+		const win = doc.defaultView;
+		const blockCache = new Map();
+		const isBlock = (el) => {
+			if (!blockCache.has(el)) {
+				const d = win.getComputedStyle(el).display;
+				blockCache.set(el, !['inline', 'inline-block', 'inline-flex', 'inline-grid', 'contents'].includes(d));
+			}
+			return blockCache.get(el);
+		};
+		const blockOf = (el) => {
+			let cur = el;
+			while (cur && cur !== doc.body && !isBlock(cur)) cur = cur.parentElement;
+			return cur || doc.body;
+		};
+		let current = '';
+		let currentBlock = null;
+		const walker = doc.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+		let node;
+		while ((node = walker.nextNode()) && total < LIMIT) {
+			const raw = node.nodeValue;
+			const el = node.parentElement;
+			if (!raw?.trim() || !el || SKIP.has(el.tagName.toUpperCase())) continue;
+			const range = doc.createRange();
+			range.selectNodeContents(node);
+			if (!intersects(range.getClientRects(), clip) || !visibleTextStyle(win.getComputedStyle(el))) continue;
+			const text = raw.replace(/\s+/g, ' ').trim();
+			const block = blockOf(el);
+			if (block !== currentBlock) {
+				if (current) lines.push(prefix + current);
+				current = text;
+				currentBlock = block;
+				total += prefix.length;
+			} else {
+				current += ' ' + text;
+			}
+			total += text.length + 1;
 		}
-		total += text.length + 1;
-	}
-	if (current) lines.push(current);
+		if (current) lines.push(prefix + current);
+		if (!includeFrames) return;
+		for (const frame of doc.querySelectorAll('iframe,frame')) {
+			if (total >= LIMIT) break;
+			const rect = frame.getBoundingClientRect();
+			if (!intersects([rect], clip) || !visibleTextStyle(win.getComputedStyle(frame))) continue;
+			const left = rect.left + frame.clientLeft;
+			const top = rect.top + frame.clientTop;
+			const childClip = {
+				left: Math.max(0, clip.left - left), top: Math.max(0, clip.top - top),
+				right: Math.min(frame.clientWidth, clip.right - left),
+				bottom: Math.min(frame.clientHeight, clip.bottom - top),
+			};
+			if (childClip.right <= childClip.left || childClip.bottom <= childClip.top) continue;
+			try {
+				const child = frame.contentDocument;
+				if (child?.defaultView) readDocument(child, childClip, '[iframe] ');
+			} catch (error) {
+				if (error.name !== 'SecurityError') throw error;
+			}
+		}
+	};
+	readDocument(document, topClip, '');
+"""
+_VIEWPORT_BODY = (
+	_VIEWPORT_TEXT_BODY
+	+ r"""
 	const links = [];
 	for (const a of document.querySelectorAll('a[href]')) {
 		if (links.length >= 200) break;
@@ -116,11 +158,28 @@ _VIEWPORT_BODY = r"""(() => {
 		scroll: [scrollX, scrollY], text: lines.join('\n').slice(0, LIMIT), links, viewport: {width: vw, height: vh},
 		scrollDiagnostics};
 """
+)
 VISIBLE_TEXT_SCRIPT = _VIEWPORT_BODY + 'return viewport; })()'
 _VIEWPORT_WITH_REGIONS = (
 	_VIEWPORT_BODY
 	+ scroll_regions.OBSERVE_JS
 	+ 'return [JSON.stringify({...viewport, regions}), centerElement, ...regionNodes]; })()'
+)
+
+
+_CROSS_ORIGIN_EDITOR_TEXT = (
+	"""function(clip, limit) {
+		if (!this.isConnected || this.ownerDocument.defaultView !== window) return '';
+		try {
+			void window.top.document;
+			return '';
+		} catch (error) {
+			if (error.name !== 'SecurityError') throw error;
+		}
+		return """
+	+ _VIEWPORT_TEXT_BODY
+	+ r"""return lines.join('\n').slice(0, LIMIT); })(clip, limit, false);
+	}"""
 )
 
 
@@ -135,7 +194,7 @@ async def _legacy_viewport(cdp) -> dict:
 
 
 async def read_visible_text(browser_session: BrowserSession, *, include_regions: bool = True) -> dict[str, Any]:
-	"""Read main-document text and links from a single viewport in one CDP request."""
+	"""Read visible text, including same-origin frames, and top-level links in one CDP request."""
 	try:
 		cdp = await browser_session.get_or_create_cdp_session()
 		if not include_regions:
@@ -320,6 +379,48 @@ async def click_location(
 		return None
 
 
+async def _read_node_value(
+	browser: BrowserSession, node: EnhancedDOMTreeNode, function: str, arguments: list | None = None
+) -> str | None:
+	"""Read a live node in the CDP session that owns its backend ID."""
+	try:
+		cdp = await browser.cdp_client_for_node(node)
+		send, session_id = cdp.cdp_client.send, cdp.session_id
+		resolved = await send.DOM.resolveNode(params={'backendNodeId': node.backend_node_id}, session_id=session_id)
+		object_id = resolved['object'].get('objectId')
+		if not object_id:
+			return None
+		try:
+			result = await send.Runtime.callFunctionOn(
+				params={
+					'objectId': object_id,
+					'functionDeclaration': function,
+					'arguments': arguments or [],
+					'returnByValue': True,
+				},
+				session_id=session_id,
+			)
+			value = result['result'].get('value')
+			return value if isinstance(value, str) and 'exceptionDetails' not in result else None
+		finally:
+			await send.Runtime.releaseObject(params={'objectId': object_id}, session_id=session_id)
+	except Exception as exc:
+		logger.debug('Could not read live text for node %s: %s', node.backend_node_id, type(exc).__name__)
+		return None
+
+
+async def typed_target_value(browser: BrowserSession, node: EnhancedDOMTreeNode) -> str | None:
+	"""Read the target itself, even when input moved focus elsewhere."""
+	return await _read_node_value(
+		browser,
+		node,
+		"""function() {
+			if (!this.isConnected) return null;
+			return typeof this.value === 'string' ? this.value : this.innerText;
+		}""",
+	)
+
+
 async def still_focused(browser: BrowserSession, node: EnhancedDOMTreeNode, document: tuple[str, float, str]) -> bool:
 	"""A key goes to the actual focus, so verify the typed element again just before dispatch."""
 	target, epoch, url = document
@@ -417,6 +518,15 @@ def _states(node: EnhancedDOMTreeNode) -> dict[str, bool]:
 		if node.ax_node
 		else {}
 	)
+	if (
+		node.tag_name in {'html', 'body'}
+		and node.ax_node
+		and any(
+			prop.name == 'editable' and str(prop.value).lower() in {'true', 'richtext', 'plaintext'}
+			for prop in node.ax_node.properties or []
+		)
+	):
+		states['editable'] = True
 	for attr in ('disabled', 'readonly', 'required'):
 		if attr in node.attributes:
 			states[attr] = True
@@ -735,25 +845,65 @@ async def selected_option(
 	return None
 
 
+def _visibility_omission(node: EnhancedDOMTreeNode, width: int, height: int) -> OmissionReason | None:
+	# BU already applied the frame and scroll offsets to absolute_position.
+	rect = node.absolute_position
+	if rect is None or rect.width <= 0 or rect.height <= 0:
+		return 'no_rect'
+	if rect.x >= width or rect.y >= height or rect.x + rect.width <= 0 or rect.y + rect.height <= 0:
+		return 'outside_viewport'
+	return 'not_visible' if node.is_visible is False else None
+
+
 def _visible(node: EnhancedDOMTreeNode, width: int, height: int) -> bool:
-	# In BU 0.13.14 the tree builder has already applied frame and scroll offsets.
-	# DOMSnapshot.clientRects contains clientLeft/clientTop, not the element origin.
-	rect = node.absolute_position
-	return bool(
-		node.is_visible is not False
-		and rect
-		and rect.width > 0
-		and rect.height > 0
-		and rect.x < width
-		and rect.y < height
-		and rect.x + rect.width > 0
-		and rect.y + rect.height > 0
-	)
+	return _visibility_omission(node, width, height) is None
 
 
-def _viewport_rect(node: EnhancedDOMTreeNode, width: int, height: int) -> dict[str, int] | None:
-	rect = node.absolute_position
-	if rect is None:
+def add_candidate_omission(
+	audit: list[CandidateOmission], text: str, operation: Operation, key: str, label: str, reason: OmissionReason
+) -> None:
+	if len(audit) < 20 and label and label in text:
+		audit.append(CandidateOmission(operation=operation, key=key, label=label, reason=reason))
+
+
+def _audit_unindexed_controls(
+	summary: BrowserStateSummary, audit: list[CandidateOmission], text: str, width: int, height: int
+) -> None:
+	# BU may reject a disabled control or an offscreen control before assigning an index.
+	# Read the original nodes of this same snapshot so the omission still has a source.
+	root = summary.dom_state._root
+	if root is None or not text:
+		return
+	indexed = {(node.target_id, node.backend_node_id) for node in summary.dom_state.selector_map.values()}
+	pending = [root.original_node]
+	while pending and len(audit) < 20:
+		node = pending.pop()
+		if node.content_document:
+			pending.append(node.content_document)
+		pending.extend(reversed(node.children_and_shadow_roots))
+		if (node.target_id, node.backend_node_id) in indexed:
+			continue
+		if node.tag_name not in {'button', 'input', 'textarea', 'select', 'a'} and node.attributes.get('role') != 'button':
+			continue
+		if not (label := _name(node)) or label not in text:
+			continue
+		reason = _visibility_omission(node, width, height)
+		if reason is None and _states(node).get('disabled'):
+			reason = 'disabled'
+		if reason is not None:
+			key = f'dom:{node.target_id}:{node.backend_node_id}'
+			add_candidate_omission(audit, text, 'SELECT' if node.tag_name == 'select' else 'CLICK', key, label, reason)
+
+
+def _owning_frame(node: EnhancedDOMTreeNode) -> EnhancedDOMTreeNode | None:
+	parent = node.parent
+	while parent is not None and parent.tag_name not in {'iframe', 'frame'}:
+		parent = parent.parent
+	return parent
+
+
+def _viewport_origin(node: EnhancedDOMTreeNode) -> tuple[float, float] | None:
+	if (rect := node.absolute_position) is None:
 		return None
 	x, y = rect.x, rect.y
 	# BU adds each iframe's border-box origin. Its document starts inside the border.
@@ -763,6 +913,14 @@ def _viewport_rect(node: EnhancedDOMTreeNode, width: int, height: int) -> dict[s
 			x += client.x
 			y += client.y
 		parent = parent.parent
+	return x, y
+
+
+def _viewport_rect(node: EnhancedDOMTreeNode, width: int, height: int) -> dict[str, int] | None:
+	rect, origin = node.absolute_position, _viewport_origin(node)
+	if rect is None or origin is None:
+		return None
+	x, y = origin
 	left, top = max(0, math.floor(x)), max(0, math.floor(y))
 	right, bottom = min(width, math.ceil(x + rect.width)), min(height, math.ceil(y + rect.height))
 	if left >= right or top >= bottom:
@@ -774,13 +932,15 @@ def _element(index: int, node: EnhancedDOMTreeNode, url: str, settings: JevSetti
 	attrs, tag, role, states = node.attributes, node.tag_name, _role(node), _states(node)
 	context, form_key, dialog_key = _context(node)
 	kind = attrs.get('type', 'text').lower() if tag == 'input' else None
+	content_editable = 'contenteditable' in attrs and attrs['contenteditable'].lower() != 'false'
 	editable = (
 		kind != 'password'
 		and not (states.get('disabled') or states.get('readonly'))
 		and (
 			tag == 'textarea'
 			or kind in _TEXT_INPUTS
-			or ('contenteditable' in attrs and attrs['contenteditable'].lower() != 'false')
+			or states.get('editable')
+			or content_editable
 			or (tag != 'select' and role in {'textbox', 'searchbox', 'combobox'})
 		)
 	)
@@ -789,6 +949,12 @@ def _element(index: int, node: EnhancedDOMTreeNode, url: str, settings: JevSetti
 	except ValueError:
 		href = None
 	name = _name(node)
+	if editable and tag in {'html', 'body'}:
+		role = 'textbox'
+		frame = _owning_frame(node)
+		if frame:
+			title = _short(frame.attributes.get('title') or frame.attributes.get('name'), 104)
+			name = f'{title} (iframe body)' if title else 'iframe body'
 	return Candidate(
 		key=str(index),
 		kind='element',
@@ -804,6 +970,7 @@ def _element(index: int, node: EnhancedDOMTreeNode, url: str, settings: JevSetti
 		context=context,
 		rect=_viewport_rect(node, width, height),
 		editable=editable,
+		rich_text=editable and tag not in {'input', 'textarea'} and bool(content_editable or states.get('editable')),
 		is_submit=rules.is_ordinary_submit(tag, kind, attrs.get('type'), bool(form_key or 'form' in attrs)),
 		risky_effect=rules.risky_effect(role, name, settings.risky_action_labels)
 		if settings.checks.mode('risky_action') != 'off'
@@ -928,6 +1095,69 @@ def scroll_effect(before: Observation | None, after: Observation, target: Candid
 	return effect
 
 
+def _frame_content_clip(frame: EnhancedDOMTreeNode, width: int, height: int) -> dict[str, float] | None:
+	left, top, right, bottom = 0.0, 0.0, float(width), float(height)
+	content_origin = None
+	owner: EnhancedDOMTreeNode | None = frame
+	while owner is not None:
+		origin, snapshot = _viewport_origin(owner), owner.snapshot_node
+		if origin is None or snapshot is None or (client := snapshot.clientRects) is None:
+			return None
+		x, y = origin[0] + client.x, origin[1] + client.y
+		if content_origin is None:
+			content_origin = (x, y)
+		left, top = max(left, x), max(top, y)
+		right, bottom = min(right, x + client.width), min(bottom, y + client.height)
+		owner = _owning_frame(owner)
+	if left >= right or top >= bottom or content_origin is None:
+		return None
+	x, y = content_origin
+	return {'left': left - x, 'top': top - y, 'right': right - x, 'bottom': bottom - y}
+
+
+def _cross_origin_source(frame: EnhancedDOMTreeNode, page_url: str) -> bool:
+	try:
+		outer = urlsplit(page_url)
+		child = urlsplit(urljoin(page_url, frame.attributes.get('src', '')))
+		return (outer.scheme, outer.hostname, outer.port) != (child.scheme, child.hostname, child.port)
+	except ValueError:
+		return False
+
+
+async def _text_with_iframe_editors(
+	browser: BrowserSession, summary: BrowserStateSummary, rendered: dict[str, Any], page_url: str, width: int, height: int
+) -> str:
+	# The viewport script respects same-origin access. Read an already indexed, editable cross-origin root
+	# in its owned CDP session, and apply the same text and geometry limits before adding it to observations.
+	text = rendered['text']
+	target = rendered.get('target_id')
+	seen = set()
+	for node in summary.dom_state.selector_map.values():
+		if len(text) >= VISIBLE_TEXT_LIMIT:
+			break
+		if node.tag_name not in {'body', 'html'} or not _visible(node, width, height):
+			continue
+		if not (
+			_states(node).get('editable')
+			or 'contenteditable' in node.attributes
+			and node.attributes['contenteditable'].lower() != 'false'
+		):
+			continue
+		frame = _owning_frame(node)
+		if frame is None or not (node.target_id != target or _cross_origin_source(frame, page_url)):
+			continue
+		key = frame.target_id, frame.backend_node_id
+		if key in seen or (clip := _frame_content_clip(frame, width, height)) is None:
+			continue
+		seen.add(key)
+		lines = await _read_node_value(
+			browser, node, _CROSS_ORIGIN_EDITOR_TEXT, [{'value': clip}, {'value': VISIBLE_TEXT_LIMIT - len(text)}]
+		)
+		if lines and browser.agent_focus_target_id == target:
+			text += '\n'.join(['', *('[iframe] ' + line for line in lines.splitlines())])
+	return text[:VISIBLE_TEXT_LIMIT]
+
+
 async def observe(browser_session: BrowserSession, summary: BrowserStateSummary, settings: JevSettings, step: int) -> Observation:
 	pipeline = settings.effective_candidate_pipeline
 	rendered = summary.jev_viewport
@@ -1017,10 +1247,17 @@ async def observe(browser_session: BrowserSession, summary: BrowserStateSummary,
 	# Off preserves the PR5 candidate list when the page adds no region.
 	keep_legacy_scrolls = pipeline == 'pr5' or (pipeline == 'pr5_with_regions' and not regions)
 	unselectable = 0
+	audit: list[CandidateOmission] = []
+	visible_text = await _text_with_iframe_editors(browser_session, summary, rendered, page_url, width, height)
+	visible_labels = ' '.join(visible_text.split())
 	for index, node in summary.dom_state.selector_map.items():
-		if not _visible(node, width, height):
+		operation = 'SELECT' if node.tag_name == 'select' else 'CLICK'
+		if reason := _visibility_omission(node, width, height):
+			add_candidate_omission(audit, visible_labels, operation, str(index), _name(node), reason)
 			continue
 		field = _element(index, node, page_url, settings, width, height)
+		if field.states.get('disabled'):
+			add_candidate_omission(audit, visible_labels, operation, field.key, field.name, 'disabled')
 		if not field.states.get('disabled') and field.tag not in {'select', 'option'}:
 			candidates['CLICK'].append(field)
 		if field.editable:
@@ -1040,7 +1277,14 @@ async def observe(browser_session: BrowserSession, summary: BrowserStateSummary,
 			if keep_legacy_scrolls or not center_represented:
 				candidates['SCROLL_UP'].append(field)
 				candidates['SCROLL_DOWN'].append(field)
-	clicks = candidates['CLICK'] = _drop_click_wrappers(candidates['CLICK'], summary.dom_state.selector_map)
+	_audit_unindexed_controls(summary, audit, visible_labels, width, height)
+	before_wrappers = candidates['CLICK']
+	clicks = candidates['CLICK'] = _drop_click_wrappers(before_wrappers, summary.dom_state.selector_map)
+	if len(clicks) < len(before_wrappers):
+		kept = {candidate.key for candidate in clicks}
+		for candidate in before_wrappers:
+			if candidate.key not in kept:
+				add_candidate_omission(audit, visible_labels, 'CLICK', candidate.key, candidate.name, 'wrapper_dropped')
 	_describe_repeated_controls(clicks, summary.dom_state.selector_map)
 	tabs: list[dict[str, str]] = []
 	for tab in summary.tabs:
@@ -1069,11 +1313,12 @@ async def observe(browser_session: BrowserSession, summary: BrowserStateSummary,
 		viewport_width=viewport.get('width') or width,
 		viewport_height=viewport.get('height') or height,
 		scroll=scroll,
-		visible_text=rendered['text'],
+		visible_text=visible_text,
 		links=rendered['links'],
 		candidates=candidates,
 		scroll_regions=regions,
 		scroll_observation=scroll_observation,
+		audit=audit,
 		tabs=tabs,
 		can_go_back=go_back,
 		is_pdf=summary.is_pdf_viewer,

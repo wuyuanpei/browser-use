@@ -527,6 +527,47 @@ async def test_helper_failure_preserves_original_and_leaves_input_untouched(http
 	assert 'ALPHA-83' in res.answer_payloads[0]['collected_pages'][0]['text']
 
 
+@pytest.mark.parametrize(
+	('kind', 'may_submit', 'applies'),
+	[
+		('recipient', False, True),
+		('recipient', True, True),
+		('form', False, False),
+		('form', True, True),
+		('search', False, False),
+		('search', True, True),
+	],
+)
+async def test_enter_distinguishes_in_place_confirmation_from_submission(httpserver, tmp_path, kind, may_submit, applies):
+	field = {'recipient': 'Recipients', 'form': 'Reference', 'search': 'Search records'}[kind]
+	input_type = 'search' if kind == 'search' else 'text'
+	control = f'<label>{field}<input id="field" type="{input_type}"></label>'
+	js = (
+		"const field = document.querySelector('#field');"
+		"const show = () => { document.querySelector('#result').textContent = field.value; };"
+	)
+	if kind == 'form':
+		control = f'<form id="entry">{control}<button type="submit">Apply</button></form>'
+		js += "document.querySelector('#entry').addEventListener('submit', e => { e.preventDefault(); show(); });"
+	else:
+		js += "field.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); show(); } });"
+	url = serve_page(httpserver, '/confirm-enter', f'{control}<output id="result"></output><script>{js}</script>')
+	steps = [{'operation': 'TYPE_TEXT', 'target': field}, {'operation': 'PRESS_ENTER'}]
+	if applies:
+		steps.append({'operation': 'STEP_DONE'})
+	res = await run_case(
+		httpserver,
+		tmp_path,
+		url,
+		steps,
+		[delegate(may_submit=may_submit, inputs='Alice'), finish(applies)],
+		'document.querySelector("#result").textContent',
+		write='Alice',
+	)
+	assert res.final_page == ('Alice' if applies else '')
+	assert res.by_event('handback')[-1]['reason'] == ('step_done' if applies else 'submit_not_allowed')
+
+
 @pytest.mark.parametrize('checks', ['enforce', 'record'])
 async def test_submit_rule_measures_the_actual_search_effect(httpserver: HTTPServer, tmp_path: Path, checks: str):
 	url = serve_page(httpserver, '/search', SEARCH_FORM_PAGE)

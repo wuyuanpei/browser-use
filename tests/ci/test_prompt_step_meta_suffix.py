@@ -15,7 +15,11 @@ calls. Keeping it at the very end means everything above it can in principle be 
 moving it back into `<agent_state>` would silently shrink the cacheable prefix.
 """
 
-from browser_use.agent.prompts import AgentMessagePrompt
+from datetime import date
+
+import pytest
+
+from browser_use.agent.prompts import AgentMessagePrompt, SystemPrompt
 from browser_use.agent.views import AgentStepInfo
 from browser_use.browser.views import BrowserStateSummary, PageInfo, TabInfo
 from browser_use.dom.views import SerializedDOMState
@@ -117,3 +121,50 @@ def test_browser_state_error_is_visible_to_model(tmp_path):
 	assert isinstance(content, str)
 	assert '<browser_state_error>' in content
 	assert 'no element indices are safe to use' in content
+
+
+def test_calendar_uses_today_and_stays_in_the_step_suffix(tmp_path):
+	prompt = _make_prompt(tmp_path)
+	before = date.today()
+	content = prompt.get_user_message(use_vision=False).content
+	after = date.today()
+	assert isinstance(content, str)
+
+	prefix, marker, tail = content.partition('<step_info>')
+	assert marker and 'Calendar:' not in prefix
+	assert tail.endswith('</step_info>\n')
+	step_lines = tail.removesuffix('</step_info>\n').splitlines()
+	assert len(step_lines) == 3
+	step, today_line, calendar_line = step_lines
+	assert step == 'Step4 maximum:50'
+	assert today_line.startswith('Today:')
+	today = date.fromisoformat(today_line.removeprefix('Today:'))
+	assert today in {before, after}
+
+	assert calendar_line.startswith('Calendar: ')
+	entries = calendar_line.removeprefix('Calendar: ').split('; ')
+	assert len(entries) == 8
+	weekdays = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
+	for offset, entry in enumerate(entries):
+		label, formatted_date, weekday = entry.split()
+		expected = date.fromordinal(today.toordinal() + offset)
+		assert label == ('today' if offset == 0 else f'+{offset}d')
+		assert formatted_date == expected.isoformat()
+		assert weekday == weekdays[expected.isoweekday() - 1]
+
+
+@pytest.mark.parametrize(('flash', 'thinking'), [(False, True), (False, False), (True, True)])
+def test_planner_requires_observed_url_and_preserves_task_constraints(flash, thinking):
+	prompt = SystemPrompt(jev_mode='isolated', flash_mode=flash, use_thinking=thinking).get_system_message().content
+	assert isinstance(prompt, str)
+	rules = prompt.split('<subgoal_rules>\n', 1)[1].split('</subgoal_rules>', 1)[0]
+	assert rules.startswith('- Before the first delegation, list the task')
+	assert 'exact dates taken from the Calendar line' in rules
+	assert 'Never replace a constraint by a weaker one' in rules
+	assert 'finish with success=false and name the unsupported part' in rules
+	assert 'whose address you have seen' in rules
+	assert 'only after you have seen that URL pattern on the site' in rules
+	assert 'Never invent filter or query parameters (for example isFollow=1)' in rules
+	assert "do not try another guess, use the page's visible controls" in rules
+	assert 'Use at most one of start_url and start_tab' in rules
+	assert 'put search terms, dates or filters into the URL' not in rules

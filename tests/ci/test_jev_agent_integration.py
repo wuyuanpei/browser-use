@@ -1,5 +1,6 @@
 """Agent entry points, planner output schemas and end-to-end effects on real local pages."""
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -438,6 +439,37 @@ async def test_single_step_driver_has_final_answer(entry_point, httpserver, tmp_
 		assert agent.history.final_result() == 'Answer from the finishing page'
 		await agent._jev.finalize_if_done(agent)
 		assert agent._jev.usage_by_role()['answer']['calls'] == 1
+	finally:
+		await agent.eventbus.stop(clear=True, timeout=3)
+		await agent.close()
+
+
+async def test_time_budget_preserves_planner_result_when_answer_helper_is_slow(httpserver, tmp_path):
+	url = serve_page(httpserver, '/budget-done', '<p>No matches</p>')
+	trace = tmp_path / 'budget.jsonl'
+	reason = 'The page reports no matches for the requested filters.'
+	agent = make_agent(
+		'Apply the filters and report the matches or data insufficiency.',
+		[planner_action('finish', success=False, reason=reason)],
+		JevSettings(jev_api_key='test', time_budget_seconds=3, trace_path=trace),
+	)
+	assert agent._jev is not None
+
+	async def slow_answer(_payload):
+		await asyncio.sleep(4)
+		return 'Answer delivered too late'
+
+	agent._jev.helpers.answer = AsyncMock(side_effect=slow_answer)
+	try:
+		await agent.browser_session.start()
+		await agent.browser_session.navigate_to(url)
+		agent._jev.on_new_task()
+		await agent.take_step(AgentStepInfo(step_number=0, max_steps=4))
+		assert agent.history.final_result() == reason
+		assert not agent.history.is_successful()
+		agent._jev.helpers.answer.assert_awaited_once()
+		events = [json.loads(line) for line in trace.read_text(encoding='utf-8').splitlines()]
+		assert any(event['event'] == 'final_answer' and event['error'] == 'time_budget' for event in events)
 	finally:
 		await agent.eventbus.stop(clear=True, timeout=3)
 		await agent.close()

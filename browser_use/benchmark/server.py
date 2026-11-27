@@ -59,6 +59,7 @@ def baseline():
 		BASELINE = BaselineManager(
 			ARTIFACTS,
 			ORIGIN,
+			timeout=345,
 			run_factory=partial(BrowserUseRun, chrome=CHROME),
 			browser_mode='attached_chrome' if CHROME is not None else 'isolated',
 		)

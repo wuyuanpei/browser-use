@@ -5,7 +5,7 @@ import math
 import re
 import unicodedata
 from collections.abc import Collection, Iterable, Mapping
-from typing import Any, Protocol, cast, get_args
+from typing import Any, Literal, Protocol, cast, get_args
 
 from browser_use.agent.jev import questions as wording
 from browser_use.agent.jev.rules import http_url
@@ -26,6 +26,7 @@ from browser_use.agent.jev.views import (
 	Operation,
 	SubgoalRun,
 	System1Reply,
+	TextMode,
 )
 from browser_use.agent.jev.vision import PreparedImage
 
@@ -262,6 +263,8 @@ def build_questions(
 	context = [f'Current objective: {params.objective}', f'Completion: {params.completion}']
 	if params.text_mode == 'append':
 		context.append('Append only the requested new text to the current field.')
+	elif params.text_mode == 'auto' and 'TYPE_TEXT' in offered:
+		context.append('Auto appends only new text in rich-text editors and replaces values in ordinary fields.')
 	if params.inputs:
 		context.append(f'Inputs: {params.inputs}')
 	if params.review_note:
@@ -497,6 +500,12 @@ def combine(
 		if focus == target and focus_probability is not None and focus_probability >= focus_threshold:
 			result.operation_score = min(1.0, probability + click_probability * focus_probability)
 	return result
+
+
+def resolve_text_mode(mode: TextMode, target: Candidate | None) -> Literal['replace', 'append']:
+	if mode != 'auto':
+		return mode
+	return 'append' if target is not None and target.rich_text else 'replace'
 
 
 def to_bu_action(

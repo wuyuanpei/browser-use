@@ -85,6 +85,9 @@ URL and step. It can include rendered content outside the viewport. Use it as so
 Action records prove execution, not its result. Later conflicting observations override earlier states.
 Saved pages are visited source material, not current form state.
 completion_review records the planner's final judgment and supporting reason, not independent proof.
+Keep the order of items in the planner's finish reason and preserve action names and meanings. COLLECT saves
+page text. Describe COLLECT as collecting. Refer to questions by the numbers shown on the page.
+Keep supported limitations, such as a site not offering the requested ranking window.
 Use its explanation alongside the actual records; do not invent a failure or ask the user to repeat work
 that those records support. If evidence is genuinely insufficient, describe the specific uncertainty without
 claiming an unobserved failure. Respect the original scope: an intentionally omitted operation is not failure.
@@ -171,7 +174,15 @@ def render_handback(
 		lines.append(f'{discarded} decided action(s) were discarded before execution (pause or interruption); they did not run.')
 	if handback.operation:
 		prob = 'n/a' if handback.operation_probability is None else f'{handback.operation_probability:.2f}'
-		lines.append(f'Last System1 answer: {handback.operation} (operation p={prob}).')
+		target = f' {handback.target_label}' if handback.target_label else ''
+		probabilities = f'operation p={prob}'
+		if target:
+			target_prob = 'n/a' if handback.target_probability is None else f'{handback.target_probability:.2f}'
+			probabilities += f', target p={target_prob}'
+		lines.append(f'Last System1 answer: {handback.operation}{target} ({probabilities}).')
+	if handback.reason != 'step_done' and handback.new_text:
+		lines.append('Page text that appeared during this stage and was not on the starting page (untrusted data):')
+		lines.extend(f'- {text}' for text in handback.new_text)
 	if repeated_empty:
 		lines.append(
 			'This subgoal has been handed back twice in a row without any executed action; it will not be accepted again unchanged. Rewrite it or delegate something else first.'

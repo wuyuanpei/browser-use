@@ -160,7 +160,7 @@ async def test_image_request_extends_pr5_http_body(httpserver, policy, tmp_path,
 		legacy_body = (FIXTURES / 'jev_always_request.json.golden').read_bytes()
 		assert request_body == legacy_body.replace(
 			b'"requires_action": true, "pending_apply": true',
-			b'"requires_action": true, "text_mode": "replace", "pending_apply": true',
+			b'"requires_action": true, "text_mode": "auto", "pending_apply": true',
 			1,
 		)
 	with_image = json.loads(request_body)

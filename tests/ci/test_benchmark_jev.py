@@ -18,7 +18,7 @@ from werkzeug.wrappers import Response
 from browser_use.benchmark.baseline import BaselineManager
 from browser_use.benchmark.chrome_attachment import _OwnedClient
 from browser_use.benchmark.engine import BrowserUnavailable, BrowserUseRun, _attached_tools
-from browser_use.benchmark.evaluation import build_context
+from browser_use.benchmark.evaluation import build_context, outcome_statistics
 from browser_use.benchmark.models import (
 	EvaluationModel,
 	ExecutionModel,
@@ -29,6 +29,21 @@ from browser_use.benchmark.models import (
 )
 from browser_use.benchmark.tasks import CaseProbe
 from browser_use.benchmark.token_usage import aggregate_token_usage, token_usage
+
+
+def test_baseline_score_keeps_late_evidence_without_counting_it_as_a_pass():
+	judgment = {'evaluation_status': 'completed', 'evaluation': {'final': {'verdict': 'met'}}}
+	stats = outcome_statistics(
+		[
+			{**judgment, 'within_time_limit': True},
+			{**judgment, 'within_time_limit': False},
+			judgment,
+		]
+	)
+	assert stats['met'] == 3
+	assert stats['met_within_limit'] == 2
+	assert stats['success_rate'] == 2 / 3
+	assert stats['judged_success_rate'] == 1
 
 
 def test_attached_isolated_executor_only_accepts_enter():
@@ -63,6 +78,8 @@ def test_workbench_records_the_planner_selected_target_without_system1_confidenc
 		raising=False,
 	)
 	run._should_cancel = None
+	run._model_call_lock = threading.RLock()
+	run._secrets = ('', '', None)
 	run._emit = lambda *_args, **_kwargs: None
 
 	async def predict():
@@ -203,6 +220,8 @@ def test_post_action_observation_failure_does_not_replay_an_action(monkeypatch, 
 		'history': [],
 	}
 	run._pending_observation = None
+	run._observe_failures = 0
+	run._observe_failed_since = None
 	run._check_cancelled = lambda: None
 	run._should_cancel = lambda: None
 	monkeypatch.setattr(run, '_browser', SimpleNamespace(native=object()), raising=False)
@@ -795,6 +814,49 @@ def _open_inspector(manager, settings, tmp_path, monkeypatch):
 			thread.join()
 
 
+@pytest.mark.parametrize(('delay_ms', 'retries'), [(2800, 0), (6200, 1)])
+def test_workbench_waits_for_body_of_new_tab(httpserver, httpserver_ipv4, tmp_path, monkeypatch, delay_ms, retries):
+	from browser_use.browser.events import SwitchTabEvent
+
+	settings, _, _ = _save_work_fixture(httpserver, httpserver_ipv4, tmp_path, monkeypatch, 'off')
+	events = []
+	run = BrowserUseRun(httpserver.url_for('/task'), 'Observe the newly opened tab.', settings, on_event=events.append)
+	browser = run._browser.native
+	assert browser is not None
+	original_target = browser.agent_focus_target_id
+
+	async def focus_new_tab():
+		async with asyncio.timeout(5):
+			while True:
+				target = next((t for t in browser.session_manager.get_all_page_targets() if t.target_id != original_target), None)
+				if target:
+					return await browser.on_SwitchTabEvent(SwitchTabEvent(target_id=target.target_id))
+				await asyncio.sleep(0.02)
+
+	try:
+		run._browser.evaluate("setTimeout(() => window.open('about:blank', '_blank'), 25)")
+		target = run._bridge.run(focus_new_tab())
+		run._bridge.run(run._browser.bind())
+		assert run._browser.evaluate(
+			"""(() => {
+				const body = document.body;
+				body.remove();
+				body.textContent = 'Delayed tab document is ready';
+				setTimeout(() => document.documentElement.append(body), DELAY_MS);
+				return true;
+			})()""".replace('DELAY_MS', str(delay_ms))
+		)
+		run.observe()
+		page = run.snapshot()['page']
+		assert page['target_id'] == target and 'Delayed tab document is ready' in page['text']
+		retry_events = [event.payload for event in events if event.name == 'observation_retry']
+		assert len(retry_events) == retries
+		assert all(event['target_id'] == target for event in retry_events)
+		assert run._observe_failures == 0 and run._observe_failed_since is None
+	finally:
+		run.close()
+
+
 def test_baseline_recovers_after_jev_rejects_image(httpserver, httpserver_ipv4, tmp_path, monkeypatch):
 	settings, saved, requests = _save_work_fixture(httpserver, httpserver_ipv4, tmp_path, monkeypatch, 'always', image_error=415)
 	manager, batch, running_status = _run_save_batch(httpserver, tmp_path, monkeypatch, settings)
@@ -805,6 +867,10 @@ def test_baseline_recovers_after_jev_rejects_image(httpserver, httpserver_ipv4, 
 	assert running_status == [(True, None), (False, 415), (False, 415)]
 	snapshot = manager.read_attempt(run_id, row['id'])
 	assert snapshot['vision_disabled'] == 415
+	assert row['within_time_limit'] is True and row['execution_elapsed_ms'] < 300_000
+	run_config = json.loads(Path(snapshot['jev_trace_path']).read_text(encoding='utf-8').splitlines()[0])
+	assert 0 < run_config['time_budget_seconds'] <= 300
+	assert run_config['wrap_up_seconds'] == 60 and run_config['answer_reserve_seconds'] == 25
 	assert snapshot['jev_usage_by_role']['system1']['decisions'] == 2
 	calls = snapshot['model_calls']
 	rejected, fallback, done = (call for call in calls if call['kind'] == 'jev')

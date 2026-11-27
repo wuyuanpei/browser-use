@@ -17,6 +17,12 @@ SEGMENT_ACTIONS_LIMIT = 30
 TASK_ACTIONS_LIMIT = 10
 REPEAT_WINDOW = 8
 REPEAT_LIMIT = 3
+LOOP_CYCLE_REPEATS = 3
+LOOP_MAX_PERIOD = 3
+LOOP_REPEAT_CLICK = 4
+LOOP_REPEAT_TYPE = 3
+NEW_TEXT_MAX_LINES = 8
+NEW_TEXT_MAX_CHARS = 600
 NO_EFFECT_LIMIT = 2
 NO_ACTION_HANDBACK_LIMIT = 2
 SCROLL_PAGES = 0.8
@@ -101,6 +107,9 @@ class JevSettings(JevModel):
 	answer_llm: BaseChatModel | None = None
 	answer_prompt: str | None = None
 	answer_timeout: float = Field(default=120, gt=0)
+	time_budget_seconds: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+	wrap_up_seconds: float = Field(default=60, ge=0, allow_inf_nan=False)
+	answer_reserve_seconds: float = Field(default=25, ge=0, allow_inf_nan=False)
 	# thresholds and limits
 	min_read_operation_probability: float = Field(default=0.6, ge=0, le=1)
 	min_operation_probability: float = Field(default=0.8, ge=0, le=1)
@@ -111,6 +120,7 @@ class JevSettings(JevModel):
 	trace_path: str | Path | None = None
 	capture_dir: str | Path | None = None
 	# programmatic checks
+	verify_typed_text: bool = True
 	checks: Annotated[JevChecks, BeforeValidator(_parse_checks)] = Field(default_factory=JevChecks)
 	risky_action_labels: list[str] | None = None
 
@@ -144,6 +154,9 @@ class JevSettings(JevModel):
 		return self
 
 
+TextMode = Literal['replace', 'append', 'auto']
+
+
 class DelegateSubgoalParams(JevModel):
 	objective: str = Field(
 		description='What System1 should achieve in this stage only. State the result, not clicks, element indices, selectors or coordinates.'
@@ -155,9 +168,9 @@ class DelegateSubgoalParams(JevModel):
 	inputs: str | None = Field(
 		default=None, description='Values System1 must enter, e.g. "From=Zurich; To=London". Omit if nothing needs typing.'
 	)
-	text_mode: Literal['replace', 'append'] = Field(
-		default='replace',
-		description='How to type into an existing field. Use append for text that must preserve and follow its current contents. Use a separate stage when another field needs replacement.',
+	text_mode: TextMode = Field(
+		default='auto',
+		description='How to type. Auto appends in rich-text editors and replaces ordinary field values. Use append to preserve content explicitly, or replace to overwrite it.',
 	)
 	may_submit: bool = Field(
 		default=False,
@@ -266,6 +279,8 @@ HandbackReason = Literal[
 	'low_confidence',
 	'no_effect',
 	'repeated_action',
+	'loop_revisit',
+	'loop_repeat',
 	'wait_limit',
 	'action_error',
 	'step_error',
@@ -281,6 +296,7 @@ HandbackReason = Literal[
 	'risk_denied',
 	'unsupported_page',
 	'step_limit',
+	'time_budget',
 	'verification_stalled',
 	'observation_changed',
 ]
@@ -303,6 +319,9 @@ class ActionRecord(JevModel):
 	bu_action: dict[str, dict[str, Any]]  # e.g. {'click': {'index': 1530}}
 	fingerprint_before: str
 	url_before: str
+	state_before: str | None = None
+	state_after: str | None = None
+	target_signature: str | None = None
 	status: ActionStatus = 'predicted'
 	error: str | None = None
 	verified: bool | None = None  # SELECT only: the chosen option was selected in the next observation (5.8)
@@ -326,6 +345,7 @@ class Handback(JevModel):
 	target_probability: float | None = None
 	fingerprint: str | None = None  # observation at handback time, if one was made
 	evidence_key: str | None = None
+	new_text: list[str] = Field(default_factory=list)
 
 
 class SubgoalRun(JevModel):
@@ -337,6 +357,8 @@ class SubgoalRun(JevModel):
 	start_url: str  # page URL after start_url / start_tab was applied
 	start_site: str | None  # registrable_domain(start_url), None for non-http pages
 	actions: list[ActionRecord] = Field(default_factory=list)
+	start_lines: list[str] | None = Field(default=None, exclude=True)
+	new_text: list[str] = Field(default_factory=list)
 	applied: bool = False  # any applied action in this run
 	no_effect_streak: int = 0
 	new_evidence: bool = False
@@ -373,6 +395,7 @@ class Candidate(JevModel):
 	href: str | None = None
 	context: dict[str, str] = Field(default_factory=dict)
 	editable: bool = False
+	rich_text: bool = False
 	is_submit: bool = False
 	risky_effect: str | None = None  # appendix D, filled from T14 on
 	tab_id: str | None = None  # 4-character BU tab id, for kind='tab'
@@ -410,6 +433,16 @@ class Candidate(JevModel):
 		return data
 
 
+OmissionReason = Literal['not_visible', 'no_rect', 'outside_viewport', 'disabled', 'wrapper_dropped', 'pruned', 'candidate_limit']
+
+
+class CandidateOmission(JevModel):
+	operation: Operation
+	key: str
+	label: str
+	reason: OmissionReason
+
+
 class Observation(JevModel):
 	step: int  # agent.state.n_steps when observed
 	url: str
@@ -417,6 +450,7 @@ class Observation(JevModel):
 	scroll: dict[str, int]  # y, viewport_height, page_height, pixels_above, pixels_below
 	scroll_regions: list[ScrollRegion] = Field(default_factory=list)
 	scroll_observation: ScrollObservation | None = Field(default=None, exclude=True)
+	audit: list[CandidateOmission] = Field(default_factory=list, exclude=True)
 	viewport_width: int = 0
 	viewport_height: int = 0
 	visible_text: str  # full visible text, appendix F, at most 50,000 characters

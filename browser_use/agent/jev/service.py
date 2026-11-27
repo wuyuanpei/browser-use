@@ -5,7 +5,11 @@ import base64
 import json
 import logging
 import os
+import re
+from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
+from difflib import SequenceMatcher
+from hashlib import sha256
 from pathlib import Path
 from time import monotonic
 from typing import TYPE_CHECKING, Any, Literal
@@ -22,7 +26,13 @@ from browser_use.agent.jev.trace import JevTrace
 from browser_use.agent.jev.usage import Role, UsageLedger
 from browser_use.agent.jev.views import (
 	JEV_INPUT_USD_PER_MTOK,
+	LOOP_CYCLE_REPEATS,
+	LOOP_MAX_PERIOD,
+	LOOP_REPEAT_CLICK,
+	LOOP_REPEAT_TYPE,
 	MAX_REQUEST_CHARS,
+	NEW_TEXT_MAX_CHARS,
+	NEW_TEXT_MAX_LINES,
 	NO_ACTION_HANDBACK_LIMIT,
 	NO_EFFECT_LIMIT,
 	PAGE_TEXT_LIMIT,
@@ -32,6 +42,7 @@ from browser_use.agent.jev.views import (
 	VISIBLE_TEXT_LIMIT,
 	ActionRecord,
 	Candidate,
+	CandidateOmission,
 	CollectPageParams,
 	DelegateSubgoalParams,
 	DelegateSubgoalParamsSmart,
@@ -65,6 +76,8 @@ Stop = tuple[HandbackReason, str]
 _NO_PROGRESS_STOPS = frozenset(
 	{'step_done', 'unable', 'unable_probability', 'low_confidence', 'no_effect', 'wait_limit', 'repeated_action'}
 )
+
+_LOOP_HANDBACKS = frozenset({'loop_revisit', 'loop_repeat', 'repeated_action', 'no_effect'})
 
 
 @dataclass
@@ -141,10 +154,113 @@ def _is_repeated_empty(runs: list[SubgoalRun], identity: str, vision: bool = Fal
 	)
 
 
+def _cycle_period(states: list[str | None], intents: Sequence[tuple[str, str | None, str | None]] | None = None) -> int | None:
+	for period in range(1, LOOP_MAX_PERIOD + 1):
+		action_count = period * (LOOP_CYCLE_REPEATS - 1)
+		tail = states[-action_count - 1 :]
+		if len(tail) != action_count + 1 or None in tail or tail[:-period] != tail[period:]:
+			continue
+		if intents is not None:
+			steps = intents[-action_count:]
+			if len(steps) != action_count or steps[:-period] != steps[period:]:
+				continue
+			operations = {op for op, _, _ in steps}
+			# Saving and waiting can make progress without changing the visible page. Scrolling
+			# forward through equivalent viewports also needs a reversal before it proves a cycle.
+			if operations & {'COLLECT', 'WAIT'} or operations in ({'SCROLL_UP'}, {'SCROLL_DOWN'}):
+				continue
+		return period
+	return None
+
+
+def _action_cycle(actions: list[ActionRecord]) -> int | None:
+	if not actions:
+		return None
+	states = [actions[0].state_before]
+	for action in actions:
+		if states[-1] != action.state_before:
+			states[-1] = None
+		states.append(action.state_after)
+	intents = [(action.operation, action.target_signature, action.text) for action in actions]
+	period = _cycle_period(states, intents)
+	if period is None:
+		return None
+	pattern = actions[-period * (LOOP_CYCLE_REPEATS - 1) :]
+	if {action.operation for action in pattern} == {'SCROLL_UP', 'SCROLL_DOWN'}:
+		return period
+	native_steps = [(action.target_key, action.fingerprint_before) for action in pattern]
+	# Keep the existing repeat guard when both laps reuse the same live page and target IDs.
+	return None if native_steps[:-period] == native_steps[period:] else period
+
+
+def _intent_target(target: Candidate | None) -> str | None:
+	if target is None:
+		return None
+	return f'{target.role}|{target.name}' if target.name else f'key:{target.key}'
+
+
+def _repeated_intent(
+	actions: list[ActionRecord], operation: Operation, target: str | None, text: str | None
+) -> list[ActionRecord]:
+	if operation not in ('CLICK', 'SELECT', 'PRESS_ENTER', 'TYPE_TEXT'):
+		return []
+	window = actions if operation == 'TYPE_TEXT' else actions[-REPEAT_WINDOW:]
+	matches = [
+		action for action in window if (action.operation, action.target_signature, action.text) == (operation, target, text)
+	]
+	if operation == 'TYPE_TEXT':
+		return matches if len(matches) >= LOOP_REPEAT_TYPE - 1 else []
+	if len(matches) < LOOP_REPEAT_CLICK - 1:
+		return []
+
+	match_numbers = {action.n for action in matches}
+	seen = set()
+	revisits = 0
+	for action in actions:
+		seen.add(action.state_before)
+		if action.n in match_numbers and action.state_after is not None and action.state_after in seen:
+			revisits += 1
+		seen.add(action.state_after)
+	return matches if revisits >= 2 else []
+
+
+def _same_goal(left: DelegateSubgoalParams, right: DelegateSubgoalParams) -> bool:
+	left_completion = ' '.join(left.completion.casefold().split())
+	right_completion = ' '.join(right.completion.casefold().split())
+	if left_completion == right_completion:
+		return True
+	left_objective = ' '.join(left.objective.casefold().split())
+	right_objective = ' '.join(right.objective.casefold().split())
+	return SequenceMatcher(None, left_objective, right_objective).ratio() >= 0.8
+
+
+def _repeats_route(params: DelegateSubgoalParams, previous: SubgoalRun) -> bool:
+	return (params.start_url is None or params.start_url == previous.start_url) and (
+		params.start_tab is None or params.start_tab == previous.params.start_tab
+	)
+
+
+def _track_progress(run: SubgoalRun, visible_text: str) -> None:
+	lines = rules.content_lines(visible_text)
+	if run.start_lines is None:
+		run.start_lines = lines
+		return
+	start = set(run.start_lines)
+	for line in lines:
+		if line in start or len(line) < 4 or not any(char.isalpha() for char in line):
+			continue
+		line = line[:160]
+		if line not in run.new_text:
+			run.new_text.append(line)
+	while len(run.new_text) > NEW_TEXT_MAX_LINES or sum(map(len, run.new_text)) > NEW_TEXT_MAX_CHARS:
+		run.new_text.pop(0)
+
+
 class JevExecutor:
 	def __init__(self, agent: 'Agent', settings: JevSettings):
 		self.agent = agent
 		self.settings = settings
+		self._budget_started = monotonic()
 		self.trace = JevTrace(Path(settings.trace_path or agent.agent_directory / 'jev_trace.jsonl'), agent.id)
 		self.gate = CheckGate(settings.checks, self.trace)
 		self.runs: list[SubgoalRun] = []
@@ -158,6 +274,7 @@ class JevExecutor:
 		self._seen_evidence: set[str] = set()
 		self._confidence_rechecked: set[str] = set()
 		self._evidence_key: str | None = None
+		self._last_candidate_audit: list[CandidateOmission] = []
 		self.pending_record: ActionRecord | None = None
 		self._record_target: Candidate | None = None
 		self._typed_field: _TypedField | None = None
@@ -205,6 +322,9 @@ class JevExecutor:
 					'max_candidates',
 					'pruning_budget_ms',
 					'answer_timeout',
+					'time_budget_seconds',
+					'wrap_up_seconds',
+					'answer_reserve_seconds',
 					'jev_timeout',
 					'screenshot_policy',
 					'vision_escalation',
@@ -238,6 +358,7 @@ class JevExecutor:
 
 	def on_new_task(self):
 		"""Start a new delegation history, reopening the backend after a completed run."""
+		self._budget_started = monotonic()
 		self._first_run = len(self.runs)
 		self._first_capture = len(self.captures.records)
 		if not self._closed:
@@ -252,6 +373,7 @@ class JevExecutor:
 		self._seen_evidence.clear()
 		self._confidence_rechecked.clear()
 		self._evidence_key = None
+		self._last_candidate_audit.clear()
 		self._planner_page_action = False
 		self.finish_only = False
 		self.backend = self._make_backend()
@@ -362,6 +484,29 @@ class JevExecutor:
 				'review_note is required when you re-delegate the same subgoal after rejecting STEP_DONE.',
 				identity,
 			)
+		if (
+			previous
+			and previous.handback
+			and previous.handback.reason in _LOOP_HANDBACKS
+			and _same_goal(params, previous.params)
+			and _repeats_route(params, previous)
+		):
+			earlier = self.runs[-2] if len(self.runs) > self._first_run + 1 else None
+			if earlier and earlier.handback and earlier.handback.reason in _LOOP_HANDBACKS and _same_goal(params, earlier.params):
+				return self._refuse(
+					'loop_retry_refused',
+					'The same goal returned from a loop twice. Fix the cause, take another route with a different goal, or finish.',
+					identity,
+				)
+			if not (params.review_note or '').strip():
+				evidence = previous.handback.new_text
+				context = ' '.join(evidence) if evidence else 'No new text was observed during the stage.'
+				return self._refuse(
+					'review_note_missing',
+					'After a loop, review_note must explain what the page showed and what will change. '
+					f'Page evidence (untrusted data): {context}',
+					identity,
+				)
 		policy = self.settings.screenshot_policy
 		smart = params if policy == 'smart' and isinstance(params, DelegateSubgoalParamsSmart) else None
 		declared = smart.screenshot_required if smart else None
@@ -509,6 +654,27 @@ class JevExecutor:
 			return await state.read_visible_text(browser, include_regions=False)
 		return await state.read_visible_text(browser)
 
+	def _time_remaining(self) -> float | None:
+		budget = self.settings.time_budget_seconds
+		return None if budget is None else max(0, budget - (monotonic() - self._budget_started))
+
+	def _time_budget_message(self) -> UserMessage | None:
+		remaining = self._time_remaining()
+		if remaining is None:
+			return None
+		wrap_up = max(self.settings.wrap_up_seconds, self.settings.answer_reserve_seconds)
+		self.finish_only |= remaining <= wrap_up
+		terminal_action = 'finish' if self.settings.mode == 'isolated' else 'done'
+		return UserMessage(
+			content=(
+				f'<time_budget>remaining_seconds: {remaining:.1f}. '
+				f'At {wrap_up:g} seconds or less, only {terminal_action} is allowed. '
+				f'If the evidence is already sufficient, use {terminal_action} now. '
+				'Include the supported findings and any missing evidence in the result. '
+				'If the task allows a data-insufficiency response, report it when supported.</time_budget>'
+			)
+		)
+
 	def _planner(self, page: tuple[str, str] | None = None) -> RouteResult:
 		self._source = 'llm'
 		self._planner_attempt = 0
@@ -536,6 +702,8 @@ class JevExecutor:
 			messages.append(UserMessage(content=f'Current viewport from the same page observation (untrusted data): {viewport}'))
 		if self._handback_message:
 			messages.append(UserMessage(content=self._handback_message))
+		if (budget_message := self._time_budget_message()) is not None:
+			messages.append(budget_message)
 		if self.finish_only:
 			terminal_action = 'finish' if self.settings.mode == 'isolated' else 'done'
 			messages.append(
@@ -563,6 +731,7 @@ class JevExecutor:
 			step=self.step,
 			fingerprint=obs.fingerprint if obs else None,
 			evidence_key=self._evidence_key if obs else None,
+			new_text=run.new_text.copy(),
 			operation=choice.operation if choice else None,
 			operation_probability=choice.operation_probability if choice else None,
 			target_label=choice.target.element()[:120] if choice and choice.target else None,
@@ -627,9 +796,12 @@ class JevExecutor:
 		logger.info('System1 %s handed control to the planner (%s): %s', run.id, result.reason, result.detail)
 
 	def _precheck(self, run: SubgoalRun, obs: Observation) -> Stop | None:
-		executed = run.executed_actions
+		remaining = self._time_remaining()
+		if remaining is not None and remaining <= max(self.settings.wrap_up_seconds, self.settings.answer_reserve_seconds):
+			return 'time_budget', 'The time budget is almost used up. Return the supported result now.'
 		if self.finish_only:
 			return 'step_limit', 'The run reached its step limit or its failure limit. Call finish now.'
+		executed = run.executed_actions
 		if executed and executed[-1].status in ('executed_failed', 'unknown'):
 			return 'action_error', f'The last action failed or its effect is unknown: {executed[-1].error}'
 		if self.agent.state.consecutive_failures > 0:
@@ -646,6 +818,10 @@ class JevExecutor:
 				'no_effect',
 				f'The last {run.no_effect_streak} actions did not change the page. Consider a different route or control.',
 			)
+		if period := _action_cycle(executed):
+			numbers = [action.n for action in executed[-period * (LOOP_CYCLE_REPEATS - 1) :]]
+			self.trace.write('loop_detected', self.step, run_id=run.id, kind='loop_revisit', period=period, actions=numbers)
+			return 'loop_revisit', f'The page keeps returning to the same evidence in a {period}-action cycle.'
 		if len(executed) >= run.max_actions:
 			return 'action_budget', f'The action budget of this subgoal ({run.max_actions}) is used up. Review the result.'
 		return None
@@ -719,15 +895,43 @@ class JevExecutor:
 			>= REPEAT_LIMIT - 1
 		)
 
+	def _loop_repeat(self, run: SubgoalRun, choice: decision.Decision, text: str | None) -> Stop | None:
+		target = _intent_target(choice.target)
+		matches = _repeated_intent(run.executed_actions, choice.operation, target, text)
+		if matches:
+			self.trace.write(
+				'loop_detected',
+				self.step,
+				run_id=run.id,
+				kind='loop_repeat',
+				signature={
+					'operation': choice.operation,
+					'target': (
+						redact_sensitive_string(target, collect_sensitive_data_values(self.agent.sensitive_data or {}))
+						if target is not None
+						else None
+					),
+					'text_sha256': sha256(text.encode()).hexdigest() if text is not None else None,
+				},
+				actions=[action.n for action in matches],
+			)
+			return 'loop_repeat', 'System1 was about to repeat the same action without new evidence of progress.'
+		return None
+
 	async def _action_check(self, run: SubgoalRun, obs: Observation, choice: decision.Decision) -> tuple[Stop | None, str | None]:
 		op, target = choice.operation, choice.target
 		repeated: Stop = ('repeated_action', 'System1 was about to repeat the same action on an unchanged page a third time.')
-		if op != 'TYPE_TEXT' and self._repeat(run, obs, choice, None):
-			return repeated, None
+		if op != 'TYPE_TEXT':
+			if self._repeat(run, obs, choice, None):
+				return repeated, None
+			if stop := self._loop_repeat(run, choice, None):
+				return stop, None
 		executed = run.executed_actions
 		if op == 'WAIT' and executed and executed[-1].operation == 'WAIT':
 			return ('wait_limit', 'System1 chose WAIT twice in a row.'), None
-		submission = op == 'PRESS_ENTER' or (op == 'CLICK' and target and target.is_submit)
+		submission = (op == 'PRESS_ENTER' and self._enter_is_submit(obs, target)) or (
+			op == 'CLICK' and target and target.is_submit
+		)
 		if self.gate.evaluate('submit', bool(submission and not run.params.may_submit), f'{op} requires may_submit', self.step):
 			return (
 				'submit_not_allowed',
@@ -755,8 +959,24 @@ class JevExecutor:
 				and self.gate.evaluate('confidence', True, 'The proposed text could send an Enter key.', self.step)
 			):
 				return ('low_confidence', 'Focusing the same field supports typing only the delegated single-line text.'), None
-			return (repeated if self._repeat(run, obs, choice, text) else None), text
+			return (repeated if self._repeat(run, obs, choice, text) else self._loop_repeat(run, choice, text)), text
 		return None, None
+
+	@staticmethod
+	def _enter_is_submit(obs: Observation, field: Candidate | None) -> bool:
+		if field is None:
+			return True
+		clicks = obs.candidates.get('CLICK', [])
+		if field.form_key is not None and any(c.is_submit and c.form_key == field.form_key for c in clicks):
+			return True
+		if rules.enter_effect(field, clicks) is not None:
+			return True
+		search_label = f'{field.name} {field.placeholder or ""}'
+		return (
+			field.role == 'searchbox'
+			or field.input_type == 'search'
+			or re.search(r'搜索|查找|search|query', search_label, re.IGNORECASE) is not None
+		)
 
 	async def _risky_action(self, run: SubgoalRun, obs: Observation, choice: decision.Decision) -> Stop | None:
 		if self.gate.is_off('risky_action'):
@@ -1259,6 +1479,31 @@ class JevExecutor:
 				)
 		return retry, retry_reply, retry_choice, obs, retry_stop
 
+	def _audit_candidates(
+		self,
+		obs: Observation,
+		offered_obs: Observation,
+		offered: list[Operation],
+		selected: dict[str, list[Candidate]],
+		registered: set[str],
+	) -> None:
+		omitted = list(obs.audit)
+		text = ' '.join(obs.visible_text.split())
+		kept_clicks = {candidate.key for candidate in offered_obs.candidates['CLICK']}
+		for candidate in obs.candidates['CLICK']:
+			if candidate.key not in kept_clicks:
+				state.add_candidate_omission(omitted, text, 'CLICK', candidate.key, candidate.name, 'pruned')
+		for operation in offered:
+			if operation not in selected:
+				continue
+			kept = {candidate.key for candidate in selected[operation]}
+			for candidate in decision._targets(offered_obs, operation, registered):
+				if candidate.key not in kept:
+					state.add_candidate_omission(omitted, text, operation, candidate.key, candidate.name, 'candidate_limit')
+		if omitted and omitted != self._last_candidate_audit:
+			self.trace.write('candidate_audit', self.step, omitted=[row.model_dump() for row in omitted])
+		self._last_candidate_audit = omitted
+
 	async def route(self, agent: 'Agent', browser_state_summary: BrowserStateSummary) -> RouteResult:
 		self._source = 'llm'
 		self._reviewed_click = None
@@ -1284,6 +1529,9 @@ class JevExecutor:
 		self.last_observation = obs
 		self.observations = [*self.observations[-11:], obs]
 		key = self._evidence_key = state.evidence_key(obs)
+		if not obs.state_error:
+			sensitive = collect_sensitive_data_values(self.agent.sensitive_data or {})
+			_track_progress(run, redact_sensitive_string(obs.visible_text, sensitive))
 		if not obs.state_error and key not in self._seen_evidence:
 			self._seen_evidence.add(key)
 			run.new_evidence = True
@@ -1355,6 +1603,7 @@ class JevExecutor:
 				return self._handback(run, size_error, obs)
 			maximum = max(1, maximum // 2)
 
+		self._audit_candidates(obs, candidate_obs, offered, selected_targets, registered)
 		self.usage.roles['system1'].decisions += 1
 		run.decisions += 1
 		initial_stats = request.stats.copy()
@@ -1466,7 +1715,8 @@ class JevExecutor:
 			return self._handback(run, stop, obs, choice, navigation=navigation)
 		assert choice is not None
 		target = choice.target
-		bu_action = decision.to_bu_action(choice.operation, target, text, append=run.params.text_mode == 'append')
+		append = decision.resolve_text_mode(run.params.text_mode, target) == 'append'
+		bu_action = decision.to_bu_action(choice.operation, target, text, append=append)
 		action = agent.ActionModel.model_validate(bu_action)
 		output = agent.AgentOutput(
 			thinking=None,
@@ -1488,6 +1738,8 @@ class JevExecutor:
 			text=text,
 			fingerprint_before=obs.fingerprint,
 			url_before=obs.url,
+			state_before=self._evidence_key,
+			target_signature=_intent_target(target),
 		)
 		run.actions.append(record)
 		self.task_actions.append(record)
@@ -1601,10 +1853,9 @@ class JevExecutor:
 		record.error = error
 		if not error and record.operation == 'TYPE_TEXT' and isinstance(index, int):
 			document = state.captured_document(self._routed_observation)
-			summary = agent.browser_session._cached_browser_state_summary
-			node = summary.dom_state.selector_map.get(index) if summary and summary.dom_state else None
-			if document is not None and node is not None:
-				self._typed_field = _TypedField(document, node)
+			summary = self._routed_observation
+			node = summary.dom_state.selector_map.get(index) if summary else None
+			self._typed_field = _TypedField(document, node) if document is not None and node is not None else None
 
 	async def _complete_record(
 		self, run: SubgoalRun, obs: Observation, summary: BrowserStateSummary, previous: Observation | None
@@ -1614,6 +1865,7 @@ class JevExecutor:
 			return
 		target = self._record_target
 		record.url_after = obs.url
+		record.state_after = self._evidence_key if not obs.state_error else None
 		if record.operation in ('SCROLL_UP', 'SCROLL_DOWN'):
 			effect = state.scroll_effect(previous, obs, target)
 			record.scroll_effect = effect
@@ -1631,6 +1883,18 @@ class JevExecutor:
 					if not record.verified:
 						record.status = 'executed_failed'
 						record.error = f'The page did not keep option {n} "{target.option_text}"; current: {current}.'
+		if record.operation == 'TYPE_TEXT' and record.status == 'executed_ok' and self.settings.verify_typed_text:
+			field = self._typed_field
+			actual = None
+			if field and field.document == state.captured_document(summary):
+				actual = await state.typed_target_value(self.agent.browser_session, field.node)
+			expected = ' '.join(record.bu_action['input']['text'].split())
+			current = ' '.join(actual.split()) if actual is not None else None
+			record.verified = current is not None and (expected in current if expected else not current)
+			if not record.verified:
+				record.status = 'executed_failed'
+				record.error = 'typed text not found in the target'
+				self._typed_field = None
 		changes = record.operation in ('TYPE_TEXT', 'SELECT', 'PRESS_ENTER') or (
 			record.operation == 'CLICK' and target and target.kind == 'element' and not target.editable
 		)
@@ -1665,6 +1929,11 @@ class JevExecutor:
 		self.pending_record = None
 		self._record_target = None
 
+	def _answer_time_left(self) -> float | None:
+		remaining = self._time_remaining()
+		# The benchmark still needs time to publish the result after the answer is returned.
+		return None if remaining is None else max(0, remaining - 1)
+
 	async def finalize_if_done(self, agent: 'Agent'):
 		async with self._finalize_lock:
 			await self._finalize_current(agent)
@@ -1692,7 +1961,8 @@ class JevExecutor:
 			return
 		last_page = {'url': item.state.url, 'title': item.state.title, 'text': ''}
 		try:
-			page = await self._read_viewport_text(agent.browser_session)
+			async with asyncio.timeout(self._answer_time_left()):
+				page = await self._read_viewport_text(agent.browser_session)
 			focus = agent.browser_session.agent_focus_target_id
 			target_matches = not self._routed_target or self._routed_target == (item.metadata.step_number, focus)
 			if not last_page['url'] and focus and self._routed_target == (item.metadata.step_number, focus):
@@ -1755,12 +2025,18 @@ class JevExecutor:
 						dom_text=dom_text,
 					)
 		error = None
+		answer_budget = asyncio.timeout(self._answer_time_left())
 		try:
-			result.extracted_content = await self.helpers.answer(payload)
+			async with answer_budget:
+				result.extracted_content = await self.helpers.answer(payload)
 		except Exception as exc:
-			error = type(exc).__name__
-			result.success = False
-			result.extracted_content = f'Final answer could not be generated ({error}). Planner reason: {reason}'
+			if answer_budget.expired():
+				error = 'time_budget'
+				result.extracted_content = reason
+			else:
+				error = type(exc).__name__
+				result.success = False
+				result.extracted_content = f'Final answer could not be generated ({error}). Planner reason: {reason}'
 		if agent.state.last_result and agent.state.last_result[-1].is_done:
 			agent.state.last_result[-1].extracted_content = result.extracted_content
 			agent.state.last_result[-1].success = result.success

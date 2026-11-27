@@ -7,7 +7,7 @@ from typing import Any, TypeVar
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from browser_use.agent.jev import prompts
+from browser_use.agent.jev import decision, prompts
 from browser_use.agent.jev.views import (
 	ANSWER_LIMIT,
 	PAGE_TEXT_LIMIT,
@@ -94,9 +94,11 @@ class ModelHelpers:
 	async def text(
 		self, goal: str, run: SubgoalRun, obs: Observation, field: Candidate, actions: list[ActionRecord]
 	) -> str | None:
+		subgoal = run.params.model_dump(include={'objective', 'completion', 'inputs', 'text_mode'})
+		subgoal['text_mode'] = decision.resolve_text_mode(run.params.text_mode, field)
 		payload = {
 			'original_goal': goal,
-			'subgoal': run.params.model_dump(include={'objective', 'completion', 'inputs', 'text_mode'}),
+			'subgoal': subgoal,
 			'field': field_info(field),
 			'page': {
 				'url': obs.url,

@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode
 
-from .archive import atomic_json
+from .archive import AttemptPublisher, atomic_json
 from .engine import MAX_STEPS, VIEWPORT, BrowserMode, BrowserUnavailable, BrowserUseRun, RunCancelled, RunEvent
 from .evaluation import attempt_status, build_context, evaluate_frozen, freeze_context, outcome_statistics
 from .models import DEBUG_PROFILE, FINAL_REPORT_PROFILE, PROVIDER, RunSettings, redact_secrets, runtime_settings
@@ -505,6 +505,7 @@ class BaselineManager:
 			'verdict',
 			'evaluation_reason',
 			'execution_elapsed_ms',
+			'within_time_limit',
 			'execution_mode',
 			'system1_provider',
 			'jev_model',
@@ -572,7 +573,8 @@ class BaselineManager:
 			'',
 			f'批次：{batch["id"]}',
 			f'状态：{batch["status"]}',
-			f'目标达成：{stats["met"]} / {stats["attempts"]}（分母包含所有计划尝试）',
+			f'限时内达成：{stats["met_within_limit"]} / {stats["attempts"]}（分母包含所有计划尝试）',
+			f'独立终验判为达成：{stats["met"]}（其中超出限时或未正常结束 {stats["met"] - stats["met_within_limit"]}）',
 			'',
 			f'总成功率：{batch["success_rate"]:.1%}；环境阻塞：{counts["environment_blocked"]} 次',
 			'',
@@ -787,27 +789,39 @@ class BaselineManager:
 		folder = self.attempt_folder(run_id, row['id'])
 		(folder / 'screenshots').mkdir(parents=True)
 		started = time.monotonic()
+		deadline = started + self.timeout
+		settings = settings.model_copy(update={'time_limit_seconds': self.timeout, 'deadline_monotonic': deadline})
 		evaluation_started_at = now()
 		observations, evaluations, execution_events = [], [], []
 		agent = None
 		fatal = ''
+		terminal_time: tuple[float, str] | None = None
 
 		def cancelled():
 			if self.stop_event.is_set():
 				return 'cancelled'
-			return 'timeout' if time.monotonic() - started >= self.timeout else None
+			return 'timeout' if time.monotonic() >= deadline else None
 
 		def append(event, payload):
 			with (folder / 'events.jsonl').open('a', encoding='utf-8') as stream:
 				stream.write(json.dumps(self.clean({'time': now(), 'event': event, **payload}), ensure_ascii=False) + '\n')
 
-		def publish(snapshot: dict[str, Any]):
-			"""Persist the same state that the page can read while the attempt is running."""
-			snapshot = deepcopy(snapshot)
-			snapshot['page'].pop('screenshot', None)
-			snapshot['observations'] = observations
+		def prepare_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
+			prepared = {**snapshot, 'observations': observations.copy()}
+			for key in ('page', 'history', 'elements'):
+				if key in snapshot:
+					prepared[key] = deepcopy(snapshot[key])
+			if 'model_calls' in snapshot:
+				prepared['model_calls'] = [
+					deepcopy(call) if call.get('status') == 'pending' else call for call in snapshot['model_calls']
+				]
+			page = prepared['page']
+			page.pop('screenshot', None)
 			if observations:
-				snapshot['page']['screenshot_url'] = observations[-1].get('screenshot_url')
+				page['screenshot_url'] = observations[-1].get('screenshot_url')
+			return prepared
+
+		def write_snapshot(snapshot: dict[str, Any]) -> None:
 			snapshot = self.clean(snapshot)
 			atomic_json(folder / 'trace.json', snapshot)
 			result = snapshot.get('result')
@@ -815,6 +829,8 @@ class BaselineManager:
 			(folder / 'result.md').write_text((result or {}).get('markdown', ''), encoding='utf-8')
 			if partial := snapshot.get('partial_result'):
 				(folder / 'partial-result.md').write_text(partial['markdown'], encoding='utf-8')
+
+		def publish_memory(snapshot: dict[str, Any]) -> None:
 			calls = snapshot.get('model_calls', [])
 			verify_calls = [call for call in calls if call['kind'] == 'verify']
 			verify_usage = Counter()
@@ -854,8 +870,14 @@ class BaselineManager:
 						risk_calls=roles['risk']['calls'],
 					)
 
+		publisher = AttemptPublisher(publish_memory, write_snapshot, prepare=prepare_snapshot)
+
 		def event(record: RunEvent):
+			nonlocal terminal_time
 			name, payload, snapshot = record.name, record.payload, record.snapshot
+			is_terminal = name == 'action_result' and snapshot.get('status') in {'done', 'blocked'}
+			if is_terminal:
+				terminal_time = (time.monotonic(), now())
 			append(name, payload)
 			if name in {'action_started', 'action_executed', 'action_result', 'observation_error'}:
 				execution_events.append({'event': name, 'time': now(), **deepcopy(payload)})
@@ -864,7 +886,7 @@ class BaselineManager:
 				step = len(snapshot['history'])
 				phase = payload['phase']
 				evaluations.append(
-					{'step': step, 'time': now(), 'phase': phase, 'event_seq': payload['event_seq'], **preview.sample}
+					self.clean({'step': step, 'time': now(), 'phase': phase, 'event_seq': payload['event_seq'], **preview.sample})
 				)
 				frame = {
 					'step': step,
@@ -892,11 +914,10 @@ class BaselineManager:
 				append('observed', {'page': page, 'evaluation': preview.sample, 'frame': frame})
 				atomic_json(
 					folder / 'evaluation.json',
-					self.clean(
-						{'observations': evaluations, 'metrics_status': 'not_computed', 'ever_met': None, 'first_met_step': None}
-					),
+					{'observations': evaluations, 'metrics_status': 'not_computed', 'ever_met': None, 'first_met_step': None},
+					indent=None,
 				)
-			publish(snapshot)
+			publisher.publish(snapshot, force=is_terminal)
 
 		try:
 			append('attempt_start', {'task': task, 'repeat': row['repeat']})
@@ -941,6 +962,8 @@ class BaselineManager:
 			append('error', {'error': message})
 		finally:
 			try:
+				ended, execution_ended_at = terminal_time or (time.monotonic(), now())
+				execution_elapsed_ms = round((ended - started) * 1000)
 				if agent:
 					try:
 						if settings.jev is not None:
@@ -954,16 +977,18 @@ class BaselineManager:
 						)
 					if row.get('execution_status') == 'timeout':
 						agent.record_timeout_evidence()
-				execution_ended_at = now()
 				execution_status = row.get('execution_status', 'error')
 				execution_reason = row.get('execution_reason', row.get('reason', ''))
 				row.update(
 					execution_reason=execution_reason,
 					execution_ended_at=execution_ended_at,
-					execution_elapsed_ms=round((time.monotonic() - started) * 1000),
+					execution_elapsed_ms=execution_elapsed_ms,
+					within_time_limit=execution_status in {'done', 'blocked'} and ended <= deadline,
 				)
-				state = deepcopy(agent.snapshot()) if agent else {'goal': task['goal'], 'history': []}
-				state['observations'] = deepcopy(observations)
+				state = agent.snapshot() if agent else {'goal': task['goal'], 'history': []}
+				if agent:
+					publisher.publish(state, force=True)
+				state['observations'] = observations.copy()
 				context = self.clean(
 					build_context(
 						state,
@@ -1031,7 +1056,7 @@ class BaselineManager:
 						execution_reason=execution_reason,
 						evaluation_status=final['evaluation_status'],
 					)
-					publish(snapshot)
+					publisher.publish(snapshot, force=True)
 				atomic_json(folder / 'evaluation.json', self.clean({**evaluation, 'observations': evaluations}))
 				append('attempt_end', {'result': row})
 			finally:

@@ -2,11 +2,12 @@
 
 import hashlib
 import json
+import re
 import time
 from collections.abc import Callable, Sequence
 from contextlib import AbstractContextManager
 from copy import deepcopy
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 import httpx
@@ -18,11 +19,16 @@ _VERIFY_CLIENT = httpx.Client(http2=True, timeout=60)
 VERIFY_PROMPT = """Independently evaluate whether the user's original task was accomplished.
 Use the original goal, task output, collected originals/summaries, chronological independent samples,
 observation_history, actions and execution_events. Judge outcome AND explicit process constraints from the
-user's words, without adding acceptance requirements. Execution status, DONE and task output are claims;
+user's words. In the reason, quote the original wording of each requirement before judging it. Keep the
+user's verbs and scope. For example, collecting source content does not require bookmarking it, even if
+the executor used the word "bookmarked". Apply only requirements from the original task. Execution status, DONE and task output are claims;
 prove results using independently observed state. Actions can establish process but not a successful result.
 Preserve the user's quantity, scope, correctness, detail, links and time requirements. Interpret approximate
 language in context; explain consequential ambiguity. A missing extracted metadata field alone is not failure:
 read the original text. Do not silently weaken a requested time window or demand an unrequested answer key.
+For relative calendar dates, use derived_hints.date_hints, where offset_days=0 is the task's local start
+date. Use the listed dates and weekdays. Do not calculate additional dates. Use source evidence to
+assess requested time windows.
 For a requested time window or recent trend, cite evidence about the reported items or the exact list and
 its time scope. A current view, capture time, lifetime counts and recency labels on unrelated page sections
 do not establish that scope. For example, classic topics and their accumulated views can establish popular
@@ -68,7 +74,13 @@ viewport alone is not a contradictory label. Do not promote a mismatched histori
 Join only matching source documents and native identities. Current form state overrides older checked/value
 observations. Scrolling a control out of view does not clear its value or selection. Do not count only the final
 viewport's observed_controls as the whole form. One checked radio in EACH distinct group can be correct.
-DOM IDs, node numbers and input names are opaque identities, never question numbers, row labels or answer labels.
+For question numbers, prefer explicit page numbering. Otherwise use derived_hints.question_ordinals when
+the source and form match. by_name maps observed control groups to one-based positions in the indicated
+sample. In Tencent questionnaire names of the form 831-q-16-abcd, look up q-16. Input names may be
+zero-based. Treat DOM IDs, node numbers and other input names as opaque identities for rows and answers.
+Nonempty rich_text.unordered_lists and ordered_lists establish the presence of those list formats.
+Entries in rich_text.format establish the recorded formatting on the listed runs. Check the list text,
+runs and flags against the exact requirements.
 Values like "on" do not name a radio option. Use observed labels, group context and table row/column descriptions.
 Hierarchical selectors may display only the selected leaf in a field tag. Missing parent text in that tag
 alone does not establish failure. Use source-qualified observations and actions to identify the traversed
@@ -182,7 +194,7 @@ def _verify_report(config: EvaluationModel, context: dict[str, Any], trace: dict
 
 
 CONTEXT_VERSION = 1
-PROMPT_VERSION = '2026-11-26.1'
+PROMPT_VERSION = '2026-11-27.1'
 
 
 def timestamp():
@@ -428,8 +440,57 @@ def validate_frozen(frozen):
 		raise ValueError('Invalid or modified frozen evaluation context')
 
 
+def derive_hints(context: dict[str, Any]) -> dict[str, Any]:
+	"""Derive date and form-order hints from a frozen context without changing it."""
+	date_hints = []
+	started_at = context.get('task_started_at')
+	if isinstance(started_at, str):
+		try:
+			start_date = datetime.fromisoformat(started_at).date()
+		except ValueError:
+			pass  # Legacy archives may lack a usable start timestamp.
+		else:
+			weekdays = ('Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday')
+			for offset in range(15):
+				day = start_date + timedelta(days=offset)
+				date_hints.append({'offset_days': offset, 'date': day.isoformat(), 'weekday': weekdays[day.weekday()]})
+
+	evidence = context.get('independent_evidence') or {}
+	records = evidence.get('control_records', {})
+	latest_forms = {}
+	for sample in evidence.get('samples', []):
+		form = sample['evidence'].get('form_state')
+		if not form or form.get('description_status') == 'source_mismatch':
+			continue
+		is_tencent_questionnaire = (form.get('source_url') or '').startswith('https://wj.qq.com/')
+		groups: dict[str, dict[int | None, dict[str, int]]] = {}
+		for reference in form['controls']:
+			record = records.get(reference) if isinstance(reference, str) else None
+			if not record:
+				continue
+			reading = record['reading']
+			name = reading.get('name')
+			if not isinstance(name, str) or not name:
+				continue
+			# Tencent uses a different transient numeric prefix for each option in a question.
+			if is_tencent_questionnaire and reading.get('type') in {'radio', 'checkbox'}:
+				match = re.fullmatch(r'[0-9]+-(q-[0-9]+)-abcd', name)
+				if match:
+					name = match[1]
+			ordinals = groups.setdefault(record['source_id'], {}).setdefault(reading.get('form_owner'), {})
+			ordinals.setdefault(name, len(ordinals) + 1)
+		# Keep ordinals local to a single snapshot so re-renders cannot add duplicate groups.
+		for source_id, forms in groups.items():
+			latest_forms[source_id] = [
+				{'source_id': source_id, 'sample_id': sample['sample_id'], 'form_owner': owner, 'by_name': names}
+				for owner, names in forms.items()
+			]
+
+	return {'date_hints': date_hints, 'question_ordinals': [form for forms in latest_forms.values() for form in forms]}
+
+
 def error_status(error):
-	"""Only transient transport/provider failures are retryable; never retry a received verdict."""
+	"""Retry transient transport failures and invalid responses, leaving valid verdicts final."""
 	if isinstance(error, ModelProviderError):
 		return 'transport_error', error.status_code in {408, 429} or error.status_code >= 500
 	if isinstance(error, (httpx.TransportError, TimeoutError, ConnectionError)):
@@ -437,7 +498,7 @@ def error_status(error):
 	if str(error).startswith('Model connection failed'):
 		return 'transport_error', True
 	if isinstance(error, (ValueError, TypeError, KeyError)):
-		return ('transport_error', False) if 'API_KEY' in str(error) else ('invalid_response', False)
+		return ('transport_error', False) if 'API_KEY' in str(error) else ('invalid_response', True)
 	return 'transport_error', False
 
 
@@ -450,6 +511,7 @@ def evaluate_frozen(
 ):
 	"""At most two identical, text-only requests. No execution-budget checks or browser access."""
 	validate_frozen(frozen)
+	context = {**frozen['context'], 'derived_hints': derive_hints(frozen['context'])}
 	result = {
 		'method': 'llm',
 		'evaluation_status': 'not_run',
@@ -474,7 +536,7 @@ def evaluate_frozen(
 				evaluation_attempt=attempt,
 				evaluation_prompt_version=PROMPT_VERSION,
 			) as trace:
-				reply = _verify_report(config, frozen['context'], trace)
+				reply = _verify_report(config, context, trace)
 			result.update(
 				evaluation_status='completed',
 				verdict=reply['verdict'],
@@ -508,11 +570,15 @@ def attempt_status(execution_status, evaluation):
 def outcome_statistics(attempts):
 	"""All scheduled attempts stay in the denominator; old unknowns retain their legacy meaning."""
 	counts = dict(attempts=len(attempts), met=0, not_met=0, unknown=0, evaluation_errors=0, not_run=0, legacy=0, legacy_unknown=0)
+	met_outside_limit = 0
 	for row in attempts:
 		status = row.get('evaluation_status')
 		final = (row.get('evaluation') or {}).get('final', {}) if isinstance(row.get('evaluation'), dict) else {}
 		if status == 'completed':
-			counts[final['verdict']] += 1
+			verdict = final['verdict']
+			counts[verdict] += 1
+			if verdict == 'met' and row.get('within_time_limit') is False:
+				met_outside_limit += 1
 		elif status in {'transport_error', 'invalid_response'}:
 			counts['evaluation_errors'] += 1
 		elif status is not None:
@@ -526,9 +592,11 @@ def outcome_statistics(attempts):
 			else:
 				counts['legacy_unknown'] += 1
 	judged = counts['met'] + counts['not_met'] + counts['unknown']
+	met_within_limit = counts['met'] - met_outside_limit
 	return {
 		**counts,
-		'success_rate': counts['met'] / len(attempts) if attempts else None,
+		'met_within_limit': met_within_limit,
+		'success_rate': met_within_limit / len(attempts) if attempts else None,
 		'success_rate_denominator': len(attempts),
 		'judged_success_rate': counts['met'] / judged if judged else None,
 		'judged_denominator': judged,

@@ -16,6 +16,7 @@ from werkzeug.wrappers import Request, Response
 
 from browser_use import Agent
 from browser_use.agent.jev import JevChecks, JevSettings, backends, service
+from browser_use.agent.jev.prompts import render_handback
 from browser_use.agent.jev.questions import VISION_RULES
 from browser_use.agent.jev.service import _is_repeated_empty, _is_review_delegation
 from browser_use.agent.jev.views import ActionRecord, DelegateSubgoalParams, DelegateSubgoalParamsSmart, Handback, SubgoalRun
@@ -53,6 +54,76 @@ def subgoal(name):
 		may_submit=True,
 		requires_action=True,
 	)
+
+
+def test_handback_preserves_selected_target_and_probability():
+	run = SubgoalRun(
+		id='sg1',
+		params=DelegateSubgoalParams(objective='Continue', completion='Next page', reason='Check the control'),
+		identity='continue',
+		started_step=1,
+		start_url='http://localhost',
+		start_site='localhost',
+		max_actions=15,
+	)
+	handback = Handback(
+		reason='observation_changed',
+		detail='The document changed.',
+		step=1,
+		operation='CLICK',
+		operation_probability=0.93,
+		target_label='[1234] button "Continue"',
+		target_probability=0.88,
+	)
+	run.handback = handback
+	assert 'Last System1 answer: CLICK [1234] button "Continue" (operation p=0.93, target p=0.88).' in render_handback(run, False)
+	run.handback = handback.model_copy(update={'target_label': None, 'target_probability': None})
+	assert 'Last System1 answer: CLICK (operation p=0.93).' in render_handback(run, False)
+
+
+@pytest.mark.parametrize(
+	('states', 'period'),
+	[
+		(list('AAA'), 1),
+		(list('ABABA'), 2),
+		(list('ABCABCA'), 3),
+		(list('AB'), None),
+		(['list', 'first', 'list', 'second', 'list', 'third'], None),
+	],
+)
+def test_loop_period_requires_a_consecutive_cycle(states, period):
+	assert service._cycle_period(states) == period
+
+
+def test_loop_rule_distinguishes_identical_typing_and_progress_on_the_same_page():
+	def typed(n, text):
+		return ActionRecord(
+			n=n,
+			step=n,
+			run_id='sg1',
+			operation='TYPE_TEXT',
+			bu_action={},
+			target_signature='textbox|To',
+			text=text,
+			fingerprint_before=str(n),
+			url_before='http://localhost',
+			state_before=str(n),
+			state_after=str(n + 1),
+			status='executed_ok',
+		)
+
+	actions = [typed(1, 'Alice'), typed(2, 'Alice')]
+	assert service._action_cycle(actions) is None
+	assert service._repeated_intent(actions, 'TYPE_TEXT', 'textbox|To', 'Alice') == actions
+	assert not service._repeated_intent(actions, 'TYPE_TEXT', 'textbox|To', 'Bob')
+
+
+def test_loop_cycle_preserves_reading_and_different_targets():
+	assert service._cycle_period(['A', 'A', 'A'], [('COLLECT', None, None)] * 2) is None
+	assert service._cycle_period(['A', 'A', 'A'], [('SCROLL_DOWN', None, None)] * 2) is None
+	assert service._cycle_period(['A', 'A', 'A'], [('CLICK', 'first', None), ('CLICK', 'second', None)]) is None
+	assert service._cycle_period(['A', 'B', 'A'], [('CLICK', 'like', None), ('CLICK', 'undo', None)]) is None
+	assert service._cycle_period(list('ABABA'), [('SCROLL_DOWN', None, None), ('SCROLL_UP', None, None)] * 2) == 2
 
 
 def test_only_adjacent_empty_subgoals_count():
@@ -137,15 +208,17 @@ async def test_dense_inbox_keeps_compose_and_search(jev_browser, httpserver, tmp
 	assert history.is_successful() and observed == (['会议'] if search else ['草稿已打开'])
 
 
-@pytest.mark.parametrize('mode,expected', [('append', '前缀关键点'), ('replace', '关键点')])
-async def test_jev_applies_explicit_rich_text_mode(jev_browser, httpserver, tmp_path, mode, expected):
+@pytest.mark.parametrize('mode,expected', [('append', '前缀关键点'), ('replace', '关键点'), (None, '前缀关键点')])
+async def test_jev_applies_rich_text_mode(jev_browser, httpserver, tmp_path, mode, expected):
+	preserves_content = mode != 'replace'
 	url = serve_page(
 		httpserver,
 		'/rich-text',
 		'<div id="editor" aria-label="正文" role="textbox" contenteditable="true">'
 		'<p id="tail">前缀</p><ul id="items"><li>第一项</li><li>第二项</li><li>第三项</li></ul></div>'
+		'<table><tbody><tr><td>保留表格</td></tr></tbody></table>'
 		'<script>if (location.search.includes("append")) {'
-		'editor.prepend(items);'
+		'editor.prepend(items, document.querySelector("table"));'
 		'editor.focus(); getSelection().collapse(tail.firstChild, tail.textContent.length);'
 		'document.execCommand("bold"); document.execCommand("italic");'
 		'let drop = true; editor.addEventListener("beforeinput", e => {'
@@ -159,11 +232,11 @@ async def test_jev_applies_explicit_rich_text_mode(jev_browser, httpserver, tmp_
 		completion='正文显示关键点',
 		reason='按任务填写',
 		inputs='关键点',
-		text_mode=mode,
 		requires_action=True,
+		**({'text_mode': mode} if mode is not None else {}),
 	)
 	agent = Agent(
-		task=f'Open {url}?{mode} and use {mode} to write 关键点 in the rich text editor.',
+		task=f'Open {url}?{"append" if preserves_content else "replace"} and write 关键点 in the rich text editor.',
 		llm=create_mock_llm([plan, planner_action('finish', success=True, reason='Text present')]),
 		browser_session=jev_browser,
 		use_judge=False,
@@ -184,17 +257,24 @@ async def test_jev_applies_explicit_rich_text_mode(jev_browser, httpserver, tmp_
 					jev_browser,
 					'[(document.querySelector("#tail") || editor).textContent, editor.querySelectorAll("li").length, '
 					'[...editor.querySelectorAll("i, em")].some(el => el.textContent === "关键点"), '
-					'[...editor.querySelectorAll("b, strong")].some(el => el.textContent === "关键点")]',
+					'[...editor.querySelectorAll("b, strong")].some(el => el.textContent === "关键点"), '
+					'editor.querySelector("td")?.textContent || ""]',
 				)
 			)
 			proof.append((await browser_eval(jev_browser, INSPECT_PAGE))['facts']['rich_text'][0])
 
 	await agent.run(max_steps=5, on_step_end=inspect)
 	assert not fake.errors
-	assert proof[0] == [expected, 3 if mode == 'append' else 0, mode == 'append', mode == 'append']
+	assert proof[0] == [
+		expected,
+		3 if preserves_content else 0,
+		preserves_content,
+		preserves_content,
+		'保留表格' if preserves_content else '',
+	]
 	assert proof[1]['text'].endswith(expected)
-	assert proof[1]['format'] == ([{'bold': True, 'italic': True, 'runs': ['关键点']}] if mode == 'append' else [])
-	assert proof[1]['unordered_lists'] == ([['第一项', '第二项', '第三项']] if mode == 'append' else [])
+	assert proof[1]['format'] == ([{'bold': True, 'italic': True, 'runs': ['关键点']}] if preserves_content else [])
+	assert proof[1]['unordered_lists'] == ([['第一项', '第二项', '第三项']] if preserves_content else [])
 
 
 async def test_replacing_empty_editor_preserves_managed_nodes(jev_browser, httpserver):
@@ -482,6 +562,7 @@ async def start_stage(
 	min_read_operation_probability=0.6,
 	screenshot_fields=None,
 	save_conversation_path=None,
+	time_budget_seconds=None,
 ):
 	url = serve_page(
 		server,
@@ -502,6 +583,9 @@ async def start_stage(
 		vision_escalation=vision_escalation,
 		min_operation_probability=min_operation_probability,
 		min_read_operation_probability=min_read_operation_probability,
+		time_budget_seconds=time_budget_seconds,
+		wrap_up_seconds=0.5 if time_budget_seconds is not None else 60,
+		answer_reserve_seconds=0.2 if time_budget_seconds is not None else 25,
 		checks=checks or JevChecks(),
 	)
 	agent = Agent(
@@ -531,6 +615,98 @@ async def start_stage(
 		out = await e.delegate(params, session)
 	assert not out.error
 	return agent, e, params
+
+
+async def test_modal_loop_returns_disappeared_text_to_planner(jev_browser, httpserver, tmp_path):
+	body = """
+	<button onclick="openError()">Send</button>
+	<script>
+	function openError() {
+		const modal = document.createElement('section');
+		modal.setAttribute('role', 'dialog');
+		modal.innerHTML = '<p>Recipient does not exist: fixture@example.invalid</p>' +
+			'<button onclick="this.parentElement.remove()">OK</button>';
+		document.body.append(modal);
+	}
+	</script>"""
+	agent, executor, params = await start_stage(
+		jev_browser, httpserver, tmp_path, body=body, checks=JevChecks.model_validate({'risky_action': 'record'})
+	)
+	fake = FakeJev(httpserver, [{'operation': 'CLICK', 'target': name} for name in ['Send', 'OK'] * 4])
+	try:
+		for _ in range(7):
+			out = await routed(agent)
+			if out.model_output is None:
+				break
+		first = executor.runs[-1]
+		assert first.handback and first.handback.reason == 'loop_revisit'
+		assert len(first.executed_actions) <= 6
+		assert first.handback.new_text == ['Recipient does not exist: fixture@example.invalid']
+		assert 'Recipient does not exist:' in str(out.context_messages[-1].content)
+		assert not fake.errors
+
+		unchanged = await executor.delegate(params, jev_browser)
+		assert unchanged.error and 'review_note' in unchanged.error
+		revised = params.model_copy(update={'review_note': 'Read the dialog and verify the recipient.'})
+		assert not (await executor.delegate(revised, jev_browser)).error
+		retry = executor.runs[-1]
+		retry.status, retry.handback = 'handed_back', first.handback
+		unchanged = await executor.delegate(revised, jev_browser)
+		assert unchanged.error and 'loop' in unchanged.error.lower()
+		different = params.model_copy(update={'objective': 'Find a help article', 'completion': 'Article title visible'})
+		assert not (await executor.delegate(different, jev_browser)).error
+	finally:
+		await close_driver(agent)
+
+
+async def test_same_goal_can_continue_at_a_different_start_url_after_no_effect(jev_browser, httpserver, tmp_path):
+	agent, executor, params = await start_stage(jev_browser, httpserver, tmp_path)
+	try:
+		run = executor.runs[-1]
+		run.status = 'handed_back'
+		run.handback = Handback(reason='no_effect', detail='The settings control did not respond.', step=1)
+		alternate_url = serve_page(httpserver, '/settings', '<h1>Settings</h1>')
+		alternate = params.model_copy(update={'start_url': alternate_url})
+		result = await executor.delegate(alternate, jev_browser)
+		assert not result.error
+		assert await jev_browser.get_current_page_url() == alternate_url
+	finally:
+		await close_driver(agent)
+
+
+@pytest.mark.parametrize('advances', [False, True])
+async def test_repeated_clicks_only_stop_when_state_revisits(jev_browser, httpserver, tmp_path, advances):
+	expression = '++n' if advances else 'n = 1 - n'
+	body = f"""<button onclick="document.querySelector('output').textContent = 'Page ' + ({expression})">Next</button>
+	<output>Page 0</output><script>let n = 0;</script>"""
+	agent, executor, _ = await start_stage(jev_browser, httpserver, tmp_path, body=body)
+	fake = FakeJev(httpserver, [{'operation': 'CLICK', 'target': 'Next'}] * 5 + [{'operation': 'STEP_DONE'}])
+	try:
+		for _ in range(6):
+			out = await routed(agent)
+			if out.model_output is None:
+				break
+		run = executor.runs[-1]
+		assert run.handback
+		assert run.handback.reason == ('step_done' if advances else 'loop_repeat')
+		assert len(run.executed_actions) == (5 if advances else 3)
+		assert not fake.errors
+	finally:
+		await close_driver(agent)
+
+
+@pytest.mark.parametrize('tag', ['input', 'textarea'])
+async def test_jev_auto_replaces_existing_plain_text(jev_browser, httpserver, tmp_path, tag):
+	element = '<input id="field" value="old">' if tag == 'input' else '<textarea id="field">old</textarea>'
+	agent, executor, _ = await start_stage(jev_browser, httpserver, tmp_path, body=f'<label>Account {element}</label>')
+	fake = FakeJev(httpserver, [{'operation': 'TYPE_TEXT', 'target': 'Account'}])
+	executor.helpers.text = AsyncMock(return_value='new')
+	try:
+		assert (await routed(agent)).model_output is not None
+		assert await browser_eval(jev_browser, 'document.querySelector("#field").value') == 'new'
+		assert not fake.errors
+	finally:
+		await close_driver(agent)
 
 
 async def test_missing_screenshot_uses_text_in_the_same_decision(jev_browser, httpserver, tmp_path):
@@ -2014,6 +2190,26 @@ async def test_confidence_recheck_preserves_execution_guards(jev_browser, httpse
 			assert not (await executor.delegate(params.model_copy(update={'objective': 'Try the form again'}), jev_browser)).error
 			assert (await routed(agent)).model_output is None
 			assert len(fake.requests) == 3 and executor.task_actions == []
+	finally:
+		await close_driver(agent)
+
+
+async def test_time_budget_hands_back_active_subgoal(jev_browser, httpserver, tmp_path):
+	agent, executor, _ = await start_stage(jev_browser, httpserver, tmp_path, time_budget_seconds=1)
+	fake = FakeJev(httpserver, [])
+	try:
+		summary = await agent._prepare_context(AgentStepInfo(0, 20))
+		executor._budget_started = service.monotonic()
+		messages = executor._planner().context_messages
+		assert any('remaining_seconds' in message.content for message in messages)
+		assert not executor.finish_only
+		await asyncio.sleep(0.6)
+		out = await routed(agent, execute=False, summary=summary)
+		assert out.model_output is None and executor.finish_only
+		handback = executor.runs[-1].handback
+		assert handback and handback.reason == 'time_budget'
+		assert any('Only the finish action' in message.content for message in out.context_messages)
+		assert not fake.requests
 	finally:
 		await close_driver(agent)
 

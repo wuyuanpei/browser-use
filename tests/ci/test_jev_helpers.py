@@ -35,6 +35,16 @@ async def test_answer_retry_is_bounded():
 	assert len(calls) == 2
 
 
+async def test_capture_summary_receives_original_goal_and_source():
+	h, calls = helpers(['{"summary":"Three entries in the current total ranking."}'])
+	page = {'url': 'https://example.test/chart', 'text': 'Current total ranking'}
+	await h.summary(page, original_goal='Find the top three in the last 24 hours.')
+	assert json.loads(calls[0][2][1].content) == {
+		'original_goal': 'Find the top three in the last 24 hours.',
+		'page': page,
+	}
+
+
 async def test_timeout_and_summary_limit():
 	h, _ = helpers([json.dumps({'summary': 'a' * 600})])
 	assert await h.summary({'text': 'original'}) == 'a' * 400

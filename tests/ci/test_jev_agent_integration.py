@@ -63,6 +63,50 @@ def make_agent(task, outputs, settings, **kwargs):
 	)
 
 
+@pytest.mark.parametrize('period', ['All-time ranking', 'Past 24 hours'])
+async def test_planner_checks_original_capture_after_leaving_source(httpserver, tmp_path, period, monkeypatch):
+	daily = period == 'Past 24 hours'
+	url = serve_page(httpserver, '/ranking', f'<h1>{period}</h1><p>1. Alpha</p><a href="/other">Next page</a>')
+	serve_page(httpserver, '/other', '<h1>Other page</h1>')
+	fake = FakeJev(
+		httpserver, [{'operation': 'COLLECT'}, {'operation': 'CLICK', 'target': 'Next page'}, {'operation': 'STEP_DONE'}]
+	)
+	answer = 'Daily leader: Alpha.' if daily else 'Alpha leads the chart. The daily leader is unverified.'
+	agent = make_agent(
+		f'Open {url} and collect the leader of the daily chart.',
+		[
+			subgoal('Read and save the chart', 'The chart is saved and the next page is open'),
+			planner_action(
+				'finish',
+				success=True,
+				reason='Alpha is ranked first in p1.',
+				unverified_requirements=[] if daily else ['The requested daily ranking period is unverified.'],
+			),
+		],
+		JevSettings(
+			jev_base_url=httpserver.url_for('/'),
+			jev_api_key='local-test',
+			trace_path=tmp_path / 'trace.jsonl',
+			capture_dir=tmp_path / 'captures',
+			summary_llm=create_mock_llm(['{"summary":"Alpha is ranked first."}']),
+			answer_llm=create_mock_llm([json.dumps({'text': answer})]),
+		),
+	)
+	predict = AsyncMock(wraps=agent.get_model_output)
+	monkeypatch.setattr(agent, 'get_model_output', predict)
+	history = await agent.run(max_steps=8)
+
+	assert not fake.errors and history.is_done() and history.is_successful() is daily
+	assert history.final_result() == answer
+	assert predict.await_count == 2
+	messages = [m.content for m in predict.await_args.args[0] if isinstance(m.content, str)]
+	evidence = next((m for m in messages if m.startswith('Saved capture evidence')), '')
+	assert evidence, 'Planner must receive the saved original text in its finish decision'
+	assert period in evidence and url in evidence and 'p1' in evidence
+	assert any('Current viewport' in m and 'Other page' in m for m in messages)
+	assert agent._jev is not None and agent._jev.usage.roles['planner'].calls == 2
+
+
 def action_names(output):
 	schema = output.model_json_schema()
 
@@ -111,6 +155,19 @@ async def test_planner_screenshot_policy_schema_and_prompt(mode, variant, flash,
 					assert key not in delegate['required']
 					field = delegate['properties'].pop(key)
 					assert field['default'] is None and field['anyOf'] == [{'type': datatype}, {'type': 'null'}]
+			if mode == 'isolated':
+				finish_schema = schema['$defs']['FinishParams']
+				assert 'unverified_requirements' not in finish_schema['required']
+				field = finish_schema['properties'].pop('unverified_requirements')
+				assert field == {
+					'anyOf': [{'type': 'array', 'items': {'type': 'string'}}, {'type': 'null'}],
+					'default': None,
+					'description': (
+						'For a collected task, list unmet or unverified user requirements. '
+						'Use [] when every requirement is supported.'
+					),
+					'title': 'Unverified Requirements',
+				}
 			assert json.dumps(schema, ensure_ascii=False).encode() == json.dumps(expected, ensure_ascii=False).encode()
 			assert_pr5_prompt(pr5_planner, f'{mode}/{variant}', prompt)
 		finally:

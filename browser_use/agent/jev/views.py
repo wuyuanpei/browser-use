@@ -205,6 +205,10 @@ class DelegateSubgoalParamsSmart(DelegateSubgoalParams):
 class FinishParams(JevModel):
 	success: bool = Field(description='True only if every requirement of the task is supported by evidence.')
 	reason: str = Field(description='Concrete observations supporting this decision. Use the language of the task.')
+	unverified_requirements: list[str] | None = Field(
+		default=None,
+		description='For a collected task, list unmet or unverified user requirements. Use [] when every requirement is supported.',
+	)
 
 
 class ScrollRegionParams(JevModel):

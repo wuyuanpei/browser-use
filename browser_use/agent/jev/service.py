@@ -16,7 +16,7 @@ from browser_use.agent.jev import decision, pruning, rules, scroll_regions, stat
 from browser_use.agent.jev.backends import JevBackend, System1Error, image_rejection_status, make_backend
 from browser_use.agent.jev.checks import CheckGate
 from browser_use.agent.jev.helpers import ModelHelpers
-from browser_use.agent.jev.prompts import render_handback
+from browser_use.agent.jev.prompts import COLLECTION_EVIDENCE_PROMPT, render_handback
 from browser_use.agent.jev.research import CaptureStore
 from browser_use.agent.jev.trace import JevTrace
 from browser_use.agent.jev.usage import Role, UsageLedger
@@ -29,6 +29,7 @@ from browser_use.agent.jev.views import (
 	REPEAT_LIMIT,
 	REPEAT_WINDOW,
 	SUBGOAL_FIELD_LIMITS,
+	VISIBLE_TEXT_LIMIT,
 	ActionRecord,
 	Candidate,
 	CollectPageParams,
@@ -164,6 +165,7 @@ class JevExecutor:
 		self._handback_message: str | None = None
 		self._source: _SOURCE = 'llm'
 		self._planner_attempt = 0
+		self._first_capture = 0
 		self._planner_page_action = False
 		self._vision_disabled: dict[str, Any] | None = None
 		self.current_vision_trigger: str | None = None
@@ -237,6 +239,7 @@ class JevExecutor:
 	def on_new_task(self):
 		"""Start a new delegation history, reopening the backend after a completed run."""
 		self._first_run = len(self.runs)
+		self._first_capture = len(self.captures.records)
 		if not self._closed:
 			return
 		if self.active_run:
@@ -302,11 +305,19 @@ class JevExecutor:
 			terminates_sequence=True,
 		)
 		async def finish(params: FinishParams):
+			success = params.success
+			reason = params.reason
+			if params.unverified_requirements:
+				success = False
+				reason += '\nUnverified requirements: ' + '; '.join(params.unverified_requirements)
+			elif success and len(self.captures.records) > self._first_capture and params.unverified_requirements is None:
+				success = False
+				reason += '\nThe Planner did not state whether the collected evidence supports every requirement.'
 			return ActionResult(
 				is_done=True,
-				success=params.success,
-				extracted_content=params.reason,
-				long_term_memory=f'Finished (success={params.success}): {params.reason}',
+				success=success,
+				extracted_content=reason,
+				long_term_memory=f'Finished (success={success}): {reason}',
 			)
 
 		@registry.action('Internal action used only by System1: save the visible page text.', param_model=CollectPageParams)
@@ -456,7 +467,9 @@ class JevExecutor:
 		if run is not None:
 			run.new_evidence = True
 		try:
-			record.summary = await self.helpers.summary(record.model_dump(include={'url', 'title', 'text', 'links'}))
+			record.summary = await self.helpers.summary(
+				record.model_dump(include={'url', 'title', 'text', 'links'}), original_goal=self.agent.task
+			)
 			record.summary_status = 'ok'
 		except Exception as exc:
 			record.summary_status = 'failed'
@@ -504,6 +517,19 @@ class JevExecutor:
 			self.settings.mode, self.settings.system1, self.runs[-1] if len(self.runs) > self._first_run else None, page
 		)
 		messages = [UserMessage(content=context)]
+		if records := self.captures.records[self._first_capture :]:
+			limit = min(PAGE_TEXT_LIMIT, VISIBLE_TEXT_LIMIT // len(records))
+			sensitive = collect_sensitive_data_values(self.agent.sensitive_data or {})
+			evidence = [
+				{
+					'id': record.id,
+					'url': redact_sensitive_string(record.url, sensitive),
+					'text': decision.page_text(redact_sensitive_string(record.text, sensitive), limit),
+				}
+				for record in records
+			]
+			payload = json.dumps(evidence, ensure_ascii=False)
+			messages.append(UserMessage(content=f'Saved capture evidence:\n{COLLECTION_EVIDENCE_PROMPT}\n{payload}'))
 		if page is not None:
 			url, text = page
 			viewport = json.dumps({'url': url, 'text': decision.page_text(text)}, ensure_ascii=False)

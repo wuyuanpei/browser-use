@@ -99,6 +99,14 @@ class CaptureStore:
 		]
 		if page is not None:
 			lines.append(f'Current page saved: {"yes" if saved else "no"}. COLLECT available: {"yes" if available else "no"}.')
+		if available:
+			lines.append(
+				'COLLECT saves the current viewport text, while browser_state can include other items offscreen. '
+				'For multi-item reading, if the viewport contains an unsaved requested body, make saving it the '
+				'next stage before scrolling to another item. One capture can cover items visible together. '
+				'Associate an expand control with its own item using its container or surrounding text. '
+				'For a truncated body, expand that item and save the newly revealed text.'
+			)
 		for record in self.records:
 			lines.append(f'- {record.id} | {record.url} | {record.title} | {record.summary or "(summary unavailable)"}')
 			if record.links:

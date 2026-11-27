@@ -111,9 +111,12 @@ class ModelHelpers:
 		)
 		return response.text if response.text and response.text.strip() else None
 
-	async def summary(self, page: dict) -> str:
+	async def summary(self, page: dict, *, original_goal: str = '') -> str:
+		payload = {'page': page}
+		if original_goal:
+			payload['original_goal'] = original_goal
 		response = await asyncio.wait_for(
-			self._call('summary', self.settings.summary_prompt or prompts.SUMMARY_PROMPT, {'page': page}, SummaryReply),
+			self._call('summary', self.settings.summary_prompt or prompts.SUMMARY_PROMPT, payload, SummaryReply),
 			self.timeout,
 		)
 		if not response.summary.strip():

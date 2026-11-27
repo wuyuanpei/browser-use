@@ -27,7 +27,8 @@ let selectedCallId = null;
 let renderedQuestionContexts = null;
 const browserUseProvider = 'browser_use';
 let executionChoice = 'direct';
-const screenshotChoice = 'off';
+let screenshotChoice = 'off';
+let editingRunSettings = false;
 let modelProfiles = [], modelProfileChoice = 'debug';
 const modelProfileLabel = profile => ({ debug: '调试', final_report: '最终报告' })[profile] || '配置未记录';
 const finalReportConfigured = () => modelProfiles.some(profile => profile.id === 'final_report' && profile.configured);
@@ -47,6 +48,9 @@ function consumeModelProfile() {
   renderModelProfile();
 }
 const screenshotPolicy = record => record?.screenshot_policy || (record?.screenshot_mode ? 'always' : 'off');
+function screenshotSettings() {
+  return { screenshot_policy: screenshotChoice };
+}
 const screenshotLabel = policy => ({ off: '始终关闭', always: '始终开启', smart: '智能截图' })[policy] || '始终关闭';
 const modeLabel = mode => ({ direct: 'BU 直接执行', isolated: 'Jev 隔离模式', collaborative: 'Jev 协作模式', planned: 'Planner 子任务' })[mode] || '直接执行';
 const handoffLabel = trigger => ({ initial: '初始规划', STEP_DONE: '完成检查', UNABLE: '无法推进',
@@ -54,9 +58,9 @@ const handoffLabel = trigger => ({ initial: '初始规划', STEP_DONE: '完成�
   no_progress: '持续无进展', action_cycle: '重复操作', stale_observation: '观察失效' })[trigger] || trigger;
 const providerLabel = p => ({ laya: 'Laya', deepseek: 'DeepSeek', jev: 'Jev', fixture: '本地 fixture', browser_use: 'Browser Use' })[p] || 'Laya';
 const nativeProvider = provider => provider === 'fixture' || provider === 'browser_use';
-const callLabel = c => ({collect:'Collect helper · 页面摘要', summarize:'Summarize helper · 任务输出', summary:'页面摘要助手', answer:'最终答复助手', risk:'提交效果确认', other:'其他模型调用', verify:'Verify helper · 独立复核'})[c?.kind] || (c?.kind === 'planner' ? (c.trigger ? `Planner / ${handoffLabel(c.trigger)}` : 'Planner') : c?.kind === 'text' ? 'Text helper' : c?.kind === 'deepseek' ? `DeepSeek (System1)${c.stage ? ` / 第 ${c.decision_round} 轮 / ${c.stage === 'operation' ? '操作选择' : '目标选择'}` : ''}` : jevScreenshot(c) ? 'Jev（截图）' : providerLabel(c?.kind));
+const callLabel = c => ({collect:'Collect helper · 页面摘要', summarize:'Summarize helper · 任务输出', summary:'页面摘要助手', answer:'最终答复助手', risk:'提交效果确认', other:'其他模型调用', verify:'Verify helper · 独立复核'})[c?.kind] || (c?.kind === 'planner' ? (c.trigger ? `Planner / ${handoffLabel(c.trigger)}` : 'Planner') : c?.kind === 'text' ? 'Text helper' : c?.kind === 'deepseek' ? `DeepSeek (System1)${c.stage ? ` / 第 ${c.decision_round} 轮 / ${c.stage === 'operation' ? '操作选择' : '目标选择'}` : ''}` : c?.kind === 'jev' ? jevCallLabel(c) : providerLabel(c?.kind));
 const decisionCount = attempt => attempt?.decision_calls ?? ((attempt?.laya_calls || 0) + (attempt?.deepseek_calls || 0) + (attempt?.jev_calls || 0));
-const callCounts = a => `${decisionCount(a)} / ${a.text_calls || 0} / ${a.planner_calls || 0}<small>收集 ${a.collect_calls || 0} · 总结 ${a.summarize_calls || 0}</small><small>${a.decision_rounds ?? decisionCount(a)} 决策轮 · ${a.replans || 0} 次改计划</small>`;
+const callCounts = a => `${decisionCount(a)} / ${a.text_calls || 0} / ${a.planner_calls || 0}<small>收集 ${a.collect_calls || 0} · 总结 ${a.summarize_calls || 0}</small><small>${a.decision_rounds ?? decisionCount(a)} 决策轮 · ${a.replans || 0} 次交回后再委派</small>`;
 function tokenPanel(usage, title = 'Token 消耗', panelKey = 'tokens') {
   if (!usage) return '<p class="token-note">Token 用量暂无记录</p>';
   const n = key => Number.isFinite(usage[key]) ? escape(usage[key].toLocaleString('en-US')) : '—';
@@ -123,11 +127,51 @@ function formatPayload(payload) {
     return value;
   }, 2);
 }
+function requestImageSource(call, part) {
+  const image = call?.request_images?.[part];
+  if (typeof image !== 'string') return '';
+  if (/^system1_images\/[0-9]+-[0-9]+\.jpg$/.test(image)) {
+    if (view === 'baseline') return '/api/baseline/frame?' + new URLSearchParams({run_id:selectedRunId, attempt_id:selectedAttemptId, name:image});
+    return '/api/jev/frame?' + new URLSearchParams({ref:call.request.state.page.screenshot});
+  }
+  // Older traces stored the JPEG inline.
+  return /^[A-Za-z0-9+/]+={0,2}$/.test(image) ? `data:image/jpeg;base64,${image}` : '';
+}
 function requestImages(call) {
-  return Object.entries(call?.request_images || {}).map(([part, data]) =>
-    typeof data === 'string' && /^[A-Za-z0-9+/]+={0,2}$/.test(data)
-      ? `<figure class="model-image"><figcaption>提交给 Jev 的页面截图 · ${escape(part)}</figcaption><img src="data:image/jpeg;base64,${data}" alt="本次 Jev 请求的页面截图" /></figure>` : ''
-  ).join('');
+  return Object.keys(call?.request_images || {}).map(part => {
+    const src = requestImageSource(call, part);
+    return src ? `<figure class="model-image"><figcaption>提交给 Jev 的页面截图 · ${escape(part)}</figcaption><img src="${escape(src)}" alt="本次 Jev 请求的页面截图" /></figure>` : '';
+  }).join('');
+}
+function jevModelChoice(call) {
+  const answers = call?.response?.answers;
+  const operation = answers?.operation;
+  return { operation, target: answers?.[operation?.choice?.toLowerCase() + '_target'] };
+}
+function jevModelFrame(call) {
+  if (!call?.vision) return null;
+  const page = call.request.state.page;
+  const src = requestImageSource(call, 'page-screenshot');
+  if (!src || !page.viewport) return null;
+  const elements = new Map();
+  for (const [question, {criteria}] of Object.entries(call.request.questions)) {
+    if (!question.endsWith('_target')) continue;
+    const operation = question.slice(0, -'_target'.length).toUpperCase();
+    for (const [index, criterion] of Object.entries(criteria)) {
+      if (!elements.has(index)) elements.set(index, {
+        index, label:criterion.element.replace(/^\[[^\]]+\] /, ''), role:criterion.role,
+        value:criterion.current_value, ...criterion.states, rect:criterion.rect, operations:[],
+      });
+      elements.get(index).operations.push(operation);
+    }
+  }
+  const { operation, target } = jevModelChoice(call);
+  return {
+    page: {url:page.url, title:page.title, w:page.viewport.width, h:page.viewport.height, screenshot_url:src},
+    elements:[...elements.values()],
+    decision:operation ? {operation:operation.choice, choice:operation.choice, provider:'jev', target:target?.choice, latency_ms:call.latency_ms,
+      operation_probabilities:operation.probabilities, target_probabilities:target?.probabilities, target_confidence:target?.confidence} : null,
+  };
 }
 function observationIndex() {
   return selectedFrame === null ? (state?.observations?.length || 0) - 1 : Number(selectedFrame);
@@ -215,33 +259,57 @@ function decisionTrail(calls) {
   return rows.map(({ call, members }) => {
     const grouped = call.kind === 'deepseek' && call.stage && Number.isInteger(call.decision_round);
     const operation = members.find(c => c.stage === 'operation') || call;
+    const modelChoice = call.vision || call.outcome === 'escalated' ? jevModelChoice(call) : null;
     const target = members.find(c => c.stage && c.stage !== 'operation');
     const status = members.some(c => c.status === 'error' || c.application_status === 'rejected') ? 'error'
       : members.some(c => c.status === 'pending') ? 'pending'
       : grouped && ['CLICK', 'TYPE_TEXT', 'SELECT'].includes(operation.operation) && !target
         ? '目标未调用' : members.at(-1).status;
     return { ...call, members, status,
-      operation: operation.operation, target: target?.target || call.target,
+      operation: modelChoice?.operation?.choice ?? operation.operation,
+      target: modelChoice ? modelChoice.target?.choice : target?.target || call.target,
       latency_ms: members.reduce((total, c) => total + (c.latency_ms || 0), 0),
       label: grouped ? `DeepSeek (System1) / 第 ${call.decision_round} 轮` : callLabel(call),
     };
   });
 }
 function jevScreenshot(call) {
-  return call?.kind === 'jev' && (call.request_format === 'multipart/form-data'
+  return call?.kind === 'jev' && (call.vision || call.request_format === 'multipart/form-data'
     || Object.keys(call.request_images || {}).length > 0);
+}
+function archivedEscalationReason(call) {
+  // Older traces recorded the reason on the text call and in the screenshot trigger.
+  const prefix = 'escalation:';
+  return call.escalation_from || (call.vision_trigger?.startsWith(prefix) ? call.vision_trigger.slice(prefix.length) : '');
+}
+function jevCallLabel(call) {
+  if (call.outcome === 'escalated') return 'Jev（文本→升级）';
+  if (archivedEscalationReason(call)) return call.vision_rejected ? 'Jev（截图·升级，被拒）' : 'Jev（截图·升级）';
+  if (call.vision_rejected) return call.vision_trigger === 'planner' ? 'Jev（截图·Planner，被拒）' : 'Jev（截图，被拒）';
+  if (!jevScreenshot(call)) return 'Jev';
+  return call.vision_trigger === 'planner' ? 'Jev（截图·Planner）' : 'Jev（截图）';
 }
 function traceCard(call, index, active) {
   const label = ({planner:'Planner', text:'Text helper', collect:'Collect', summarize:'Summarize', verify:'Verify'})[call.kind]
-    || (call.kind === 'jev' ? jevScreenshot(call) ? 'Jev（截图）' : 'Jev' : call.kind === 'deepseek' ? 'DeepSeek' : call.label);
+    || (call.kind === 'deepseek' ? 'DeepSeek' : call.label);
   const operation = call.operation === 'UNABLE' && call.decision?.forced_unable === true
     ? 'UNABLE(强制)' : call.operation;
-  const action = call.planner_result?.decision || operation || call.field
+  const httpStatus = call.kind === 'jev' && call.status === 'error' ? call.attempts?.at(-1)?.status : null;
+  const action = (httpStatus >= 400 && `HTTP ${httpStatus}`) || call.planner_result?.decision || operation || call.field
     || ({collect:'页面摘要', summarize:'生成任务输出', verify:'核验报告', text:'输入文本'})[call.kind] || '等待结果';
   const status = ({success:'成功', error:'失败', pending:'进行中'})[call.status] || call.status;
-  const description = [`${index + 1}. ${call.label}`, action, call.model, call.target ? `target ${call.target}` : '',
+  const declaration = call.kind === 'planner' && screenshotPolicy(state) === 'smart'
+    ? call.response?.completion?.action?.find(a => a.delegate_subgoal)?.delegate_subgoal : null;
+  const decision = declaration ? `screenshot_required: ${declaration.screenshot_required ?? '未填'}` : '';
+  const reason = declaration ? declaration.screenshot_reason?.trim() || '理由未填' : '';
+  const detail = declaration ? `<span class="screenshot-declaration"><strong>${escape(decision)}</strong><span>${escape(reason)}</span></span>` : '';
+  const trigger = archivedEscalationReason(call);
+  const failures = call.parse_failures || [];
+  const parseNote = !failures.length ? '' : (failures.at(-1).planner_feedback_retry ?? failures.at(-1).retried) ? `解析失败 ${failures.length} 次，已重试` : '解析失败，已放弃';
+  const note = trigger ? `升级原因：${trigger}` : parseNote;
+  const description = [`${index + 1}. ${call.label}`, action, decision, reason, note, call.model, call.target ? `target ${call.target}` : '',
     call.subgoal_id, `${call.latency_ms ?? 0} ms`, status].filter(Boolean).join(' · ');
-  return `<button type="button" class="trace-row ${active ? 'active' : ''}" data-call-id="${call.id}" aria-pressed="${active}" aria-label="${escape(description)}" title="${escape(description)}"><span class="trace-top"><span class="number">${String(index + 1).padStart(2, '0')}</span><span class="call-status ${call.status === 'error' ? 'failed' : ''}">${escape(status)}</span></span><span class="trace-main"><span class="trace-kind">${escape(label)}</span><b>${escape(action)}</b></span><span class="trace-bottom"><span class="time">${call.latency_ms ?? 0} ms</span><small>${call.target ? '#'+escape(call.target) : ''}</small></span></button>`;
+  return `<button type="button" class="trace-row ${declaration ? 'has-declaration' : ''} ${active ? 'active' : ''}" data-call-id="${call.id}" aria-pressed="${active}" aria-label="${escape(description)}" title="${escape(description)}"><span class="trace-top"><span class="number">${String(index + 1).padStart(2, '0')}</span><span class="call-status ${call.status === 'error' ? 'failed' : ''}">${escape(status)}</span></span><span class="trace-main"><span class="trace-kind">${escape(label)}</span><b>${escape(action)}</b></span>${detail}${note ? `<span class="trace-note">${escape(note)}</span>` : ''}<span class="trace-bottom"><span class="time">${call.latency_ms ?? 0} ms</span><small>${call.target ? '#'+escape(call.target) : ''}</small></span></button>`;
 }
 function renderModelCalls() {
   const calls = executionCalls();
@@ -285,7 +353,9 @@ function renderModelCalls() {
   const output = ['laya', 'jev'].includes(selected?.kind) && selected.response != null
     ? Object.fromEntries(Object.entries(selected.response).filter(([key]) => key !== 'question_contexts'))
     : selected?.response;
-  const outputText = selected?.error
+  const outputText = selected?.parse_failures?.length
+    ? exactPayload({ response: output ?? null, parse_failures: selected.parse_failures, ...(selected.error ? {error:selected.error} : {}) })
+    : selected?.error
     ? exactPayload({ response: output ?? null, error: selected.error })
     : output != null ? exactPayload(output) : 'No response recorded.';
   if ($('model-output').textContent !== outputText) $('model-output').textContent = outputText;
@@ -300,6 +370,7 @@ async function call(name, body = {}) {
   if (!response.ok) throw Error(data.error || "Request failed");
   state = data;
   freeState = data;
+  editingRunSettings = false;
   if (name === "reset") { selectedCallId = null; selectedFrame = null; consumeModelProfile(); }
   render();
   return data;
@@ -309,7 +380,20 @@ function controls() {
   const locked = busy || baseline.active || view !== 'free';
   $('execution-mode').disabled = busy || automatic || baseline.active || baselineBusy;
   $('model-profile').disabled = busy || automatic || baseline.active || baselineBusy;
-  $('screenshot-off').disabled = busy || automatic || baseline.active || baselineBusy;
+  const configuring = !busy && !automatic && !baseline.active && !baselineBusy;
+  const jevMode = executionChoice !== 'direct';
+  for (const policy of ['off', 'always', 'smart']) {
+    const button = $(`screenshot-${policy}`);
+    button.disabled = !configuring || !jevMode;
+    button.setAttribute('aria-pressed', String(screenshotChoice === policy));
+  }
+  const inspecting = selectedCallId !== null || selectedFrame !== null || (view === 'baseline' && (pinnedRun || pinnedAttempt));
+  const running = view === 'free' ? live : state?.baseline_attempt?.execution_status === 'running';
+  const disabledStatus = (inspecting || running) && !(configuring && editingRunSettings) ? state?.vision_disabled : null;
+  $('screenshot-mode-hint').textContent = disabledStatus ? `Jev 拒收截图（HTTP ${disabledStatus}），本任务已改为纯文本`
+    : !jevMode ? '选择 Jev 执行模式后可开启截图。'
+    : screenshotChoice === 'smart' ? 'Planner 在复盘时决定是否向 Jev 提交截图。'
+    : screenshotChoice === 'always' ? '下次运行向 Jev 提交当前视口截图和候选元素框。' : '下次运行向 Jev 提交纯文本。';
   renderModelProfile();
   $('choose').textContent = state?.planning?.pending ? '请求云端规划' : 'Choose next';
   $('baseline-tab').disabled = busy;
@@ -416,7 +500,7 @@ function sourceLink(url, label = '原文链接') {
 }
 function taskResult() {
   // New task output belongs to the task, independently of the selected notebook step.
-  return Array.isArray(state?.research?.pages) ? state?.result : researchVersion()?.result;
+  return (Array.isArray(state?.research?.pages) ? state?.result : researchVersion()?.result) || state?.partial_result;
 }
 function renderResearch() {
   const research = state?.research, version = researchVersion();
@@ -467,14 +551,17 @@ function render() {
         `<div class="plan-step ${i === state.plan_index ? "current" : ""}"><span>${i < state.plan_index ? "✓" : i + 1}</span>${escape(goal)}</div>`,
     )
     .join("");
-  const inspecting = view === 'baseline' || selectedFrame !== null || (selectedCallId !== null && Number.isInteger(selectedModelCall()?.observation_index));
+  const selected = selectedModelCall();
+  const inspecting = view === 'baseline' || selectedFrame !== null || (selectedCallId !== null && Number.isInteger(selected?.observation_index));
   const frame = state.observations?.[observationIndex()];
-  const historical = inspecting ? historicalDecision(selectedModelCall()) : null;
-  const page = inspecting ? frame?.page || (frame ? { url: frame.url, title: frame.title, actions: [] } : null) : state.page;
+  const modelFrame = inspecting || (state.decision && state.decision.model_call_id === selected?.id) ? jevModelFrame(selected) : null;
+  const historical = inspecting ? historicalDecision(selected) : null;
+  const page = modelFrame?.page || (inspecting ? frame?.page || (frame ? { url: frame.url, title: frame.title, actions: [] } : null) : state.page);
   $('viewport').style?.setProperty('aspect-ratio', page?.w > 0 && page?.h > 0 ? `${page.w} / ${page.h}` : '1120 / 780');
-  const d = inspecting ? historical.decision : state.decision || (state.status === 'done' && selectedModelCall()?.kind !== 'planner' ? state.decisions?.at(-1) : null);
-  const observedElements = inspecting ? (historical.elements.length ? historical.elements : frame?.elements || []) : state.elements || [];
-  displayedTargetIndex = d?.target?.split(':')[0] || null;
+  const d = modelFrame ? modelFrame.decision : inspecting ? historical.decision : state.decision || (state.status === 'done' && selected?.kind !== 'planner' ? state.decisions?.at(-1) : null);
+  const observedElements = modelFrame ? modelFrame.elements : inspecting ? (historical.elements.length ? historical.elements : frame?.elements || []) : state.elements || [];
+  const selectedIndex = modelFrame ? d?.target : d?.target?.split(':')[0];
+  displayedTargetIndex = selectedIndex || null;
   const overlayKey = inspecting ? `${selectedRunId}/${selectedAttemptId}/${observationIndex()}/${selectedModelCall()?.id}` : page?.fingerprint;
   if (overlayContextKey !== overlayKey) hoveredElementIndex = null;
   overlayContextKey = overlayKey;
@@ -518,7 +605,7 @@ function render() {
   $("page-title").textContent = page.title;
   $("action-count").textContent = `${observedElements.length} elements`;
   const chosen = (page.actions || []).find((a) => a.id === d?.choice);
-  const chosenElement = observedElements.find(e => e.index === d?.target?.split(':')[0]);
+  const chosenElement = observedElements.find(e => e.index === selectedIndex);
   $("choice-title").textContent = d
     ? chosen?.label || chosenElement?.options?.find(o => o.index === d.target)?.label || chosenElement?.label || d.choice
     : inspecting ? '该次观察没有可用决策' : "Choose an action";
@@ -532,7 +619,6 @@ function render() {
     `<span class="operation-choice ${name === d.operation ? 'best' : ''}">${escape(name)} <b>${percent(p)}</b></span>`).join('');
   const probability = e => d?.target_probabilities?.[e.index] ??
     Math.max(-1, ...(e.options || []).map(o=>d?.target_probabilities?.[o.index] ?? -1));
-  const selectedIndex = d?.target?.split(':')[0];
   const elements = [...observedElements];
   if (d) elements.sort((a,b)=>probability(b)-probability(a));
   $("choices").innerHTML = elements.map(e => {
@@ -544,21 +630,20 @@ function render() {
     if (['click', 'fill', 'select'].includes(a.kind) && a.node != null && !targets.has(a.node)) targets.set(a.node, a);
   }
   const observedIndices = new Set(observedElements.map(e => e.index));
-  $("targets").innerHTML = [...targets.values()].map((a,i) => {
-    const index=String(i+1);
-    const r = a.rect;
+  const outlined = modelFrame ? modelFrame.elements : [...targets.values()].map((a, i) => ({index:String(i+1), rect:a.rect}));
+  $("targets").innerHTML = outlined.map(({index, rect:r}) => {
     if (!observedIndices.has(index) || !r || ![r.x, r.y, r.w, r.h, page.w, page.h].every(Number.isFinite)
       || r.w <= 0 || r.h <= 0 || page.w <= 0 || page.h <= 0) return '';
-    return `<div class="target ${index === selectedIndex || index === hoveredElementIndex ? 'selected' : ''}" data-action="${index}" style="left:${100*r.x/page.w}%;top:${100*r.y/page.h}%;width:${100*r.w/page.w}%;height:${100*r.h/page.h}%"><span>${index}</span></div>`;
+    return `<div class="target ${index === selectedIndex || index === hoveredElementIndex ? 'selected' : ''}" data-action="${escape(index)}" style="left:${100*r.x/page.w}%;top:${100*r.y/page.h}%;width:${100*r.w/page.w}%;height:${100*r.h/page.h}%"><span>${escape(index)}</span></div>`;
   }).join('');
-  renderObservations();
+  renderObservations(modelFrame);
   updateOverlayVisibility();
   controls();
 }
-function renderObservations() {
+function renderObservations(modelFrame) {
   const frames = state?.observations || [];
   const inspecting = view === 'baseline' || selectedFrame !== null;
-  $('browser-mode').textContent = inspecting ? 'RECORD' : 'LIVE';
+  $('browser-mode').textContent = modelFrame ? 'JEV' : inspecting ? 'RECORD' : 'LIVE';
   $('observation-toolbar').hidden = !frames.length;
   if (!frames.length) return;
   const index = selectedFrame === null ? frames.length - 1 : Number(selectedFrame);
@@ -571,6 +656,10 @@ function renderObservations() {
     return;
   }
   $('observation-step').value = String(index);
+  if (modelFrame) {
+    $('observation-status').textContent = `第 ${index + 1} / ${frames.length} 次观察 · Jev 请求截图`;
+    return;
+  }
   if (!inspecting) return;
   const src = frame.screenshot_url || frame.page?.screenshot_url || (frame.page?.screenshot ? `data:image/jpeg;base64,${frame.page.screenshot}` : '');
   $('screenshot').src = src;
@@ -632,6 +721,14 @@ function selectBaselineGroup(group) {
   try { window.localStorage?.setItem('jev-baseline-group', group); } catch { /* Storage may be disabled. */ }
   renderBaseline();
 }
+function screenshotDecisionCounts(record) {
+  if (screenshotPolicy(record) !== 'smart' || !Number.isInteger(record.screenshot_decisions_missing)) return '';
+  const planner = `Planner 请求截图 ${record.planner_screenshot_requests} · 复盘委托 ${record.review_delegations} · 复盘漏填 ${record.screenshot_decisions_missing}`;
+  // These counters are present only on archived batches and attempts.
+  if (!Number.isInteger(record.escalations)) return planner;
+  const reasons = Object.entries(record.escalations_by_reason || {}).map(([reason, count]) => `${reason}:${count}`).join(';');
+  return `${planner} · 运行时升级 ${record.escalations} · 升级后执行 ${record.escalations_executed ?? '—'}${reasons ? ' · '+reasons : ''}`;
+}
 function renderBaseline() {
   const batch = baseline.batch;
   const attempts = batch?.attempts || [];
@@ -683,13 +780,15 @@ function renderBaseline() {
     const task = baseline.tasks.find(t => t.id === a.task_id);
     const result = resultName(a);
     const reason = a.reason || (typeof a.evaluation === 'object' && a.evaluation?.reason) || '';
+    const screenshotCounts = screenshotDecisionCounts(a);
     return `<article class="baseline-task-card baseline-attempt-card${a.id === selectedAttemptId ? ' selected-attempt' : ''}" data-status="${escape(a.status)}">
       <div class="baseline-attempt-header"><h4>${escape(task?.name || a.task_id)}</h4><button type="button" data-attempt-id="${escape(a.id)}" aria-pressed="${a.id === selectedAttemptId}" ${['queued', 'pending'].includes(a.status) ? 'disabled' : ''}>查看记录</button></div>
       <p class="baseline-attempt-meta">第 ${escape(a.repeat)} 次 · ${providerLabel(a.system1_provider)}${screenshotPolicy(a) !== 'off' ? ' · '+screenshotLabel(screenshotPolicy(a)) : ''} · ${modeLabel(a.execution_mode)} · ${modelProfileLabel(a.model_profile)}</p>
       <div class="baseline-task-result"><span class="baseline-task-status">${escape(executionName(a))}</span>${result ? `<span class="${['通过', '目标达成'].includes(result) ? 'result-passed' : 'result-other'}">${escape(result)}</span>` : ''}${evaluationCount(a)}</div>
-      <div class="baseline-task-metrics"><span>${escape(a.actions || 0)} 动作</span><span>${duration(a.elapsed_ms)}</span></div>
+      <div class="baseline-task-metrics"><span>${escape(a.actions || 0)} 动作</span>${a.system1_provider === 'jev' && Number.isInteger(a.vision_requests) ? `<span>带图请求 ${a.vision_requests}</span>` : ''}${a.vision_disabled ? `<span>截图已禁用（HTTP ${escape(a.vision_disabled)}）</span>` : ''}<span>${duration(a.elapsed_ms)}</span></div>
       ${reason ? `<p class="attempt-reason" title="${escape(reason)}">${escape(reason)}</p>` : ''}
       <div class="baseline-attempt-calls"><span>System1 / 文本 / 规划</span><div>${callCounts(a)}</div></div>
+      ${screenshotCounts ? `<p class="baseline-attempt-meta">${escape(screenshotCounts)}</p>` : ''}
       ${tokenPanel(a.token_usage, '本次运行 Token', a.id)}
     </article>`;
   }).join('') : '<p class="muted baseline-attempt-empty">尚无运行记录</p>', selectedRunId);
@@ -700,6 +799,8 @@ function renderBaseline() {
     ? `${stats.met} / ${stats.attempts} 目标达成 · ${stats.not_met} 未达成 · ${stats.unknown} 证据不足 · ${stats.evaluation_errors} 评估调用失败 · ${stats.not_run} 未评估 · ${stats.legacy_unknown} 旧档案未判定 · 未判决 ${(100 * (stats.unjudged_rate || 0)).toFixed(1)}%`
     : attempts.length ? `${passed} / ${attempts.length} 通过 · ${blocked} 环境阻塞（旧方法）` : '';
   stableHTML('baseline-token-summary', batch ? tokenPanel(batch.token_usage, '批次累计 Token') : '', selectedRunId);
+  const screenshotCounts = screenshotDecisionCounts(batch);
+  if (screenshotCounts) $('baseline-summary').textContent += ' · ' + screenshotCounts;
   const selected = attempts.find(a => a.id === selectedAttemptId);
   $('baseline-selected').textContent = selected ? `${baseline.tasks.find(t => t.id === selected.task_id)?.name || selected.task_id} · 第 ${selected.repeat} 次 · ${executionName(selected)}${resultName(selected) ? ' · ' + resultName(selected) : ''}` : '未选择运行记录';
   renderBaselineEvaluation(selected);
@@ -717,9 +818,20 @@ async function baselineFetch(path, body) {
 function clearFreeTask() {
   // 新批次拥有浏览器时清除旧的实时计划，历史文件仍然保留。
   freeState = { ...freeState, page: null, status: 'idle', history: [], model_calls: [], decision: null, elements: [], plan: [], planning: null, execution_mode: 'direct' };
+  freeState.vision_disabled = null;
   if (view === 'free') { state = freeState; render(); }
 }
 function acceptBaseline(data) {
+  for (const task of data.tasks || []) {
+    if (!task.url?.includes('/fixture.html?scenario=')) continue;
+    const url = new URL(task.url, location.origin);
+    const scenario = url.searchParams.get('scenario');
+    if (url.origin === location.origin && url.pathname === '/fixture.html' && scenario && !websites[scenario]) {
+      websites[scenario] = url.href;
+      goals[scenario] = task.goal;
+      $('scenario').add(new Option(task.name, scenario), $('scenario').querySelector('[value="custom"]'));
+    }
+  }
   const old = baseline.batch;
   if (data.active && !baseline.active) clearFreeTask();
   baseline = { ...baseline, ...data };
@@ -797,7 +909,7 @@ async function baselineAction(name, body = {}) {
   renderBaseline();
   try {
     const data = await baselineFetch(`/${name}`, body);
-    if (name === 'start') { pinnedRun = false; pinnedAttempt = false; clearFreeTask(); consumeModelProfile(); }
+    if (name === 'start') { editingRunSettings = false; pinnedRun = false; pinnedAttempt = false; clearFreeTask(); consumeModelProfile(); }
     if (name === 'delete') {
       pinnedRun = false; pinnedAttempt = false;
       selectedRunId = null; selectedAttemptId = null; selectedFrame = null; selectedCallId = null;
@@ -824,12 +936,13 @@ function startBaseline(taskIds) {
     showBaselineError(Error('重复次数必须为 1–10 的整数。'));
     return;
   }
-  baselineAction('start', { repeats, system1_provider: browserUseProvider, execution_mode: executionChoice, screenshot_policy: screenshotChoice, model_profile: modelProfileChoice, ...(taskIds ? { task_ids: taskIds } : {}) });
+  baselineAction('start', { repeats, system1_provider: browserUseProvider, execution_mode: executionChoice, ...screenshotSettings(), model_profile: modelProfileChoice, ...(taskIds ? { task_ids: taskIds } : {}) });
 }
 async function selectView(next) {
   selectedFrame = null;
   if (busy) return;
   view = next;
+  editingRunSettings = false;
   try { window.localStorage?.setItem('jev-task-view', next); } catch { /* Storage may be disabled. */ }
   baselineEpoch++;
   for (const name of ['free', 'baseline']) {
@@ -901,6 +1014,7 @@ $('baseline-attempts').addEventListener('click', event => {
   const button = event.target.closest('[data-attempt-id]');
   if (!button || button.disabled) return;
   pinnedAttempt = true;
+  editingRunSettings = false;
   const epoch = ++baselineEpoch;
   selectedAttemptId = button.dataset.attemptId;
   selectedCallId = null;
@@ -915,6 +1029,7 @@ $('baseline-runs').addEventListener('change', async () => {
   const epoch = ++baselineEpoch;
   // 请求历史批次期间隐藏旧指令，失败或过期响应也不能将其重新显示。
   pinnedRun = true;
+  editingRunSettings = false;
   pinnedAttempt = false;
   selectedRunId = id;
   selectedAttemptId = null;
@@ -933,6 +1048,7 @@ $('baseline-runs').addEventListener('change', async () => {
   } catch (error) { showBaselineError(error); }
 });
 $('observation-step').addEventListener('change', () => {
+  editingRunSettings = false;
   selectedFrame = $('observation-step').value;
   selectedCallId = null;
   render();
@@ -967,6 +1083,7 @@ $("history").addEventListener("click", (event) => {
   if (!row) return;
   const call = executionCalls().find(c => c.id === Number(row.dataset.callId));
   if (!call) return;
+  editingRunSettings = false;
   selectedCallId = call.id;
   if (view === 'baseline' || Number.isInteger(call?.observation_index)) {
     selectedFrame = Number.isInteger(call?.observation_index) ? String(call.observation_index) : '-1';
@@ -985,7 +1102,7 @@ $("task-form").addEventListener("submit", (event) => {
         scenario: $("scenario").value,
         system1_provider: browserUseProvider,
         execution_mode: executionChoice,
-        screenshot_policy: screenshotChoice,
+        ...screenshotSettings(),
         model_profile: modelProfileChoice,
         url: $("website-url").value.trim(),
         goal: $("goal").value,
@@ -1091,15 +1208,22 @@ $("download").addEventListener("click", () => {
   URL.revokeObjectURL(url);
 });
 $('model-profile').addEventListener('change', () => {
+  editingRunSettings = true;
   const choice = $('model-profile').value;
   modelProfileChoice = choice === 'final_report' && finalReportConfigured()
     ? 'final_report' : 'debug';
-  renderModelProfile();
+  controls();
 });
 $('execution-mode').value = executionChoice;
 $('execution-mode').addEventListener('change', () => {
+  editingRunSettings = true;
   executionChoice = $('execution-mode').value;
+  if (executionChoice === 'direct') screenshotChoice = 'off';
+  controls();
 });
+for (const policy of ['off', 'always', 'smart']) {
+  $(`screenshot-${policy}`).addEventListener('click', () => { editingRunSettings = true; screenshotChoice = policy; controls(); });
+}
 fetch("/api/state")
   .then((r) => r.json())
   .then((s) => {

@@ -1,0 +1,1508 @@
+{
+  "definitions": {
+    "isolated": {
+      "ActionModelUnion": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/DelegateSubgoalActionModel"
+          },
+          {
+            "$ref": "#/$defs/FinishActionModel"
+          }
+        ],
+        "title": "ActionModel"
+      },
+      "DelegateSubgoalActionModel": {
+        "additionalProperties": false,
+        "properties": {
+          "delegate_subgoal": {
+            "$ref": "#/$defs/DelegateSubgoalParams",
+            "description": "Hand one stage of the task to System1, which performs all page actions of that stage."
+          }
+        },
+        "required": [
+          "delegate_subgoal"
+        ],
+        "title": "DelegateSubgoalActionModel",
+        "type": "object"
+      },
+      "DelegateSubgoalParams": {
+        "additionalProperties": false,
+        "properties": {
+          "objective": {
+            "description": "What System1 should achieve in this stage only. State the result, not clicks, element indices, selectors or coordinates.",
+            "title": "Objective",
+            "type": "string"
+          },
+          "completion": {
+            "description": "A condition directly visible on the page when this stage is done.",
+            "title": "Completion",
+            "type": "string"
+          },
+          "reason": {
+            "description": "Why this subgoal now. After a handback, first state your verification of the previous stage: what was achieved, the evidence, and what is missing. Use the language of the task.",
+            "title": "Reason",
+            "type": "string"
+          },
+          "inputs": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Values System1 must enter, e.g. \"From=Zurich; To=London\". Omit if nothing needs typing.",
+            "title": "Inputs"
+          },
+          "may_submit": {
+            "default": false,
+            "description": "Allow submits (search, filter, next, pressing Enter) and irreversible or account-changing clicks (send, pay, delete) in this stage. Irreversible clicks are still confirmed with you one by one.",
+            "title": "May Submit",
+            "type": "boolean"
+          },
+          "requires_action": {
+            "default": false,
+            "description": "True if this stage must actually change the page (type, select, or click a control) before System1 may request completion. False for observation or navigation stages and when the page already shows the required state.",
+            "title": "Requires Action",
+            "type": "boolean"
+          },
+          "max_actions": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Action budget for this stage, 1-30. Default 15.",
+            "title": "Max Actions"
+          },
+          "start_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Open this http(s) URL in the current tab before System1 starts. May include query parameters.",
+            "title": "Start Url"
+          },
+          "start_tab": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Switch to this open tab (4-character tab id) before System1 starts. Do not combine with start_url.",
+            "title": "Start Tab"
+          },
+          "review_note": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Required when you re-delegate the same objective and completion after rejecting STEP_DONE: what is still missing and why the stage is not done.",
+            "title": "Review Note"
+          }
+        },
+        "required": [
+          "objective",
+          "completion",
+          "reason"
+        ],
+        "title": "DelegateSubgoalParams",
+        "type": "object"
+      },
+      "FinishActionModel": {
+        "additionalProperties": false,
+        "properties": {
+          "finish": {
+            "$ref": "#/$defs/FinishParams",
+            "description": "End the task. A separate helper writes the final answer from the saved pages and the history."
+          }
+        },
+        "required": [
+          "finish"
+        ],
+        "title": "FinishActionModel",
+        "type": "object"
+      },
+      "FinishParams": {
+        "additionalProperties": false,
+        "properties": {
+          "success": {
+            "description": "True only if every requirement of the task is supported by evidence.",
+            "title": "Success",
+            "type": "boolean"
+          },
+          "reason": {
+            "description": "Concrete observations supporting this decision. Use the language of the task.",
+            "title": "Reason",
+            "type": "string"
+          }
+        },
+        "required": [
+          "success",
+          "reason"
+        ],
+        "title": "FinishParams",
+        "type": "object"
+      }
+    },
+    "collaborative": {
+      "ActionModelUnion": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/DoneActionModel"
+          },
+          {
+            "$ref": "#/$defs/SearchActionModel"
+          },
+          {
+            "$ref": "#/$defs/NavigateActionModel"
+          },
+          {
+            "$ref": "#/$defs/GoBackActionModel"
+          },
+          {
+            "$ref": "#/$defs/WaitActionModel"
+          },
+          {
+            "$ref": "#/$defs/ClickActionModel"
+          },
+          {
+            "$ref": "#/$defs/InputActionModel"
+          },
+          {
+            "$ref": "#/$defs/UploadFileActionModel"
+          },
+          {
+            "$ref": "#/$defs/SwitchActionModel"
+          },
+          {
+            "$ref": "#/$defs/CloseActionModel"
+          },
+          {
+            "$ref": "#/$defs/ExtractActionModel"
+          },
+          {
+            "$ref": "#/$defs/SearchPageActionModel"
+          },
+          {
+            "$ref": "#/$defs/FindElementsActionModel"
+          },
+          {
+            "$ref": "#/$defs/ScrollActionModel"
+          },
+          {
+            "$ref": "#/$defs/SendKeysActionModel"
+          },
+          {
+            "$ref": "#/$defs/FindTextActionModel"
+          },
+          {
+            "$ref": "#/$defs/SaveAsPdfActionModel"
+          },
+          {
+            "$ref": "#/$defs/DropdownOptionsActionModel"
+          },
+          {
+            "$ref": "#/$defs/SelectDropdownActionModel"
+          },
+          {
+            "$ref": "#/$defs/WriteFileActionModel"
+          },
+          {
+            "$ref": "#/$defs/ReplaceFileActionModel"
+          },
+          {
+            "$ref": "#/$defs/ReadFileActionModel"
+          },
+          {
+            "$ref": "#/$defs/EvaluateActionModel"
+          },
+          {
+            "$ref": "#/$defs/DelegateSubgoalActionModel"
+          }
+        ],
+        "title": "ActionModel"
+      },
+      "ClickActionModel": {
+        "additionalProperties": false,
+        "properties": {
+          "click": {
+            "$ref": "#/$defs/ClickElementActionIndexOnly",
+            "description": "Click element by index."
+          }
+        },
+        "required": [
+          "click"
+        ],
+        "title": "ClickActionModel",
+        "type": "object"
+      },
+      "ClickElementActionIndexOnly": {
+        "properties": {
+          "index": {
+            "description": "Element index from browser_state",
+            "minimum": 1,
+            "title": "Index",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "index"
+        ],
+        "title": "ClickElementAction",
+        "type": "object"
+      },
+      "CloseActionModel": {
+        "additionalProperties": false,
+        "properties": {
+          "close": {
+            "$ref": "#/$defs/CloseTabAction",
+            "description": "Close a tab by tab_id. Tab IDs are shown in browser state tabs list (last 4 chars of target_id). Use to clean up tabs you no longer need."
+          }
+        },
+        "required": [
+          "close"
+        ],
+        "title": "CloseActionModel",
+        "type": "object"
+      },
+      "CloseTabAction": {
+        "properties": {
+          "tab_id": {
+            "description": "4-char id",
+            "maxLength": 4,
+            "minLength": 4,
+            "title": "Tab Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "tab_id"
+        ],
+        "title": "CloseTabAction",
+        "type": "object"
+      },
+      "DelegateSubgoalActionModel": {
+        "additionalProperties": false,
+        "properties": {
+          "delegate_subgoal": {
+            "$ref": "#/$defs/DelegateSubgoalParams",
+            "description": "Hand one stage of the task to System1, which performs all page actions of that stage."
+          }
+        },
+        "required": [
+          "delegate_subgoal"
+        ],
+        "title": "DelegateSubgoalActionModel",
+        "type": "object"
+      },
+      "DelegateSubgoalParams": {
+        "additionalProperties": false,
+        "properties": {
+          "objective": {
+            "description": "What System1 should achieve in this stage only. State the result, not clicks, element indices, selectors or coordinates.",
+            "title": "Objective",
+            "type": "string"
+          },
+          "completion": {
+            "description": "A condition directly visible on the page when this stage is done.",
+            "title": "Completion",
+            "type": "string"
+          },
+          "reason": {
+            "description": "Why this subgoal now. After a handback, first state your verification of the previous stage: what was achieved, the evidence, and what is missing. Use the language of the task.",
+            "title": "Reason",
+            "type": "string"
+          },
+          "inputs": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Values System1 must enter, e.g. \"From=Zurich; To=London\". Omit if nothing needs typing.",
+            "title": "Inputs"
+          },
+          "may_submit": {
+            "default": false,
+            "description": "Allow submits (search, filter, next, pressing Enter) and irreversible or account-changing clicks (send, pay, delete) in this stage. Irreversible clicks are still confirmed with you one by one.",
+            "title": "May Submit",
+            "type": "boolean"
+          },
+          "requires_action": {
+            "default": false,
+            "description": "True if this stage must actually change the page (type, select, or click a control) before System1 may request completion. False for observation or navigation stages and when the page already shows the required state.",
+            "title": "Requires Action",
+            "type": "boolean"
+          },
+          "max_actions": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Action budget for this stage, 1-30. Default 15.",
+            "title": "Max Actions"
+          },
+          "start_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Open this http(s) URL in the current tab before System1 starts. May include query parameters.",
+            "title": "Start Url"
+          },
+          "start_tab": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Switch to this open tab (4-character tab id) before System1 starts. Do not combine with start_url.",
+            "title": "Start Tab"
+          },
+          "review_note": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Required when you re-delegate the same objective and completion after rejecting STEP_DONE: what is still missing and why the stage is not done.",
+            "title": "Review Note"
+          }
+        },
+        "required": [
+          "objective",
+          "completion",
+          "reason"
+        ],
+        "title": "DelegateSubgoalParams",
+        "type": "object"
+      },
+      "DoneAction": {
+        "properties": {
+          "text": {
+            "description": "Final message to the user. ONLY report data you directly observed in browser_state, tool outputs, or screenshots during this session. Do NOT use training knowledge to fill gaps — if information was not found on the page, say so explicitly. Do NOT claim completion of steps from compacted_memory or prior session summaries unless you explicitly verified them yourself. If uncertain whether a prior step completed, say so explicitly.",
+            "title": "Text",
+            "type": "string"
+          },
+          "success": {
+            "default": true,
+            "description": "True if user_request completed successfully",
+            "title": "Success",
+            "type": "boolean"
+          },
+          "files_to_display": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": [],
+            "title": "Files To Display"
+          }
+        },
+        "required": [
+          "text"
+        ],
+        "title": "DoneAction",
+        "type": "object"
+      },
+      "DoneActionModel": {
+        "additionalProperties": false,
+        "properties": {
+          "done": {
+            "$ref": "#/$defs/DoneAction",
+            "description": "Complete task. Only report actions you performed and data you extracted in this session."
+          }
+        },
+        "required": [
+          "done"
+        ],
+        "title": "DoneActionModel",
+        "type": "object"
+      },
+      "DropdownOptionsActionModel": {
+        "additionalProperties": false,
+        "properties": {
+          "dropdown_options": {
+            "$ref": "#/$defs/GetDropdownOptionsAction",
+            "description": ""
+          }
+        },
+        "required": [
+          "dropdown_options"
+        ],
+        "title": "DropdownOptionsActionModel",
+        "type": "object"
+      },
+      "EvaluateActionModel": {
+        "additionalProperties": false,
+        "properties": {
+          "evaluate": {
+            "$ref": "#/$defs/evaluate_Params",
+            "description": "Execute browser JavaScript. Best practice: wrap in IIFE (function(){...})() with try-catch for safety. Use ONLY browser APIs (document, window, DOM). NO Node.js APIs (fs, require, process). Example: (function(){try{const el=document.querySelector('#id');return el?el.value:'not found'}catch(e){return 'Error: '+e.message}})() Avoid comments. Use for hover, drag, zoom, custom selectors, extract/filter links, or analysing page structure. IMPORTANT: Shadow DOM elements with [index] markers can be clicked directly with click(index) — do NOT use evaluate() to click them. Only use evaluate for shadow DOM elements that are NOT indexed. Limit output size."
+          }
+        },
+        "required": [
+          "evaluate"
+        ],
+        "title": "EvaluateActionModel",
+        "type": "object"
+      },
+      "ExtractAction": {
+        "properties": {
+          "query": {
+            "title": "Query",
+            "type": "string"
+          },
+          "extract_links": {
+            "default": false,
+            "description": "Set True to true if the query requires links, else false to safe tokens",
+            "title": "Extract Links",
+            "type": "boolean"
+          },
+          "extract_images": {
+            "default": false,
+            "description": "Set True to include image src URLs in extracted markdown. Auto-enabled when query contains image-related keywords.",
+            "title": "Extract Images",
+            "type": "boolean"
+          },
+          "start_from_char": {
+            "default": 0,
+            "description": "Use this for long markdowns to start from a specific character (not index in browser_state)",
+            "title": "Start From Char",
+            "type": "integer"
+          },
+          "already_collected": {
+            "description": "Item identifiers (name, URL, or ID) already collected in prior extract calls on other pages. The extractor will skip items matching these to prevent duplicates. Use when paginating across multiple pages.",
+            "items": {
+              "type": "string"
+            },
+            "title": "Already Collected",
+            "type": "array"
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "title": "ExtractAction",
+        "type": "object"
+      },
+      "ExtractActionModel": {
+        "additionalProperties": false,
+        "properties": {
+          "extract": {
+            "$ref": "#/$defs/ExtractAction",
+            "description": "LLM extracts structured data from page markdown. Use when: on right page, know what to extract, haven't called before on same page+query. Can't get interactive elements. Set extract_links=True for URLs. Set extract_images=True for image src URLs. Use start_from_char if previous extraction was truncated to extract data further down the page. When paginating across pages, pass already_collected with item identifiers (names/URLs) from prior pages to avoid duplicates."
+          }
+        },
+        "required": [
+          "extract"
+        ],
+        "title": "ExtractActionModel",
+        "type": "object"
+      },
+      "FindElementsAction": {
+        "properties": {
+          "selector": {
+            "description": "CSS selector to query elements (e.g. \"table tr\", \"a.link\", \"div.product\")",
+            "title": "Selector",
+            "type": "string"
+          },
+          "attributes": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Specific attributes to extract (e.g. [\"href\", \"src\", \"class\"]). If not set, returns tag and text only.",
+            "title": "Attributes"
+          },
+          "max_results": {
+            "default": 50,
+            "description": "Maximum elements to return",
+            "title": "Max Results",
+            "type": "integer"
+          },
+          "include_text": {
+            "default": true,
+            "description": "Include text content of each element",
+            "title": "Include Text",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "selector"
+        ],
+        "title": "FindElementsAction",
+        "type": "object"
+      },
+      "FindElementsActionModel": {
+        "additionalProperties": false,
+        "properties": {
+          "find_elements": {
+            "$ref": "#/$defs/FindElementsAction",
+            "description": "Query DOM elements by CSS selector (like find). Zero LLM cost, instant. Returns matching elements with tag, text, and attributes. Use to explore page structure, count items, get links/attributes. Use attributes=[\"href\",\"src\"] to extract specific attributes."
+          }
+        },
+        "required": [
+          "find_elements"
+        ],
+        "title": "FindElementsActionModel",
+        "type": "object"
+      },
+      "FindTextActionModel": {
+        "additionalProperties": false,
+        "properties": {
+          "find_text": {
+            "$ref": "#/$defs/find_text_Params",
+            "description": "Scroll to text."
+          }
+        },
+        "required": [
+          "find_text"
+        ],
+        "title": "FindTextActionModel",
+        "type": "object"
+      },
+      "GetDropdownOptionsAction": {
+        "properties": {
+          "index": {
+            "title": "Index",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "index"
+        ],
+        "title": "GetDropdownOptionsAction",
+        "type": "object"
+      },
+      "GoBackActionModel": {
+        "additionalProperties": false,
+        "properties": {
+          "go_back": {
+            "$ref": "#/$defs/NoParamsAction",
+            "description": "Go back"
+          }
+        },
+        "required": [
+          "go_back"
+        ],
+        "title": "GoBackActionModel",
+        "type": "object"
+      },
+      "InputActionModel": {
+        "additionalProperties": false,
+        "properties": {
+          "input": {
+            "$ref": "#/$defs/InputTextAction",
+            "description": "Input text into element by index. Clears existing text by default; pass text=\"\" to clear only, or clear=False to append."
+          }
+        },
+        "required": [
+          "input"
+        ],
+        "title": "InputActionModel",
+        "type": "object"
+      },
+      "InputTextAction": {
+        "properties": {
+          "index": {
+            "description": "from browser_state",
+            "minimum": 0,
+            "title": "Index",
+            "type": "integer"
+          },
+          "text": {
+            "description": "Text to enter. With clear=True, text=\"\" clears the field without typing.",
+            "title": "Text",
+            "type": "string"
+          },
+          "clear": {
+            "default": true,
+            "description": "Clear existing text before typing. Set to False to append instead.",
+            "title": "Clear",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "index",
+          "text"
+        ],
+        "title": "InputTextAction",
+        "type": "object"
+      },
+      "NavigateAction": {
+        "properties": {
+          "url": {
+            "title": "Url",
+            "type": "string"
+          },
+          "new_tab": {
+            "default": false,
+            "title": "New Tab",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "url"
+        ],
+        "title": "NavigateAction",
+        "type": "object"
+      },
+      "NavigateActionModel": {
+        "additionalProperties": false,
+        "properties": {
+          "navigate": {
+            "$ref": "#/$defs/NavigateAction",
+            "description": ""
+          }
+        },
+        "required": [
+          "navigate"
+        ],
+        "title": "NavigateActionModel",
+        "type": "object"
+      },
+      "NoParamsAction": {
+        "properties": {
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Optional description for the action",
+            "title": "Description"
+          }
+        },
+        "title": "NoParamsAction",
+        "type": "object"
+      },
+      "ReadFileActionModel": {
+        "additionalProperties": false,
+        "properties": {
+          "read_file": {
+            "$ref": "#/$defs/read_file_Params",
+            "description": "Read the complete content of a file. Use this to view file contents before editing or to retrieve data from files. Supports text files (txt, md, json, csv, jsonl), documents (pdf, docx), and images (jpg, png)."
+          }
+        },
+        "required": [
+          "read_file"
+        ],
+        "title": "ReadFileActionModel",
+        "type": "object"
+      },
+      "ReplaceFileActionModel": {
+        "additionalProperties": false,
+        "properties": {
+          "replace_file": {
+            "$ref": "#/$defs/replace_file_Params",
+            "description": "Replace specific text within a file by searching for old_str and replacing with new_str. Use this for targeted edits like updating todo checkboxes or modifying specific lines without rewriting the entire file."
+          }
+        },
+        "required": [
+          "replace_file"
+        ],
+        "title": "ReplaceFileActionModel",
+        "type": "object"
+      },
+      "SaveAsPdfAction": {
+        "properties": {
+          "file_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Output PDF filename (without path). Defaults to page title. Extension .pdf is added automatically if missing.",
+            "title": "File Name"
+          },
+          "print_background": {
+            "default": true,
+            "description": "Include background graphics and colors",
+            "title": "Print Background",
+            "type": "boolean"
+          },
+          "landscape": {
+            "default": false,
+            "description": "Use landscape orientation",
+            "title": "Landscape",
+            "type": "boolean"
+          },
+          "scale": {
+            "default": 1.0,
+            "description": "Scale of the webpage rendering (0.1 to 2.0)",
+            "maximum": 2.0,
+            "minimum": 0.1,
+            "title": "Scale",
+            "type": "number"
+          },
+          "paper_format": {
+            "default": "Letter",
+            "description": "Paper size: Letter, Legal, A4, A3, or Tabloid",
+            "title": "Paper Format",
+            "type": "string"
+          },
+          "display_header_footer": {
+            "default": true,
+            "description": "Print page metadata into the margins, matching the browser Print dialog default: the date in the header and the page URL plus page numbers in the footer. Set to False for a clean PDF with no header/footer.",
+            "title": "Display Header Footer",
+            "type": "boolean"
+          },
+          "header_template": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Custom HTML for the page header. Inject values with spans using the classes date, title, url, pageNumber, totalPages (e.g. '<span class=\"title\"></span>'). Set an explicit font-size or the text renders invisibly. Only used when display_header_footer is True; defaults to showing the date.",
+            "title": "Header Template"
+          },
+          "footer_template": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Custom HTML for the page footer, same format as header_template. Only used when display_header_footer is True; defaults to showing the page URL and page numbers.",
+            "title": "Footer Template"
+          }
+        },
+        "title": "SaveAsPdfAction",
+        "type": "object"
+      },
+      "SaveAsPdfActionModel": {
+        "additionalProperties": false,
+        "properties": {
+          "save_as_pdf": {
+            "$ref": "#/$defs/SaveAsPdfAction",
+            "description": "Save the current page as a PDF file. Returns the file path of the saved PDF. Use this to capture the full page content (including content below the fold) as a printable document."
+          }
+        },
+        "required": [
+          "save_as_pdf"
+        ],
+        "title": "SaveAsPdfActionModel",
+        "type": "object"
+      },
+      "ScrollAction": {
+        "properties": {
+          "down": {
+            "default": true,
+            "description": "down=True=scroll down, down=False scroll up",
+            "title": "Down",
+            "type": "boolean"
+          },
+          "pages": {
+            "default": 1.0,
+            "description": "0.5=half page, 1=full page, 10=to bottom/top",
+            "title": "Pages",
+            "type": "number"
+          },
+          "index": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Optional element index to scroll within specific element",
+            "title": "Index"
+          }
+        },
+        "title": "ScrollAction",
+        "type": "object"
+      },
+      "ScrollActionModel": {
+        "additionalProperties": false,
+        "properties": {
+          "scroll": {
+            "$ref": "#/$defs/ScrollAction",
+            "description": "Scroll by pages. REQUIRED: down=True/False (True=scroll down, False=scroll up, default=True). Optional: pages=0.5-10.0 (default 1.0). Use index for scroll elements (dropdowns/custom UI). High pages (10) reaches bottom. Multi-page scrolls sequentially. Viewport-based height, fallback 1000px/page."
+          }
+        },
+        "required": [
+          "scroll"
+        ],
+        "title": "ScrollActionModel",
+        "type": "object"
+      },
+      "SearchAction": {
+        "properties": {
+          "query": {
+            "title": "Query",
+            "type": "string"
+          },
+          "engine": {
+            "default": "duckduckgo",
+            "description": "duckduckgo, google, bing (use duckduckgo by default because less captchas)",
+            "title": "Engine",
+            "type": "string"
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "title": "SearchAction",
+        "type": "object"
+      },
+      "SearchActionModel": {
+        "additionalProperties": false,
+        "properties": {
+          "search": {
+            "$ref": "#/$defs/SearchAction",
+            "description": ""
+          }
+        },
+        "required": [
+          "search"
+        ],
+        "title": "SearchActionModel",
+        "type": "object"
+      },
+      "SearchPageAction": {
+        "properties": {
+          "pattern": {
+            "description": "Text or regex pattern to search for in page content",
+            "title": "Pattern",
+            "type": "string"
+          },
+          "regex": {
+            "default": false,
+            "description": "Treat pattern as regex (default: literal text match)",
+            "title": "Regex",
+            "type": "boolean"
+          },
+          "case_sensitive": {
+            "default": false,
+            "description": "Case-sensitive search (default: case-insensitive)",
+            "title": "Case Sensitive",
+            "type": "boolean"
+          },
+          "context_chars": {
+            "default": 150,
+            "description": "Characters of surrounding context per match",
+            "title": "Context Chars",
+            "type": "integer"
+          },
+          "css_scope": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "CSS selector to limit search scope (e.g. \"div#main\")",
+            "title": "Css Scope"
+          },
+          "max_results": {
+            "default": 25,
+            "description": "Maximum matches to return",
+            "title": "Max Results",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "pattern"
+        ],
+        "title": "SearchPageAction",
+        "type": "object"
+      },
+      "SearchPageActionModel": {
+        "additionalProperties": false,
+        "properties": {
+          "search_page": {
+            "$ref": "#/$defs/SearchPageAction",
+            "description": "Search page text for a pattern (like grep). Zero LLM cost, instant. Returns matches with surrounding context. Use to find specific text, verify content exists, or locate data on the page. Set regex=True for regex patterns. Use css_scope to search within a specific section."
+          }
+        },
+        "required": [
+          "search_page"
+        ],
+        "title": "SearchPageActionModel",
+        "type": "object"
+      },
+      "SelectDropdownActionModel": {
+        "additionalProperties": false,
+        "properties": {
+          "select_dropdown": {
+            "$ref": "#/$defs/SelectDropdownOptionAction",
+            "description": "Set the option of a <select> element."
+          }
+        },
+        "required": [
+          "select_dropdown"
+        ],
+        "title": "SelectDropdownActionModel",
+        "type": "object"
+      },
+      "SelectDropdownOptionAction": {
+        "properties": {
+          "index": {
+            "title": "Index",
+            "type": "integer"
+          },
+          "text": {
+            "description": "exact text/value",
+            "title": "Text",
+            "type": "string"
+          }
+        },
+        "required": [
+          "index",
+          "text"
+        ],
+        "title": "SelectDropdownOptionAction",
+        "type": "object"
+      },
+      "SendKeysAction": {
+        "properties": {
+          "keys": {
+            "description": "keys (Escape, Enter, PageDown) or shortcuts (Control+o)",
+            "title": "Keys",
+            "type": "string"
+          }
+        },
+        "required": [
+          "keys"
+        ],
+        "title": "SendKeysAction",
+        "type": "object"
+      },
+      "SendKeysActionModel": {
+        "additionalProperties": false,
+        "properties": {
+          "send_keys": {
+            "$ref": "#/$defs/SendKeysAction",
+            "description": ""
+          }
+        },
+        "required": [
+          "send_keys"
+        ],
+        "title": "SendKeysActionModel",
+        "type": "object"
+      },
+      "SwitchActionModel": {
+        "additionalProperties": false,
+        "properties": {
+          "switch": {
+            "$ref": "#/$defs/SwitchTabAction",
+            "description": "Switch to another open tab by tab_id. Tab IDs are shown in browser state tabs list (last 4 chars of target_id). Use when you need to work with content in a different tab."
+          }
+        },
+        "required": [
+          "switch"
+        ],
+        "title": "SwitchActionModel",
+        "type": "object"
+      },
+      "SwitchTabAction": {
+        "properties": {
+          "tab_id": {
+            "description": "4-char id",
+            "maxLength": 4,
+            "minLength": 4,
+            "title": "Tab Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "tab_id"
+        ],
+        "title": "SwitchTabAction",
+        "type": "object"
+      },
+      "UploadFileAction": {
+        "properties": {
+          "index": {
+            "title": "Index",
+            "type": "integer"
+          },
+          "path": {
+            "title": "Path",
+            "type": "string"
+          }
+        },
+        "required": [
+          "index",
+          "path"
+        ],
+        "title": "UploadFileAction",
+        "type": "object"
+      },
+      "UploadFileActionModel": {
+        "additionalProperties": false,
+        "properties": {
+          "upload_file": {
+            "$ref": "#/$defs/UploadFileAction",
+            "description": ""
+          }
+        },
+        "required": [
+          "upload_file"
+        ],
+        "title": "UploadFileActionModel",
+        "type": "object"
+      },
+      "WaitActionModel": {
+        "additionalProperties": false,
+        "properties": {
+          "wait": {
+            "$ref": "#/$defs/wait_Params",
+            "description": "Wait for x seconds."
+          }
+        },
+        "required": [
+          "wait"
+        ],
+        "title": "WaitActionModel",
+        "type": "object"
+      },
+      "WriteFileActionModel": {
+        "additionalProperties": false,
+        "properties": {
+          "write_file": {
+            "$ref": "#/$defs/write_file_Params",
+            "description": "Write content to a file. By default this OVERWRITES the entire file - use append=true to add to an existing file, or use replace_file for targeted edits within a file. FILENAME RULES: Use only letters, numbers, underscores, hyphens, dots, parentheses. Spaces are auto-converted to hyphens. SUPPORTED EXTENSIONS: .txt, .md, .json, .jsonl, .csv, .html, .xml, .pdf, .docx. For small images (.png, .gif, .jpg, .jpeg, .webp) — e.g. a tiny file to upload — set content to the base64 of a valid image (a 1x1 PNG is ~92 base64 chars); the bytes are decoded and written for you. CANNOT write other binary files (.mp4, .zip, etc.) and do not attempt to save screenshots as files. For PDF files, write content in markdown format and it will be auto-converted to PDF."
+          }
+        },
+        "required": [
+          "write_file"
+        ],
+        "title": "WriteFileActionModel",
+        "type": "object"
+      },
+      "evaluate_Params": {
+        "additionalProperties": false,
+        "properties": {
+          "code": {
+            "title": "Code",
+            "type": "string"
+          }
+        },
+        "required": [
+          "code"
+        ],
+        "title": "evaluate_Params",
+        "type": "object"
+      },
+      "find_text_Params": {
+        "additionalProperties": false,
+        "properties": {
+          "text": {
+            "title": "Text",
+            "type": "string"
+          }
+        },
+        "required": [
+          "text"
+        ],
+        "title": "find_text_Params",
+        "type": "object"
+      },
+      "read_file_Params": {
+        "additionalProperties": false,
+        "properties": {
+          "file_name": {
+            "title": "File Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "file_name"
+        ],
+        "title": "read_file_Params",
+        "type": "object"
+      },
+      "replace_file_Params": {
+        "additionalProperties": false,
+        "properties": {
+          "file_name": {
+            "title": "File Name",
+            "type": "string"
+          },
+          "old_str": {
+            "title": "Old Str",
+            "type": "string"
+          },
+          "new_str": {
+            "title": "New Str",
+            "type": "string"
+          }
+        },
+        "required": [
+          "file_name",
+          "old_str",
+          "new_str"
+        ],
+        "title": "replace_file_Params",
+        "type": "object"
+      },
+      "wait_Params": {
+        "additionalProperties": false,
+        "properties": {
+          "seconds": {
+            "default": 3,
+            "title": "Seconds",
+            "type": "integer"
+          }
+        },
+        "title": "wait_Params",
+        "type": "object"
+      },
+      "write_file_Params": {
+        "additionalProperties": false,
+        "properties": {
+          "file_name": {
+            "title": "File Name",
+            "type": "string"
+          },
+          "content": {
+            "title": "Content",
+            "type": "string"
+          },
+          "append": {
+            "default": false,
+            "title": "Append",
+            "type": "boolean"
+          },
+          "trailing_newline": {
+            "default": true,
+            "title": "Trailing Newline",
+            "type": "boolean"
+          },
+          "leading_newline": {
+            "default": false,
+            "title": "Leading Newline",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "file_name",
+          "content"
+        ],
+        "title": "write_file_Params",
+        "type": "object"
+      }
+    }
+  },
+  "output": {
+    "planner": {
+      "additionalProperties": false,
+      "properties": {
+        "thinking": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Thinking"
+        },
+        "evaluation_previous_goal": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Evaluation Previous Goal"
+        },
+        "memory": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Memory"
+        },
+        "next_goal": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Next Goal"
+        },
+        "current_plan_item": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Current Plan Item"
+        },
+        "plan_update": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Plan Update"
+        },
+        "action": {
+          "description": "List of actions to execute",
+          "items": {
+            "$ref": "#/$defs/ActionModelUnion"
+          },
+          "min_items": 1,
+          "title": "Action",
+          "type": "array"
+        }
+      },
+      "required": [
+        "evaluation_previous_goal",
+        "memory",
+        "next_goal",
+        "action"
+      ],
+      "title": "AgentOutput",
+      "type": "object"
+    },
+    "no_thinking": {
+      "additionalProperties": false,
+      "properties": {
+        "evaluation_previous_goal": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Evaluation Previous Goal"
+        },
+        "memory": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Memory"
+        },
+        "next_goal": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Next Goal"
+        },
+        "current_plan_item": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Current Plan Item"
+        },
+        "plan_update": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Plan Update"
+        },
+        "action": {
+          "items": {
+            "$ref": "#/$defs/ActionModelUnion"
+          },
+          "min_items": 1,
+          "title": "Action",
+          "type": "array"
+        }
+      },
+      "required": [
+        "evaluation_previous_goal",
+        "memory",
+        "next_goal",
+        "action"
+      ],
+      "title": "AgentOutput",
+      "type": "object"
+    },
+    "flash": {
+      "additionalProperties": false,
+      "properties": {
+        "memory": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Memory"
+        },
+        "action": {
+          "items": {
+            "$ref": "#/$defs/ActionModelUnion"
+          },
+          "min_items": 1,
+          "title": "Action",
+          "type": "array"
+        }
+      },
+      "required": [
+        "memory",
+        "action"
+      ],
+      "title": "AgentOutput",
+      "type": "object"
+    }
+  },
+  "prompt_sha256": {
+    "isolated/planner": "d89a5f20f6870c6d69b8816a6bb71c311a59a75cef037fa55695861bee644d0c",
+    "isolated/no_thinking": "a1ed64ee8e2681f122d99eb2dcb414876f2b58ae45d989f03751b4af4ff47fbe",
+    "isolated/flash": "295bd2a996b17e8bf20b005d20f591da96a74694cf63a0dc745cd04a79d8899e",
+    "isolated/anthropic_flash": "295bd2a996b17e8bf20b005d20f591da96a74694cf63a0dc745cd04a79d8899e",
+    "isolated/anthropic_45_flash": "295bd2a996b17e8bf20b005d20f591da96a74694cf63a0dc745cd04a79d8899e",
+    "isolated/browser_use": "d89a5f20f6870c6d69b8816a6bb71c311a59a75cef037fa55695861bee644d0c",
+    "isolated/browser_use_no_thinking": "a1ed64ee8e2681f122d99eb2dcb414876f2b58ae45d989f03751b4af4ff47fbe",
+    "isolated/browser_use_flash": "295bd2a996b17e8bf20b005d20f591da96a74694cf63a0dc745cd04a79d8899e",
+    "isolated/override": "93a5ffb62f275fcfcdf6ceae8d0320fbfbc8c0b3c23997ec6d4d2b97be152910",
+    "isolated/override_extend": "fad0d4623f6cf64ad07991c445196eeae27dde4bf5a970161c31e8ae2c848f11",
+    "isolated/extend": "c2e487b5092be1cc520524215415c1c5feb21b36e8e128337d7e03a5afd6857f",
+    "collaborative/planner": "32b7f10a72cef637efd15e52743952e70a46c702b10a0ab1fd882ab02e276206",
+    "collaborative/no_thinking": "8ce13684905e55b0d8b2fd3bc3104f321a63bc341c154649c09499ff4132cafd",
+    "collaborative/flash": "744780193add075069ef5eca19a01b8687e6b8715c1c6a71c1dbff71a2daa79f",
+    "collaborative/anthropic_flash": "e23d883b64f9b3a369edc75ac644f617c28e8c58d96dbe8d3e26d6177d9eb7c3",
+    "collaborative/anthropic_45_flash": "3161d76beec0a6d65871c81fb65eab9821b2292f5b6e21001d4943d12f8d0935",
+    "collaborative/browser_use": "914b6a9fde79db9d376b6305be58a12b78ed6d0d6e0f76ba20908bc6ddacd23c",
+    "collaborative/browser_use_no_thinking": "0a46be5babb666f9a9a580c991aecd6668580f221f6ea6cf8e75bc6b6daec5ea",
+    "collaborative/browser_use_flash": "0ea0a52217489f26037b85134e542005c455b17ec7bec38870b57248a5d222a3",
+    "collaborative/override": "93a5ffb62f275fcfcdf6ceae8d0320fbfbc8c0b3c23997ec6d4d2b97be152910",
+    "collaborative/override_extend": "fad0d4623f6cf64ad07991c445196eeae27dde4bf5a970161c31e8ae2c848f11",
+    "collaborative/extend": "3ec81011b6bfdeff50990c471221face48e6506642da047ea567018cb75335b9"
+  }
+}

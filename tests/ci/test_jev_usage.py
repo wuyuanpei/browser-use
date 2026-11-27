@@ -12,6 +12,14 @@ from browser_use.tokens.service import TokenCost
 from tests.ci.conftest import create_mock_llm
 
 
+def test_image_and_text_requests_are_counted_independently(tmp_path):
+	ledger = UsageLedger(TokenCost(include_cost=False), JevTrace(tmp_path / 'trace.jsonl', 'test'))
+	ledger.record_jev(None, 1, vision=True)
+	ledger.record_jev(None, 1)
+	row = ledger.summary()['system1']
+	assert (row['vision_requests'], row['text_requests']) == (1, 1)
+
+
 async def test_shared_model_retry_and_missing_usage(tmp_path):
 	trace = JevTrace(tmp_path / 'usage.jsonl', 'test')
 	cost = TokenCost(include_cost=False)

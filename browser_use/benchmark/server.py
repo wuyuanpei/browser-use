@@ -14,6 +14,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+from browser_use.agent.jev.views import ignore_legacy_vision_escalation
+
 from .baseline import BaselineConflict, BaselineManager
 from .chrome_attachment import ChromeAttachment
 from .engine import MAX_STEPS, BrowserUnavailable, BrowserUseRun, RunCancelled
@@ -116,6 +118,8 @@ def public_error(error):
 def command(name, body):
 	"""路由自由任务和基线命令，浏览器所有权不跨模式抢占。"""
 	global AGENT
+	if name in ('reset', 'baseline/start'):
+		body = ignore_legacy_vision_escalation(body)
 	if name in ('chrome/connect', 'chrome/disconnect'):
 		if CHROME is None:
 			raise ValueError('本机 Chrome 附着模式未配置。')
@@ -144,6 +148,7 @@ def command(name, body):
 				body.get('execution_mode'),
 				screenshot_mode=body.get('screenshot_mode', False),
 				screenshot_policy=body.get('screenshot_policy'),
+				candidate_pipeline=body.get('candidate_pipeline'),
 				model_profile=body.get('model_profile'),
 				before_start=close_browser,
 			)
@@ -165,7 +170,17 @@ def command(name, body):
 	FREE_PAUSE.clear()
 	if name == 'reset':
 		scenario = body.get('scenario', 'flights')
-		if scenario not in {'travel', 'research', 'flights', 'custom'}:
+		if scenario not in {
+			'travel',
+			'research',
+			'flights',
+			'custom',
+			'visual-cards',
+			'visual-icons',
+			'visual-cards-plain',
+			'scroll-panel',
+			'dense',
+		}:
 			raise ValueError('Unknown demo scenario')
 		goal = body.get('goal', '').strip()
 		if not goal or len(goal) > 2000:
@@ -200,6 +215,7 @@ def command(name, body):
 			body.get('execution_mode'),
 			body.get('screenshot_mode', False),
 			screenshot_policy=body.get('screenshot_policy'),
+			candidate_pipeline=body.get('candidate_pipeline'),
 			model_profile=body.get('model_profile'),
 		)
 		if CHROME is not None:
@@ -268,6 +284,15 @@ class Handler(BaseHTTPRequestHandler):
 		if path == '/api/state':
 			with LOCK:
 				return self.send(200, json.dumps(response_state()))
+		if path == '/api/jev/frame':
+			try:
+				agent = AGENT
+				if agent is None:
+					raise ValueError('No active Jev run')
+				reference = parse_qs(urlparse(self.path).query).get('ref', [None])[0]
+				return self.send(200, agent.request_image(reference), 'image/jpeg')
+			except (ValueError, OSError) as error:
+				return self.send(404, json.dumps({'error': public_error(error)}))
 		if path == '/demo.mp4':
 			video = ROOT / 'docs' / 'demo.mp4'
 			if video.exists():

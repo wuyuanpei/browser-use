@@ -1,19 +1,24 @@
 """Agent entry points, planner output schemas and end-to-end effects on real local pages."""
 
+import hashlib
 import json
 import logging
 import os
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 from pydantic import BaseModel, ValidationError
 from pytest_httpserver import HTTPServer
 
-from browser_use import Agent, BrowserProfile, BrowserSession, Tools
+from browser_use import Agent, BrowserProfile, BrowserSession, ChatDeepSeek, Tools
 from browser_use.agent.jev import JevSettings
+from browser_use.agent.jev.prompts import SYSTEM1_VISION_EXTENSION
 from browser_use.agent.jev.state import read_visible_text
 from browser_use.agent.prompts import SystemPrompt
 from browser_use.agent.views import AgentHistoryList, AgentStepInfo
+from browser_use.llm.exceptions import ModelProviderError
 from tests.ci.conftest import create_mock_llm
 from tests.ci.jev_support import FakeJev, serve_page, serve_two_page_site
 from tests.ci.jev_support import jev_browser as _jev_browser_fixture  # noqa: F401
@@ -66,6 +71,95 @@ def action_names(output):
 
 	item = resolve(schema['properties']['action']['items'])
 	return {name for option in item.get('anyOf', [item]) for name in resolve(option)['properties']}
+
+
+@pytest.fixture(scope='module')
+def pr5_planner():
+	# Pure PR5 schemas and prompt bodies. Shared definitions and identical prompts are stored once.
+	return json.loads((Path(__file__).with_name('fixtures') / 'jev_planner_pr5.golden').read_bytes())
+
+
+def assert_pr5_prompt(golden, key, prompt):
+	prompt_bytes = prompt.encode()
+	digest = golden['prompt_sha256'][key]
+	assert prompt_bytes == golden['prompts'][digest].encode()
+	assert hashlib.sha256(prompt_bytes).hexdigest() == digest
+
+
+@pytest.mark.parametrize('mode', ['isolated', 'collaborative'])
+@pytest.mark.parametrize(
+	('variant', 'flash', 'thinking'), [('planner', False, True), ('no_thinking', False, False), ('flash', True, True)]
+)
+async def test_planner_screenshot_policy_schema_and_prompt(mode, variant, flash, thinking, pr5_planner, tmp_path):
+	expected = {'$defs': pr5_planner['definitions'][mode], **pr5_planner['output'][variant]}
+	for policy in ('off', 'always', 'smart'):
+		settings = JevSettings(jev_api_key='local-test', mode=mode, screenshot_policy=policy, trace_path=tmp_path / 'trace.jsonl')
+		agent = make_agent(
+			'Check planner contract', [], settings, flash_mode=flash, use_thinking=thinking, max_actions_per_step=1
+		)
+		try:
+			schema = agent._planner_output_format().model_json_schema()
+			prompt = agent._message_manager.system_prompt.content
+			assert isinstance(prompt, str)
+			if policy == 'smart':
+				assert prompt.endswith('\n' + SYSTEM1_VISION_EXTENSION)
+				prompt = prompt.removesuffix('\n' + SYSTEM1_VISION_EXTENSION)
+				# Account for Pydantic's smart model name in the $defs key, title and reference.
+				schema = json.loads(json.dumps(schema).replace('DelegateSubgoalParamsSmart', 'DelegateSubgoalParams'))
+				delegate = schema['$defs']['DelegateSubgoalParams']
+				for key, datatype in (('screenshot_required', 'boolean'), ('screenshot_reason', 'string')):
+					assert key not in delegate['required']
+					field = delegate['properties'].pop(key)
+					assert field['default'] is None and field['anyOf'] == [{'type': datatype}, {'type': 'null'}]
+			assert json.dumps(schema, ensure_ascii=False).encode() == json.dumps(expected, ensure_ascii=False).encode()
+			assert_pr5_prompt(pr5_planner, f'{mode}/{variant}', prompt)
+		finally:
+			await agent.eventbus.stop(clear=True, timeout=3)
+			assert agent._jev is not None
+			await agent._jev.aclose()
+
+
+@pytest.mark.parametrize('mode', ['isolated', 'collaborative'])
+def test_smart_vision_extension_for_all_template_inputs(mode, pr5_planner, caplog):
+	inputs = {
+		'planner': {},
+		'no_thinking': {'use_thinking': False},
+		'flash': {'flash_mode': True},
+		'anthropic_flash': {'is_anthropic': True, 'flash_mode': True},
+		'anthropic_45_flash': {'is_anthropic': True, 'model_name': 'claude-opus-4-5', 'flash_mode': True},
+		'browser_use': {'is_browser_use_model': True},
+		'browser_use_no_thinking': {'is_browser_use_model': True, 'use_thinking': False},
+		'browser_use_flash': {'is_browser_use_model': True, 'flash_mode': True},
+		'override': {'override_system_message': 'Custom planner instructions.'},
+		'override_extend': {
+			'override_system_message': 'Custom planner instructions.',
+			'extend_system_message': 'Caller extension.',
+		},
+		'extend': {'extend_system_message': 'Caller extension.'},
+	}
+	# The Browser Use logger has its own handlers and does not propagate to pytest's root logger.
+	logger = logging.getLogger('browser_use.agent.prompts')
+	logger.addHandler(caplog.handler)
+	try:
+		for variant, kwargs in inputs.items():
+			for policy in ('off', 'always', 'smart'):
+				caplog.clear()
+				text = (
+					SystemPrompt(max_actions_per_step=1, jev_mode=mode, jev_screenshot_policy=policy, **kwargs)
+					.get_system_message()
+					.content
+				)
+				assert isinstance(text, str)
+				if 'override_system_message' in kwargs:
+					assert 'Custom system message supplied' in caplog.text
+				elif policy == 'smart':
+					assert text.count(SYSTEM1_VISION_EXTENSION) == 1
+					suffix = '\n' + SYSTEM1_VISION_EXTENSION
+					assert text.endswith(suffix)
+					text = text.removesuffix(suffix)
+				assert_pr5_prompt(pr5_planner, f'{mode}/{variant}', text)
+	finally:
+		logger.removeHandler(caplog.handler)
 
 
 @pytest.mark.parametrize('flash,thinking', [(False, True), (False, False), (True, True)])
@@ -152,6 +246,59 @@ async def test_forced_finish_and_planner_retries(tmp_path, caplog):
 	assert len(final_logs) == 1 and 'Unable to continue' in final_logs[0]
 	usage = a._jev.usage_by_role()['planner']
 	assert (usage['decisions'], usage['calls'], usage['missing_usage_calls']) == (1, 2, 2)
+
+
+@pytest.mark.parametrize('invalid', [subgoal('Read the page', 'Page visible', review_note_placeholder='invalid'), '{"action":'])
+@pytest.mark.parametrize('recover', [True, False])
+async def test_planner_repairs_malformed_deepseek_output(httpserver, tmp_path, monkeypatch, invalid, recover):
+	serve_page(httpserver, '/repair', '<main>Visible evidence</main>')
+	second = finish() if recover else invalid
+	responses = [
+		SimpleNamespace(
+			usage=None,
+			choices=[
+				SimpleNamespace(message=SimpleNamespace(tool_calls=[SimpleNamespace(function=SimpleNamespace(arguments=raw))]))
+			],
+		)
+		for raw in (invalid, second)
+	]
+	create = AsyncMock(side_effect=responses)
+	monkeypatch.setattr(
+		ChatDeepSeek, '_client', lambda self: SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+	)
+	agent = Agent(
+		task='Read the page',
+		llm=ChatDeepSeek(api_key='local-test'),
+		jev=JevSettings(jev_api_key='local-test', answer_llm=create_mock_llm([json.dumps({'text': 'Reviewed'})])),
+		browser_session=isolated_browser(),
+		use_judge=False,
+		enable_signal_handler=False,
+		initial_actions=[{'navigate': {'url': httpserver.url_for('/repair')}}],
+	)
+	history = await agent.run(max_steps=2)
+	assert create.await_count == 2
+	assert create.await_args is not None
+	messages = json.dumps(create.await_args.kwargs['messages'])
+	expected_diagnostic = 'review_note_placeholder' if 'review_note_placeholder' in invalid else 'Invalid JSON'
+	assert expected_diagnostic in messages
+	assert history.is_done() and history.is_successful() is recover
+	assert not any('delegate_subgoal' in action for action in history.model_actions())
+
+
+@pytest.mark.parametrize(
+	'error', [TimeoutError('request timed out'), ModelProviderError('authentication failed', status_code=401)]
+)
+async def test_planner_does_not_reprompt_for_transport_or_auth_errors(monkeypatch, error):
+	agent = make_agent('Read the page', [], JevSettings(jev_api_key='local-test'))
+	request = AsyncMock(side_effect=error)
+	monkeypatch.setattr(agent.llm, 'ainvoke', request)
+
+	history = await agent.run(max_steps=1)
+
+	assert request.await_count == 1
+	assert not history.is_done()
+	expected = 'timed out' if isinstance(error, TimeoutError) else 'authentication failed'
+	assert any(expected in item for item in history.errors() if item)
 
 
 @pytest.mark.parametrize('flash,thinking', [(False, True), (False, False), (True, True)])

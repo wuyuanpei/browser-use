@@ -38,6 +38,7 @@ class SystemPrompt:
 		is_browser_use_model: bool = False,
 		model_name: str | None = None,
 		jev_mode: Literal['isolated', 'collaborative'] | None = None,
+		jev_screenshot_policy: Literal['off', 'always', 'smart'] = 'off',
 	):
 		self.max_actions_per_step = max_actions_per_step
 		self.use_thinking = use_thinking
@@ -63,6 +64,10 @@ class SystemPrompt:
 
 		if extend_system_message:
 			prompt += f'\n{extend_system_message}'
+		if override_system_message is None and jev_mode is not None and jev_screenshot_policy == 'smart':
+			from browser_use.agent.jev.prompts import SYSTEM1_VISION_EXTENSION
+
+			prompt += f'\n{SYSTEM1_VISION_EXTENSION}'
 
 		self.system_message = SystemMessage(content=prompt, cache=True)
 
